@@ -1,0 +1,22 @@
+# Zig
+.zig-cache/
+zig-out/
+
+# OS
+.DS_Store
+
+# IDEs
+.vscode/
+.idea/
+
+# Binaries
+contracts/*.fozbin
+contracts/*.hex
+contracts/*.polkavm
+contracts/fozbin.hex
+contracts/payload.hex
+
+# Artifacts
+gaps_implementation_plan.md
+Claude.md
+FORGE_LANGUAGE_SPEC.md

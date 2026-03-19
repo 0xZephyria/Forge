@@ -1,0 +1,51 @@
+// Test contract: exercises GAP-4 (no-paren error), GAP-5 (view codegen), GAP-7 (caller builtin)
+version 1
+
+contract TokenTest:
+
+    authorities:
+        admin is AdminAuthority
+            held_by Wallet
+            initially deployer
+
+    has:
+        total_supply is u256
+        is_paused    is bool
+
+    // GAP-4: zero-field error declarations WITHOUT parentheses — previously crashed the parser
+    error SupplyOverflow
+    error SupplyUnderflow
+
+    // Regular fielded error
+    error NotAllowed(reason is Label)
+
+    event Issued(recipient is Account, amount is u256)
+    event Retired(amount is u256)
+
+    setup():
+        total_supply = 0
+        is_paused = no
+
+    action issue(recipient is Account, amount is u256):
+        only admin:
+            need amount > 0 else "zero amount"
+            total_supply += amount
+            tell Issued(recipient, amount)
+
+    action retire(amount is u256):
+        need not is_paused else "paused"
+        need amount > 0 else "zero amount"
+        need total_supply >= amount else "underflow"
+        total_supply -= amount
+        tell Retired(amount)
+
+    action set_paused(flag is bool):
+        only admin:
+            is_paused = flag
+
+    // GAP-5: view functions must produce bytecode in output binary
+    view check_paused() gives bool:
+        give back is_paused
+
+    view check_supply() gives u256:
+        give back total_supply

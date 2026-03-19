@@ -1,0 +1,757 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Forge PolkaVM Contract Deployer</title>
+    <!-- Use Inter font -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <!-- Load Ethers.js v6 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.7.0/ethers.umd.min.js"></script>
+    <style>
+        :root {
+            --bg-color: #0b0f19;
+            --surface-color: #1a1f2e;
+            --border-color: #2a3143;
+            --text-primary: #f8fafc;
+            --text-secondary: #94a3b8;
+            --accent-color: #e6007a; /* Polkadot Pink */
+            --accent-hover: #c20066;
+            --success-color: #10b981;
+            --error-color: #ef4444;
+            --warning-color: #f59e0b;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-primary);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 2rem;
+            line-height: 1.5;
+        }
+
+        /* Abstract glowing background effect */
+        .ambient-glow {
+            position: fixed;
+            top: -20%;
+            left: -10%;
+            width: 50vw;
+            height: 50vw;
+            background: radial-gradient(circle, rgba(230,0,122,0.15) 0%, rgba(11,15,25,0) 70%);
+            z-index: -1;
+            pointer-events: none;
+        }
+
+        .ambient-glow-2 {
+            position: fixed;
+            bottom: -20%;
+            right: -10%;
+            width: 60vw;
+            height: 60vw;
+            background: radial-gradient(circle, rgba(59,130,246,0.1) 0%, rgba(11,15,25,0) 70%);
+            z-index: -1;
+            pointer-events: none;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 3rem;
+            animation: fadeInDown 0.8s ease-out;
+        }
+
+        h1 {
+            font-size: 2.5rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #fff, #a5b4fc);
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 0.5rem;
+            letter-spacing: -0.02em;
+        }
+
+        header p {
+            color: var(--text-secondary);
+            font-size: 1.1rem;
+        }
+
+        main {
+            width: 100%;
+            max-width: 600px;
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem;
+            animation: fadeInUp 0.8s ease-out;
+        }
+
+        .card {
+            background-color: var(--surface-color);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 1.5rem;
+            box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.5);
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+
+        .card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 12px 40px -10px rgba(0, 0, 0, 0.7);
+        }
+
+        .card-title {
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-secondary);
+            font-weight: 600;
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .network-badge {
+            font-size: 0.75rem;
+            padding: 0.25rem 0.5rem;
+            border-radius: 12px;
+            background: rgba(230,0,122,0.1);
+            color: var(--accent-color);
+            border: 1px solid rgba(230,0,122,0.3);
+        }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            background-color: var(--accent-color);
+            color: #fff;
+            font-family: 'Inter', sans-serif;
+            font-weight: 600;
+            font-size: 1rem;
+            border: none;
+            border-radius: 8px;
+            padding: 0.75rem 1.5rem;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            width: 100%;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .btn::after {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
+            transition: 0.5s;
+        }
+
+        .btn:hover::after {
+            left: 100%;
+        }
+
+        .btn:hover:not(:disabled) {
+            background-color: var(--accent-hover);
+            transform: scale(1.02);
+        }
+
+        .btn:active:not(:disabled) {
+            transform: scale(0.98);
+        }
+
+        .btn:disabled {
+            background-color: var(--border-color);
+            color: var(--text-secondary);
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .btn.secondary {
+            background-color: transparent;
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+        }
+
+        .btn.secondary:hover:not(:disabled) {
+            background-color: rgba(255,255,255,0.05);
+            border-color: #4b5563;
+        }
+
+        .wallet-status {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 1rem;
+            margin-bottom: 1rem;
+            padding: 0.75rem;
+            background: rgba(0,0,0,0.2);
+            border-radius: 8px;
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background-color: var(--error-color);
+            box-shadow: 0 0 10px var(--error-color);
+        }
+
+        .status-dot.connected {
+            background-color: var(--success-color);
+            box-shadow: 0 0 10px var(--success-color);
+        }
+
+        #addressDisplay {
+            font-family: monospace;
+            word-break: break-all;
+            color: var(--text-secondary);
+        }
+
+        .file-upload-wrapper {
+            position: relative;
+            width: 100%;
+            height: 120px;
+            border: 2px dashed var(--border-color);
+            border-radius: 12px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            background-color: rgba(0,0,0,0.1);
+        }
+
+        .file-upload-wrapper:hover {
+            border-color: var(--accent-color);
+            background-color: rgba(230,0,122,0.05);
+        }
+
+        .file-upload-wrapper.drag-over {
+            border-color: var(--accent-color);
+            background-color: rgba(230,0,122,0.1);
+            transform: scale(1.02);
+        }
+
+        .file-upload-wrapper input[type="file"] {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            opacity: 0;
+            cursor: pointer;
+        }
+
+        .file-upload-wrapper svg {
+            width: 32px;
+            height: 32px;
+            stroke: var(--text-secondary);
+            margin-bottom: 0.5rem;
+            transition: stroke 0.2s ease;
+        }
+
+        .file-upload-wrapper:hover svg {
+            stroke: var(--accent-color);
+        }
+
+        .file-name {
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+            text-align: center;
+            padding: 0 1rem;
+        }
+
+        .payload-preview {
+            margin-top: 1rem;
+            background: rgba(0,0,0,0.3);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 1rem;
+            font-family: monospace;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            max-height: 100px;
+            overflow-y: auto;
+            word-break: break-all;
+            display: none;
+        }
+
+        .payload-preview.visible {
+            display: block;
+            animation: fadeIn 0.3s ease;
+        }
+
+        .logs {
+            margin-top: 1rem;
+            padding: 1rem;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            display: none;
+            word-break: break-all;
+            background: rgba(0,0,0,0.2);
+            border-left: 4px solid transparent;
+        }
+
+        .logs.visible {
+            display: block;
+            animation: fadeIn 0.3s ease;
+        }
+
+        .logs.success {
+            border-left-color: var(--success-color);
+            color: #ecfdf5;
+        }
+
+        .logs.error {
+            border-left-color: var(--error-color);
+            color: #fef2f2;
+        }
+
+        .logs.info {
+            border-left-color: var(--accent-color);
+            color: var(--text-primary);
+        }
+
+        .loader {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid rgba(255,255,255,0.3);
+            border-radius: 50%;
+            border-top-color: #fff;
+            animation: spin 1s ease-in-out infinite;
+            margin-right: 8px;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        @keyframes fadeInUp {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        @keyframes fadeInDown {
+            from { opacity: 0; transform: translateY(-20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* Scrollbar styles */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: var(--surface-color);
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: var(--border-color);
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #4b5563;
+        }
+
+    </style>
+</head>
+<body>
+    <div class="ambient-glow"></div>
+    <div class="ambient-glow-2"></div>
+
+    <header>
+        <h1>Forge PolkaVM Deployer</h1>
+        <p>Deploy compiled payloads to the PolkaVM Testnet</p>
+    </header>
+
+    <main>
+        <!-- Wallet Connection Card -->
+        <div class="card" id="walletCard">
+            <div class="card-title">
+                Wallet Connection
+                <span id="networkBadge" class="network-badge" style="display: none;">Unknown Network</span>
+            </div>
+            
+            <div class="wallet-status">
+                <div class="status-dot" id="statusDot"></div>
+                <span id="walletStatusText">Disconnected</span>
+            </div>
+            <div id="addressDisplay"></div>
+
+            <button class="btn" id="connectBtn">Connect MetaMask</button>
+            <button class="btn secondary" id="switchNetworkBtn" style="display: none; margin-top: 10px;">Switch to PolkaVM Testnet</button>
+        </div>
+
+        <!-- Payload Upload Card -->
+        <div class="card" id="uploadCard">
+            <div class="card-title">Contract Payload</div>
+            
+            <div class="file-upload-wrapper" id="dropZone">
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m3.75 9v6m3-3H9m1.5-12H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
+                </svg>
+                <div class="file-name" id="fileName">Drop .hex file here or click to browse</div>
+                <input type="file" id="fileInput" accept=".hex,.txt,.bin" />
+            </div>
+
+            <div class="payload-preview" id="payloadPreview"></div>
+        </div>
+
+        <!-- Deployment Card -->
+        <div class="card" id="deployCard">
+            <div class="card-title">Deployment</div>
+            
+            <button class="btn" id="deployBtn" disabled>Deploy Contract</button>
+            
+            <div class="logs" id="logsPanel"></div>
+        </div>
+    </main>
+
+    <script>
+        // Constants
+        const TARGET_CHAIN_ID_HEX = '0x190F1B41'; // 420420417
+        const TARGET_RPC_URL = 'https://eth-rpc-testnet.polkadot.io';
+        const TARGET_CHAIN_NAME = 'Polkadot Hub Testnet';
+        const TARGET_SYMBOL = 'DOT'; // Using DOT or generic token
+
+        // DOM Elements
+        const connectBtn = document.getElementById('connectBtn');
+        const switchNetworkBtn = document.getElementById('switchNetworkBtn');
+        const fileInput = document.getElementById('fileInput');
+        const dropZone = document.getElementById('dropZone');
+        const fileName = document.getElementById('fileName');
+        const payloadPreview = document.getElementById('payloadPreview');
+        const deployBtn = document.getElementById('deployBtn');
+        const logsPanel = document.getElementById('logsPanel');
+        const statusDot = document.getElementById('statusDot');
+        const walletStatusText = document.getElementById('walletStatusText');
+        const addressDisplay = document.getElementById('addressDisplay');
+        const networkBadge = document.getElementById('networkBadge');
+
+        // State
+        let selectedAccount = null;
+        let pvmHexPayload = null;
+        let isCorrectNetwork = false;
+
+        // Initialize Ethers provider
+        let provider;
+        let signer;
+
+        // Log formatter
+        function showLog(message, type = 'info') {
+            logsPanel.className = `logs visible ${type}`;
+            logsPanel.innerHTML = message;
+        }
+
+        // Check if metamask is installed
+        function isMetaMaskInstalled() {
+            return Boolean(window.ethereum && window.ethereum.isMetaMask);
+        }
+
+        // Initialize connection status on load
+        async function checkConnection() {
+            if (isMetaMaskInstalled()) {
+                provider = new ethers.BrowserProvider(window.ethereum);
+                try {
+                    const accounts = await provider.send("eth_accounts", []);
+                    if (accounts.length > 0) {
+                        handleAccountsChanged(accounts);
+                    }
+                    
+                    const network = await provider.getNetwork();
+                    handleNetworkChanged(network.chainId);
+                    
+                    // Listeners
+                    window.ethereum.on('accountsChanged', handleAccountsChanged);
+                    window.ethereum.on('chainChanged', (chainIdStr) => {
+                        handleNetworkChanged(chainIdStr);
+                        // Reload page or re-init provider is recommended by MetaMask
+                        provider = new ethers.BrowserProvider(window.ethereum);
+                    });
+                } catch (err) {
+                    console.error("Initialization error", err);
+                }
+            } else {
+                connectBtn.innerText = "Install MetaMask";
+                connectBtn.addEventListener('click', () => {
+                    window.open('https://metamask.io/download.html', '_blank');
+                });
+            }
+        }
+
+        // Handle Account Changes
+        function handleAccountsChanged(accounts) {
+            if (accounts.length === 0) {
+                // Disconnected
+                selectedAccount = null;
+                statusDot.classList.remove('connected');
+                walletStatusText.innerText = 'Disconnected';
+                addressDisplay.innerText = '';
+                connectBtn.style.display = 'block';
+                deployBtn.disabled = true;
+            } else {
+                selectedAccount = accounts[0];
+                statusDot.classList.add('connected');
+                walletStatusText.innerText = 'Connected';
+                addressDisplay.innerText = `${selectedAccount.substring(0, 6)}...${selectedAccount.substring(selectedAccount.length - 4)}`;
+                connectBtn.style.display = 'none';
+                
+                // Re-evaluate deploy button state
+                updateDeployButtonState();
+            }
+        }
+
+        // Handle Network Changes
+        function handleNetworkChanged(chainId) {
+            // Convert any format (hex string '0x...', decimal string, or number) into a parsed integer to be foolproof
+            const parsedChainId = Number(chainId);
+            const targetChainIdDec = parseInt(TARGET_CHAIN_ID_HEX, 16); // 420420417
+
+            if (parsedChainId === targetChainIdDec) {
+                isCorrectNetwork = true;
+                networkBadge.style.display = 'inline-block';
+                networkBadge.innerText = 'PolkaVM Testnet';
+                networkBadge.style.color = 'var(--success-color)';
+                networkBadge.style.borderColor = 'rgba(16,185,129,0.3)';
+                networkBadge.style.background = 'rgba(16,185,129,0.1)';
+                switchNetworkBtn.style.display = 'none';
+            } else {
+                isCorrectNetwork = false;
+                networkBadge.style.display = 'inline-block';
+                networkBadge.innerText = 'Unsupported Network';
+                networkBadge.style.color = 'var(--error-color)';
+                networkBadge.style.borderColor = 'rgba(239,68,68,0.3)';
+                networkBadge.style.background = 'rgba(239,68,68,0.1)';
+                if (selectedAccount) {
+                    switchNetworkBtn.style.display = 'block';
+                }
+            }
+            updateDeployButtonState();
+        }
+
+        // Update deploy button enable/disable
+        function updateDeployButtonState() {
+            if (selectedAccount && isCorrectNetwork && pvmHexPayload) {
+                deployBtn.disabled = false;
+            } else {
+                deployBtn.disabled = true;
+            }
+        }
+
+        // Connect button handler
+        connectBtn.addEventListener('click', async () => {
+            if (!isMetaMaskInstalled()) return;
+            try {
+                connectBtn.innerText = "Connecting...";
+                connectBtn.disabled = true;
+                const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+                handleAccountsChanged(accounts);
+                
+                const chainId = await window.ethereum.request({ method: 'eth_chainId' });
+                handleNetworkChanged(chainId);
+
+            } catch (err) {
+                console.error(err);
+                if (err.code === 4001) {
+                    showLog("Connection rejected by user", "error");
+                } else {
+                    showLog(err.message, "error");
+                }
+            } finally {
+                connectBtn.innerText = "Connect MetaMask";
+                connectBtn.disabled = false;
+            }
+        });
+
+        // Switch/Add Network Handler
+        switchNetworkBtn.addEventListener('click', async () => {
+            try {
+                switchNetworkBtn.innerText = "Switching...";
+                switchNetworkBtn.disabled = true;
+                await window.ethereum.request({
+                    method: 'wallet_switchEthereumChain',
+                    params: [{ chainId: TARGET_CHAIN_ID_HEX }],
+                });
+            } catch (switchError) {
+                // This error code means the chain hasn't been added yet
+                if (switchError.code === 4902) {
+                    try {
+                        await window.ethereum.request({
+                            method: 'wallet_addEthereumChain',
+                            params: [
+                                {
+                                    chainId: TARGET_CHAIN_ID_HEX,
+                                    chainName: TARGET_CHAIN_NAME,
+                                    nativeCurrency: {
+                                        name: TARGET_SYMBOL,
+                                        symbol: TARGET_SYMBOL,
+                                        decimals: 18
+                                    },
+                                    rpcUrls: [TARGET_RPC_URL],
+                                },
+                            ],
+                        });
+                    } catch (addError) {
+                        showLog(addError.message, "error");
+                    }
+                } else {
+                    showLog(switchError.message, "error");
+                }
+            } finally {
+                switchNetworkBtn.innerText = "Switch to PolkaVM Testnet";
+                switchNetworkBtn.disabled = false;
+            }
+        });
+
+        // File Drag & Drop events
+        ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+            dropZone.addEventListener(eventName, preventDefaults, false);
+        });
+
+        function preventDefaults(e) {
+            e.preventDefault();
+            e.stopPropagation();
+        }
+
+        ['dragenter', 'dragover'].forEach(eventName => {
+            dropZone.addEventListener(eventName, () => {
+                dropZone.classList.add('drag-over');
+            }, false);
+        });
+
+        ['dragleave', 'drop'].forEach(eventName => {
+            dropZone.addEventListener(eventName, () => {
+                dropZone.classList.remove('drag-over');
+            }, false);
+        });
+
+        dropZone.addEventListener('drop', (e) => {
+            let dt = e.dataTransfer;
+            let files = dt.files;
+            handleFiles(files);
+        });
+
+        fileInput.addEventListener('change', function() {
+            handleFiles(this.files);
+        });
+
+        // Process selected file
+        function handleFiles(files) {
+            if (files.length === 0) return;
+            const file = files[0];
+            fileName.innerText = file.name;
+
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                let content = e.target.result.trim();
+                
+                // Cleanup hex if needed (remove whitespaces, line breaks)
+                content = content.replace(/\s/g, '');
+                
+                if (!content.startsWith('0x')) {
+                    content = '0x' + content;
+                }
+
+                // Basic validation for hex
+                const hexRegex = /^0x[0-9a-fA-F]*$/;
+                if (!hexRegex.test(content)) {
+                    showLog("Invalid payload format. Must be a valid hex string.", "error");
+                    pvmHexPayload = null;
+                    payloadPreview.classList.remove('visible');
+                    updateDeployButtonState();
+                    return;
+                }
+
+                pvmHexPayload = content;
+                
+                // Show preview
+                payloadPreview.innerText = pvmHexPayload;
+                payloadPreview.classList.add('visible');
+                logsPanel.classList.remove('visible'); // Clear any previous errors
+                
+                updateDeployButtonState();
+            };
+            reader.readAsText(file);
+        }
+
+        // Deploy Contract
+        deployBtn.addEventListener('click', async () => {
+            if (!provider || !selectedAccount || !pvmHexPayload) return;
+
+            try {
+                // UI Updating to 'Deploying' state
+                deployBtn.disabled = true;
+                deployBtn.innerHTML = '<span class="loader"></span> Deploying...';
+                showLog("Initiating transaction... Please confirm in MetaMask.", "info");
+
+                // Ensure provider is up to date
+                signer = await provider.getSigner();
+
+                // Create transaction
+                const tx = {
+                    data: pvmHexPayload,
+                    // 'to' is omitted for contract deployment
+                };
+
+                // Send transaction
+                const response = await signer.sendTransaction(tx);
+                
+                showLog(`Transaction submitted. Waiting for confirmation...<br><br>Tx Hash: <code>${response.hash}</code>`, "info");
+
+                // Wait for receipt
+                const receipt = await response.wait();
+
+                if (receipt.status === 1) {
+                    showLog(`<strong>Deployment Successful! 🎉</strong><br><br>Contract Address: <code>${receipt.contractAddress}</code><br>Tx Hash: <code>${receipt.hash}</code>`, "success");
+                } else {
+                    showLog(`<strong>Deployment Failed!</strong><br><br>Transaction reverted.<br>Tx Hash: <code>${receipt.hash}</code>`, "error");
+                }
+
+            } catch (err) {
+                console.error(err);
+                if (err.info && err.info.error && err.info.error.message) {
+                    showLog(`Error: ${err.info.error.message}`, "error");
+                } else if (err.message) {
+                    showLog(`Error: ${err.message}`, "error");
+                } else {
+                    showLog("An unknown error occurred during deployment.", "error"); // Fallback
+                }
+            } finally {
+                deployBtn.innerHTML = 'Deploy Contract';
+                updateDeployButtonState(); // Re-enable if allowed
+            }
+        });
+
+        // Initialize on load
+        window.addEventListener('load', () => {
+            if (window.location.protocol === 'file:') {
+                showLog("⚠️ MetaMask cannot connect to local <code>file://</code> URLs for security reasons. Please serve this file using a local HTTP server (e.g., <code>npx serve</code> or <code>python3 -m http.server 8080</code>) and access it via <code>http://localhost:8080</code>", "error");
+                connectBtn.disabled = true;
+                connectBtn.innerText = "HTTP Server Required";
+            } else {
+                checkConnection();
+            }
+        });
+
+    </script>
+</body>
+</html>
