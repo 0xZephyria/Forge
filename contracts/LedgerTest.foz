@@ -1,0 +1,41 @@
+// Test contract
+version 1
+
+contract LedgerTest:
+
+    has:
+        counter              is u256
+        balances             is Map[Account -> u256]
+        total_deposits       is u256
+
+    event Deposited(who is Account, amount is u256)
+    event Withdrawn(who is Account, amount is u256)
+
+    setup():
+        counter        = 0
+        total_deposits = 0
+
+    action deposit(amount is u256):
+        need amount > 0 else "zero amount"
+        // GAP-3: aug_assign on mine.field
+        counter        += 1
+        total_deposits += amount
+        // GAP-3: aug_assign on mine.field[index] (map)
+        balances[caller] += amount
+        tell Deposited(caller, amount)
+
+    action withdraw(amount is u256):
+        need balances[caller] >= amount else "insufficient"
+        // GAP-3: map aug_assign with subtraction
+        balances[caller] -= amount
+        total_deposits   -= amount
+        tell Withdrawn(caller, amount)
+
+    view get_balance(who is Account) gives u256:
+        give back balances[who]
+
+    view get_counter() gives u256:
+        give back counter
+
+    view get_total() gives u256:
+        give back total_deposits

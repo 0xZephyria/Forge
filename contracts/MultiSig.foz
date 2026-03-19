@@ -1,0 +1,60 @@
+version 1
+
+contract MultiSig:
+    has:
+        owner1 is Account
+        owner2 is Account
+        owner3 is Account
+        required_sigs is u8
+        nonce is u256
+        confirmations is Map[u256 -> u8]
+        
+    setup(o1 is Account, o2 is Account, o3 is Account):
+        owner1 = o1
+        owner2 = o2
+        owner3 = o3
+        required_sigs = 2
+        nonce = 0
+
+    action propose_tx():
+        let is_owner = no
+        when caller equals owner1:
+            is_owner = yes
+        otherwise when caller equals owner2:
+            is_owner = yes
+        otherwise when caller equals owner3:
+            is_owner = yes
+        otherwise:
+            is_owner = no
+            
+        need is_owner equals yes else "Not an owner"
+        
+        nonce = nonce plus 1
+        confirmations[nonce] = 1
+        tell TxProposed(nonce)
+
+    action confirm_tx(tx_nonce is u256):
+        let is_owner = no
+        when caller equals owner1:
+            is_owner = yes
+        otherwise when caller equals owner2:
+            is_owner = yes
+        otherwise when caller equals owner3:
+            is_owner = yes
+        otherwise:
+            is_owner = no
+            
+        need is_owner equals yes else "Not an owner"
+        
+        let current = confirmations[tx_nonce]
+        confirmations[tx_nonce] = current plus 1
+        
+        let new_count = confirmations[tx_nonce]
+        when new_count equals required_sigs:
+            tell TxExecuted(tx_nonce)
+        otherwise:
+            tell TxConfirmed(tx_nonce)
+
+    event TxProposed(nonce is u256)
+    event TxConfirmed(nonce is u256)
+    event TxExecuted(nonce is u256)

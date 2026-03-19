@@ -1,0 +1,54 @@
+version 1
+
+contract Escrow:
+    has:
+        buyer is Account
+        seller is Account
+        arbiter is Account
+        amount is u256
+        locked_balance is u256
+        is_funded is bool
+        is_released is bool
+
+    authorities:
+        arbiter_auth is ArbiterRole held_by Wallet initially deployer
+
+    setup(b is Account, s is Account, a is Account, expected_amount is u256):
+        buyer = b
+        seller = s
+        arbiter = a
+        amount = expected_amount
+        locked_balance = 0
+        is_funded = no
+        is_released = no
+
+    action deposit(fund_amount is u256):
+        need caller equals buyer else "Only buyer can fund"
+        need is_funded equals no else "Already funded"
+        need fund_amount equals amount else "Must fund exact amount"
+        
+        locked_balance = locked_balance plus fund_amount
+        is_funded = yes
+        tell Funded(fund_amount)
+
+    action release():
+        only arbiter_auth:
+            need is_funded equals yes else "Not funded"
+            need is_released equals no else "Already released"
+            
+            locked_balance = locked_balance minus amount
+            is_released = yes
+            tell Released(seller, amount)
+
+    action refund():
+        only arbiter_auth:
+            need is_funded equals yes else "Not funded"
+            need is_released equals no else "Already released"
+    
+            locked_balance = locked_balance minus amount
+            is_funded = no
+            tell Refunded(buyer, amount)
+
+    event Funded(amount is u256)
+    event Released(recipient is Account, amount is u256)
+    event Refunded(recipient is Account, amount is u256)

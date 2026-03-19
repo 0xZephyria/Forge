@@ -1,0 +1,62 @@
+version 1
+
+contract Crowdfund:
+    has:
+        creator is Account
+        goal is u256
+        raised is u256
+        is_active is bool
+        is_success is bool
+        contributions is Map[Account -> u256]
+
+    setup(c is Account, g is u256):
+        creator = c
+        goal = g
+        raised = 0
+        is_active = yes
+        is_success = no
+
+    action pledge(amount is u256):
+        need is_active equals yes else "Crowdfund ended"
+        need amount > 0 else "Must pledge something"
+
+        raised = raised plus amount
+        contributions[caller] = contributions[caller] plus amount
+
+        tell Pledged(caller, amount)
+
+    action finalize():
+        need is_active equals yes else "Already finalized"
+        is_active = no
+
+        when raised >= goal:
+            is_success = yes
+            tell CrowdfundSuccess(raised)
+        otherwise:
+            is_success = no
+            tell CrowdfundFailed(raised)
+
+    action claim_funds():
+        need is_active equals no else "Still active"
+        need is_success equals yes else "Did not reach goal"
+        need caller equals creator else "Only creator claims"
+
+        let amt = raised
+        raised = 0
+        tell FundsClaimed(amt)
+
+    action refund():
+        need is_active equals no else "Still active"
+        need is_success equals no else "Fund succeeded, no refunds"
+        
+        let amt = contributions[caller]
+        need amt > 0 else "Nothing to refund"
+
+        contributions[caller] = 0
+        tell RefundIssued(caller, amt)
+
+    event Pledged(contributor is Account, amount is u256)
+    event CrowdfundSuccess(total is u256)
+    event CrowdfundFailed(total is u256)
+    event FundsClaimed(amount is u256)
+    event RefundIssued(contributor is Account, amount is u256)

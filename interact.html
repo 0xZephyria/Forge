@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Forge PolkaVM Contract Interactor</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.7.0/ethers.umd.min.js"></script>
+    <style>
+        :root {
+            --bg-color: #0b0f19;
+            --surface-color: #1a1f2e;
+            --border-color: #2a3143;
+            --text-primary: #f8fafc;
+            --text-secondary: #94a3b8;
+            --accent-color: #3b82f6; /* Blue Accent for Interactor */
+            --accent-hover: #2563eb;
+            --success-color: #10b981;
+            --error-color: #ef4444;
+            --warning-color: #f59e0b;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-primary);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 2rem;
+            line-height: 1.5;
+        }
+
+        .ambient-glow {
+            position: fixed; top: -20%; left: -10%; width: 50vw; height: 50vw;
+            background: radial-gradient(circle, rgba(59,130,246,0.15) 0%, rgba(11,15,25,0) 70%);
+            z-index: -1; pointer-events: none;
+        }
+
+        .ambient-glow-2 {
+            position: fixed; bottom: -20%; right: -10%; width: 60vw; height: 60vw;
+            background: radial-gradient(circle, rgba(230,0,122,0.1) 0%, rgba(11,15,25,0) 70%);
+            z-index: -1; pointer-events: none;
+        }
+
+        header { text-align: center; margin-bottom: 3rem; }
+        h1 {
+            font-size: 2.5rem; font-weight: 700;
+            background: linear-gradient(135deg, #fff, #93c5fd);
+            -webkit-background-clip: text; background-clip: text;
+            -webkit-text-fill-color: transparent; margin-bottom: 0.5rem;
+        }
+        header p { color: var(--text-secondary); font-size: 1.1rem; }
+
+        main {
+            width: 100%; max-width: 650px; display: flex; flex-direction: column; gap: 1.5rem;
+        }
+
+        .card {
+            background-color: var(--surface-color); border: 1px solid var(--border-color);
+            border-radius: 16px; padding: 1.5rem;
+            box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.5);
+        }
+
+        .card-title {
+            font-size: 0.9rem; text-transform: uppercase; letter-spacing: 0.05em;
+            color: var(--text-secondary); font-weight: 600; margin-bottom: 1rem;
+            display: flex; align-items: center; justify-content: space-between;
+        }
+
+        .network-badge {
+            font-size: 0.75rem; padding: 0.25rem 0.5rem; border-radius: 12px;
+            background: rgba(59,130,246,0.1); color: var(--accent-color);
+            border: 1px solid rgba(59,130,246,0.3); display: none;
+        }
+
+        .btn {
+            display: inline-flex; align-items: center; justify-content: center;
+            background-color: var(--accent-color); color: #fff;
+            font-family: 'Inter', sans-serif; font-weight: 600; font-size: 0.95rem;
+            border: none; border-radius: 8px; padding: 0.6rem 1.2rem;
+            cursor: pointer; transition: all 0.2s ease;
+        }
+        .btn:hover:not(:disabled) { background-color: var(--accent-hover); transform: scale(1.02); }
+        .btn:active:not(:disabled) { transform: scale(0.98); }
+        .btn:disabled { background-color: var(--border-color); color: var(--text-secondary); cursor: not-allowed; }
+        .btn.secondary { background-color: transparent; border: 1px solid var(--border-color); color: var(--text-primary); }
+
+        .wallet-status {
+            display: flex; align-items: center; gap: 0.5rem; font-size: 1rem;
+            margin-bottom: 1rem; padding: 0.75rem; background: rgba(0,0,0,0.2); border-radius: 8px;
+        }
+        .status-dot { width: 10px; height: 10px; border-radius: 50%; background-color: var(--error-color); }
+        .status-dot.connected { background-color: var(--success-color); box-shadow: 0 0 10px var(--success-color); }
+        #addressDisplay { font-family: monospace; color: var(--text-secondary); }
+
+        .form-group { margin-bottom: 1.25rem; }
+        .form-group label { display: block; font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 0.4rem; font-weight: 500; }
+        .form-control {
+            width: 100%; padding: 0.75rem 1rem; border-radius: 8px;
+            background-color: rgba(0,0,0,0.2); border: 1px solid var(--border-color);
+            color: #fff; font-family: 'Inter', sans-serif; font-size: 1rem;
+            transition: border-color 0.2s;
+        }
+        .form-control:focus { outline: none; border-color: var(--accent-color); }
+
+        .method-block {
+            background: rgba(0,0,0,0.15); border: 1px solid rgba(255,255,255,0.05);
+            border-radius: 12px; padding: 1.25rem; margin-bottom: 1rem;
+        }
+        .method-header {
+            display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem;
+        }
+        .method-name { font-family: monospace; font-size: 1rem; font-weight: 600; color: #fff; }
+        .method-type { font-size: 0.75rem; padding: 0.2rem 0.5rem; border-radius: 4px; font-weight: 600; }
+        .type-read { background: rgba(16,185,129,0.15); color: var(--success-color); }
+        .type-write { background: rgba(245,158,11,0.15); color: var(--warning-color); }
+
+        .result-box {
+            margin-top: 0.75rem; padding: 0.75rem; border-radius: 6px;
+            background: rgba(0,0,0,0.3); font-family: monospace; font-size: 0.9rem;
+            color: var(--success-color); word-break: break-all; display: none;
+        }
+
+        .loader {
+            display: inline-block; width: 16px; height: 16px;
+            border: 2px solid rgba(255,255,255,0.3); border-radius: 50%;
+            border-top-color: #fff; animation: spin 1s linear infinite; margin-right: 6px;
+        }
+
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* Logs Panel */
+        .logs {
+            margin-top: 1.5rem; padding: 1rem; border-radius: 8px; font-size: 0.9rem;
+            display: none; word-break: break-all; background: rgba(0,0,0,0.2);
+            border-left: 4px solid transparent; width: 100%; max-width: 650px;
+        }
+        .logs.visible { display: block; }
+        .logs.success { border-left-color: var(--success-color); color: #ecfdf5; }
+        .logs.error { border-left-color: var(--error-color); color: #fef2f2; }
+        .logs.info { border-left-color: var(--accent-color); color: var(--text-primary); }
+    </style>
+</head>
+<body>
+    <div class="ambient-glow"></div>
+    <div class="ambient-glow-2"></div>
+
+    <header>
+        <h1>TokenTest Interactor</h1>
+        <p>A beautifully designed tool to read and write to your PolkaVM token contract</p>
+    </header>
+
+    <main>
+        <!-- Connection Card -->
+        <div class="card" id="walletCard">
+            <div class="card-title">
+                Connection
+                <span id="networkBadge" class="network-badge">Unknown Network</span>
+            </div>
+            <div class="wallet-status">
+                <div class="status-dot" id="statusDot"></div>
+                <span id="walletStatusText">Disconnected</span>
+            </div>
+            <div id="addressDisplay" style="margin-bottom: 1rem;"></div>
+            
+            <button class="btn" id="connectBtn" style="width:100%;">Connect MetaMask</button>
+            <button class="btn secondary" id="switchNetworkBtn" style="display: none; width:100%; margin-top:10px;">Switch to PolkaVM Testnet</button>
+        </div>
+
+        <!-- Contract Link Card -->
+        <div class="card">
+            <div class="card-title">Target Contract</div>
+            <div class="form-group" style="margin-bottom:0;">
+                <label>Contract Address</label>
+                <input type="text" id="contractAddress" class="form-control" placeholder="0x..." />
+            </div>
+        </div>
+
+        <!-- Read Methods -->
+        <div class="card">
+            <div class="card-title">Read Operations</div>
+            
+            <!-- check_supply -->
+            <div class="method-block">
+                <div class="method-header">
+                    <span class="method-name">check_supply()</span>
+                    <span class="method-type type-read">READ</span>
+                </div>
+                <button class="btn secondary" onclick="handleRead('check_supply', this)" id="btnCheckSupply" disabled>Call Method</button>
+                <div class="result-box" id="res_check_supply"></div>
+            </div>
+
+            <!-- check_paused -->
+            <div class="method-block">
+                <div class="method-header">
+                    <span class="method-name">check_paused()</span>
+                    <span class="method-type type-read">READ</span>
+                </div>
+                <button class="btn secondary" onclick="handleRead('check_paused', this)" id="btnCheckPaused" disabled>Call Method</button>
+                <div class="result-box" id="res_check_paused"></div>
+            </div>
+        </div>
+
+        <!-- Write Methods -->
+        <div class="card">
+            <div class="card-title">Write Operations</div>
+            
+            <!-- issue -->
+            <div class="method-block">
+                <div class="method-header">
+                    <span class="method-name">issue(address recipient, uint256 amount)</span>
+                    <span class="method-type type-write">WRITE</span>
+                </div>
+                <div class="form-group">
+                    <label>Recipient Address</label>
+                    <input type="text" id="input_issue_recipient" class="form-control" placeholder="0x..." />
+                </div>
+                <div class="form-group">
+                    <label>Amount (Integer)</label>
+                    <input type="number" id="input_issue_amount" class="form-control" placeholder="100" />
+                </div>
+                <button class="btn" onclick="handleWrite('issue', [document.getElementById('input_issue_recipient').value, document.getElementById('input_issue_amount').value], this)" id="btnIssue" disabled>Execute Transaction</button>
+            </div>
+
+            <!-- retire -->
+            <div class="method-block">
+                <div class="method-header">
+                    <span class="method-name">retire(uint256 amount)</span>
+                    <span class="method-type type-write">WRITE</span>
+                </div>
+                <div class="form-group">
+                    <label>Amount (Integer)</label>
+                    <input type="number" id="input_retire_amount" class="form-control" placeholder="50" />
+                </div>
+                <button class="btn" onclick="handleWrite('retire', [document.getElementById('input_retire_amount').value], this)" id="btnRetire" disabled>Execute Transaction</button>
+            </div>
+
+            <!-- set_paused -->
+            <div class="method-block">
+                <div class="method-header">
+                    <span class="method-name">set_paused(bool flag)</span>
+                    <span class="method-type type-write">WRITE</span>
+                </div>
+                <div class="form-group">
+                    <label>Flag (true/false)</label>
+                    <select id="input_set_paused_flag" class="form-control">
+                        <option value="true">true (Pause)</option>
+                        <option value="false">false (Unpause)</option>
+                    </select>
+                </div>
+                <button class="btn" onclick="handleWrite('set_paused', [document.getElementById('input_set_paused_flag').value === 'true'], this)" id="btnSetPaused" disabled>Execute Transaction</button>
+            </div>
+        </div>
+        
+    </main>
+
+    <div class="logs" id="logsPanel"></div>
+
+    <script>
+        // Setup PolkaVM Network Constants
+        const TARGET_CHAIN_ID_HEX = '0x190F1B41'; // 420420417
+        const TARGET_RPC_URL = 'https://eth-rpc-testnet.polkadot.io';
+        
+        // Define Contract ABI from TokenTest.foz mappings
+        const CONTRACT_ABI = [
+            "function check_paused() view returns (bool)",
+            "function check_supply() view returns (uint256)",
+            "function issue(address recipient, uint256 amount)",
+            "function retire(uint256 amount)",
+            "function set_paused(bool flag)"
+        ];
+
+        // System State
+        let provider;
+        let signer;
+        let selectedAccount = null;
+        let isCorrectNetwork = false;
+
+        // UI Els
+        const connectBtn = document.getElementById('connectBtn');
+        const switchNetworkBtn = document.getElementById('switchNetworkBtn');
+        const statusDot = document.getElementById('statusDot');
+        const walletStatusText = document.getElementById('walletStatusText');
+        const addressDisplay = document.getElementById('addressDisplay');
+        const networkBadge = document.getElementById('networkBadge');
+        const addressInput = document.getElementById('contractAddress');
+        const logsPanel = document.getElementById('logsPanel');
+        
+        const actionButtons = [
+            document.getElementById('btnCheckSupply'),
+            document.getElementById('btnCheckPaused'),
+            document.getElementById('btnIssue'),
+            document.getElementById('btnRetire'),
+            document.getElementById('btnSetPaused')
+        ];
+
+        // Output logger
+        function showLog(msg, type='info') {
+            logsPanel.className = `logs visible ${type}`;
+            logsPanel.innerHTML = msg;
+        }
+
+        // Network Check
+        function handleNetworkChanged(chainId) {
+            const parsedChainId = Number(chainId);
+            const targetChainIdDec = parseInt(TARGET_CHAIN_ID_HEX, 16);
+
+            if (parsedChainId === targetChainIdDec) {
+                isCorrectNetwork = true;
+                networkBadge.style.display = 'inline-block';
+                networkBadge.innerText = 'PolkaVM Testnet';
+                networkBadge.style.color = 'var(--success-color)';
+                networkBadge.style.borderColor = 'rgba(16,185,129,0.3)';
+                networkBadge.style.background = 'rgba(16,185,129,0.1)';
+                switchNetworkBtn.style.display = 'none';
+            } else {
+                isCorrectNetwork = false;
+                networkBadge.style.display = 'inline-block';
+                networkBadge.innerText = 'Unsupported Network';
+                networkBadge.style.color = 'var(--error-color)';
+                networkBadge.style.borderColor = 'rgba(239,68,68,0.3)';
+                networkBadge.style.background = 'rgba(239,68,68,0.1)';
+                if (selectedAccount) switchNetworkBtn.style.display = 'block';
+            }
+            toggleActionButtons();
+        }
+
+        function handleAccountsChanged(accounts) {
+            if (accounts.length === 0) {
+                selectedAccount = null;
+                statusDot.classList.remove('connected');
+                walletStatusText.innerText = 'Disconnected';
+                addressDisplay.innerText = '';
+                connectBtn.style.display = 'block';
+            } else {
+                selectedAccount = accounts[0];
+                statusDot.classList.add('connected');
+                walletStatusText.innerText = 'Connected';
+                addressDisplay.innerText = selectedAccount;
+                connectBtn.style.display = 'none';
+            }
+            toggleActionButtons();
+        }
+
+        function toggleActionButtons() {
+            const valid = selectedAccount && isCorrectNetwork && addressInput.value.length > 40;
+            actionButtons.forEach(btn => btn.disabled = !valid);
+        }
+
+        // Live validation of contract address input
+        addressInput.addEventListener('input', toggleActionButtons);
+
+        async function initWallet() {
+            if (window.ethereum) {
+                provider = new ethers.BrowserProvider(window.ethereum);
+                try {
+                    const accounts = await provider.send("eth_accounts", []);
+                    if (accounts.length > 0) handleAccountsChanged(accounts);
+                    const net = await provider.getNetwork();
+                    handleNetworkChanged(net.chainId);
+
+                    window.ethereum.on('accountsChanged', handleAccountsChanged);
+                    window.ethereum.on('chainChanged', handleNetworkChanged);
+                } catch (e) { console.error(e); }
+            } else {
+                showLog('MetaMask is required to interact with the contract.', 'error');
+            }
+        }
+
+        connectBtn.addEventListener('click', async () => {
+            if (!provider) initWallet();
+            try {
+                connectBtn.innerText = "Connecting...";
+                const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+                handleAccountsChanged(accounts);
+                const cid = await window.ethereum.request({ method: 'eth_chainId' });
+                handleNetworkChanged(cid);
+            } catch (e) {
+                showLog(e.message, 'error');
+            } finally {
+                connectBtn.innerText = "Connect MetaMask";
+            }
+        });
+
+        switchNetworkBtn.addEventListener('click', async () => {
+            try {
+                await window.ethereum.request({
+                    method: 'wallet_switchEthereumChain',
+                    params: [{ chainId: TARGET_CHAIN_ID_HEX }],
+                });
+            } catch (e) {
+                if (e.code === 4902) {
+                    await window.ethereum.request({
+                        method: 'wallet_addEthereumChain',
+                        params: [{
+                            chainId: TARGET_CHAIN_ID_HEX,
+                            chainName: 'Polkadot Hub Testnet',
+                            nativeCurrency: { name: 'DOT', symbol: 'DOT', decimals: 18 },
+                            rpcUrls: [TARGET_RPC_URL]
+                        }]
+                    });
+                } else {
+                    showLog(e.message, 'error');
+                }
+            }
+        });
+
+        // Smart Contract Interaction Engine
+        async function getContract(writeMode = false) {
+            const address = addressInput.value.trim();
+            if(!ethers.isAddress(address)) throw new Error("Please enter a valid Contract Address");
+
+            if(writeMode) {
+                if(!signer) signer = await provider.getSigner();
+                return new ethers.Contract(address, CONTRACT_ABI, signer);
+            } else {
+                return new ethers.Contract(address, CONTRACT_ABI, provider);
+            }
+        }
+
+        async function handleRead(methodName, btnElement) {
+            try {
+                logsPanel.classList.remove('visible');
+                btnElement.innerHTML = `<span class="loader"></span> Reading...`;
+                btnElement.disabled = true;
+
+                const contract = await getContract(false);
+                const res = await contract[methodName]();
+                
+                const outBox = document.getElementById(`res_${methodName}`);
+                outBox.style.display = 'block';
+                outBox.innerText = `Result: ${res.toString()}`;
+
+            } catch(e) {
+                showLog(`Read Error: ${e.reason || e.message}`, 'error');
+            } finally {
+                btnElement.innerHTML = "Call Method";
+                btnElement.disabled = false;
+            }
+        }
+
+        async function handleWrite(methodName, args, btnElement) {
+            try {
+                logsPanel.classList.remove('visible');
+                btnElement.innerHTML = `<span class="loader"></span> Executing...`;
+                btnElement.disabled = true;
+
+                const contract = await getContract(true);
+
+                showLog("Initiating transaction... Please confirm in MetaMask.", "info");
+
+                // Process args (converting strings to integers if they look strictly like ints to avoid type errs, ethers usually handles it)
+                const tx = await contract[methodName](...args);
+
+                showLog(`Transaction submitted! Waiting for confirmation...<br><br>Tx Hash: <code>${tx.hash}</code>`, "info");
+                
+                const receipt = await tx.wait();
+                
+                if (receipt.status === 1) {
+                    showLog(`<strong>Execution Successful! 🎉</strong><br>Method: <code>${methodName}</code><br>Tx Hash: <code>${receipt.hash}</code>`, "success");
+                } else {
+                    showLog(`<strong>Execution Reverted!</strong><br>Tx Hash: <code>${receipt.hash}</code>`, "error");
+                }
+
+            } catch (e) {
+                console.error(e);
+                showLog(`Write Error: ${e.reason || e.message || 'Transaction Failed'}`, 'error');
+            } finally {
+                btnElement.innerHTML = "Execute Transaction";
+                btnElement.disabled = false;
+            }
+        }
+
+        window.addEventListener('load', () => {
+            if (window.location.protocol === 'file:') {
+                showLog("⚠️ Local file:// protocols restrict MetaMask. Please use local HTTP server.", "error");
+                connectBtn.disabled = true;
+            } else {
+                initWallet();
+            }
+        });
+    </script>
+</body>
+</html>

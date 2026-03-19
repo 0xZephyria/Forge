@@ -1,0 +1,11 @@
+version 1
+
+contract Test:
+    has:
+        x is u256
+
+    setup():
+        x = 0
+
+    action test_this():
+        let y = caller
