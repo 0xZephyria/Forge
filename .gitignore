@@ -1,7 +1,7 @@
 # Zig
 .zig-cache/
 zig-out/
-
+o
 # OS
 .DS_Store
 
@@ -20,3 +20,8 @@ contracts/payload.hex
 gaps_implementation_plan.md
 Claude.md
 FORGE_LANGUAGE_SPEC.md
+FORGE_GEMINI_GAP_FIX_PROMPTS.md
+Gemini.md
+deploy.html
+interact.html
+out/

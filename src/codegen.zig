@@ -17,6 +17,7 @@ const errors = @import("errors.zig");
 const types = @import("types.zig");
 const checker = @import("checker.zig");
 const riscv = @import("riscv.zig");
+const u256_mod = @import("u256.zig");
 
 const Span = ast.Span;
 const Expr = ast.Expr;
@@ -73,8 +74,10 @@ pub const ZephBinHeader = extern struct {
     bytecode_len: u32 = 0,
     /// CRC32 of entire file after this field.
     checksum: u32 = 0,
+    /// Byte length of the static data section.
+    data_section_len: u32 = 0,
     /// Reserved padding to reach exactly 64 bytes.
-    _reserved: [8]u8 = [_]u8{0} ** 8,
+    _reserved: [4]u8 = [_]u8{0} ** 4,
 };
 comptime {
     std.debug.assert(@sizeOf(ZephBinHeader) == 64);
@@ -110,6 +113,78 @@ fn crc32(data: []const u8) u32 {
         crc = (crc >> 8) ^ crc32_table[idx];
     }
     return crc ^ 0xFFFFFFFF;
+}
+
+fn pow10(n: u8) u64 {
+    const table: [19]u64 = .{
+        1,
+        10,
+        100,
+        1_000,
+        10_000,
+        100_000,
+        1_000_000,
+        10_000_000,
+        100_000_000,
+        1_000_000_000,
+        10_000_000_000,
+        100_000_000_000,
+        1_000_000_000_000,
+        10_000_000_000_000,
+        100_000_000_000_000,
+        1_000_000_000_000_000,
+        10_000_000_000_000_000,
+        100_000_000_000_000_000,
+        1_000_000_000_000_000_000,
+    };
+    if (n > 18) return std.math.maxInt(u64);
+    return table[n];
+}
+
+fn scaleFixedPoint(lit: []const u8, decimals: u8) u64 {
+    var int_part_buf: [80]u8 = undefined;
+    var frac_part_buf: [80]u8 = undefined;
+    var int_len: usize = 0;
+    var frac_len: usize = 0;
+    
+    var in_frac = false;
+    for (lit) |c| {
+        if (c == '_') continue;
+        if (c == '.') {
+            in_frac = true;
+            continue;
+        }
+        if (!in_frac) {
+            if (int_len < int_part_buf.len) {
+                int_part_buf[int_len] = c;
+                int_len += 1;
+            }
+        } else {
+            if (frac_len < frac_part_buf.len) {
+                frac_part_buf[frac_len] = c;
+                frac_len += 1;
+            }
+        }
+    }
+    
+    const int_str = int_part_buf[0..int_len];
+    var padded_frac_buf: [80]u8 = [_]u8{'0'} ** 80;
+    const copy_len = @min(frac_len, decimals);
+    @memcpy(padded_frac_buf[0..copy_len], frac_part_buf[0..copy_len]);
+    const frac_str = padded_frac_buf[0..decimals];
+    
+    const int_val = if (int_str.len == 0) 0 else std.fmt.parseInt(u64, int_str, 10) catch 0;
+    const frac_val = if (frac_str.len == 0) 0 else std.fmt.parseInt(u64, frac_str, 10) catch 0;
+    
+    const p10 = pow10(decimals);
+    
+    const mul_tup = @mulWithOverflow(int_val, p10);
+    if (mul_tup[1] != 0) return std.math.maxInt(u64);
+    
+    const add_tup = @addWithOverflow(mul_tup[0], frac_val);
+    if (add_tup[1] != 0) return std.math.maxInt(u64);
+    
+    return add_tup[0];
 }
 
 // ============================================================================
@@ -215,6 +290,11 @@ pub const CodeGen = struct {
     resolver: *TypeResolver,
     field_ids: std.StringHashMap(u32),
     next_field_id: u32,
+    /// Maps interned string content (without quotes) to its byte offset
+    /// in the data section.
+    string_table: std.StringHashMap(u32),
+    /// Accumulated static data bytes: null-terminated, 4-byte aligned strings.
+    data_section: std.ArrayListUnmanaged(u8),
 
     /// Create a new code generator.
     pub fn init(
@@ -228,12 +308,36 @@ pub const CodeGen = struct {
             .resolver = resolver,
             .field_ids = std.StringHashMap(u32).init(allocator),
             .next_field_id = 0,
+            .string_table = std.StringHashMap(u32).init(allocator),
+            .data_section = .{},
         };
     }
 
     /// Release all internal resources.
     pub fn deinit(self: *CodeGen) void {
         self.field_ids.deinit();
+        self.string_table.deinit();
+        self.data_section.deinit(self.allocator);
+    }
+
+    /// Intern a string literal, returning its offset in the data section.
+    fn internString(self: *CodeGen, content: []const u8) anyerror!u32 {
+        if (self.string_table.get(content)) |offset| {
+            return offset;
+        }
+
+        const offset: u32 = @intCast(self.data_section.items.len);
+        
+        try self.data_section.appendSlice(self.allocator, content);
+        try self.data_section.append(self.allocator, 0); // null terminator
+
+        // 4-byte alignment
+        while (self.data_section.items.len % 4 != 0) {
+            try self.data_section.append(self.allocator, 0);
+        }
+
+        try self.string_table.put(content, offset);
+        return offset;
     }
 
     /// Assign a sequential field ID to a state field name.
@@ -257,8 +361,9 @@ pub const CodeGen = struct {
             _ = self.getOrAssignFieldId(sf.name);
         }
 
-        // action_count includes both actions and views (both are externally callable)
-        const action_count: u16 = @intCast(contract.actions.len + contract.views.len);
+        // Constructor counts as an entry if present
+        const setup_count: u16 = if (contract.setup != null) 1 else 0;
+        const action_count: u16 = @intCast(contract.actions.len + contract.views.len + setup_count);
 
         // Determine flags
         var flags: u16 = 0;
@@ -283,6 +388,23 @@ pub const CodeGen = struct {
                 self.allocator.free(ab.code);
             }
             action_codes.deinit(self.allocator);
+        }
+
+        // ── Generate constructor (setup block) if present ────────────────────
+        if (contract.setup) |setup| {
+            var ctx = ActionCtx.init(self.allocator, "__setup__", &self.field_ids);
+            defer ctx.deinit();
+
+            try self.genSetup(&setup, &ctx);
+
+            const code_bytes = ctx.writer.toBytes();
+            const owned_copy = try self.allocator.alloc(u8, code_bytes.len);
+            @memcpy(owned_copy, code_bytes);
+
+            try action_codes.append(self.allocator, .{
+                .selector = 0x00000000,
+                .code = owned_copy,
+            });
         }
 
         for (contract.actions) |action| {
@@ -327,14 +449,21 @@ pub const CodeGen = struct {
         defer self.allocator.free(bytecode_bytes);
 
         // ── Assemble final binary ────────────────────────────────────────
+        // Layout: [64-byte header][access_list][bytecode][data_section]
+        const data_bytes = self.data_section.items;
         var header = ZephBinHeader{};
         header.contract_name = writeContractName(contract.name);
         header.action_count = action_count;
         header.flags = flags;
         header.access_list_len = @intCast(access_list_bytes.len);
         header.bytecode_len = @intCast(bytecode_bytes.len);
+        header.data_section_len = @intCast(data_bytes.len);
 
-        const total_size = @sizeOf(ZephBinHeader) + access_list_bytes.len + bytecode_bytes.len;
+        const total_size = @sizeOf(ZephBinHeader) +
+            access_list_bytes.len +
+            bytecode_bytes.len +
+            data_bytes.len;
+
         const binary = try self.allocator.alloc(u8, total_size);
         errdefer self.allocator.free(binary);
 
@@ -349,6 +478,12 @@ pub const CodeGen = struct {
         // Copy bytecode
         const bc_start = al_start + access_list_bytes.len;
         @memcpy(binary[bc_start..][0..bytecode_bytes.len], bytecode_bytes);
+
+        // Copy data section
+        const ds_start = bc_start + bytecode_bytes.len;
+        if (data_bytes.len > 0) {
+            @memcpy(binary[ds_start..][0..data_bytes.len], data_bytes);
+        }
 
         // Compute and store checksum over everything after checksum field
         const checksum_offset = @offsetOf(ZephBinHeader, "checksum") + @sizeOf(u32);
@@ -435,6 +570,39 @@ pub const CodeGen = struct {
 
         // ── Body ─────────────────────────────────────────────────────────
         for (view.body) |stmt| {
+            try self.genStmt(&stmt, ctx);
+        }
+
+        // ── Epilogue ─────────────────────────────────────────────────────
+        try ctx.writer.emit(riscv.LD(.s0, .sp, 8));
+        try ctx.writer.emit(riscv.LD(.ra, .sp, 0));
+        try ctx.writer.emit(riscv.ADDI(.sp, .sp, frame_size));
+        try ctx.writer.emit(riscv.JALR(.zero, .ra, 0));
+    }
+
+    // ── Setup (Constructor) code generation ──────────────────────────────
+
+    /// Generate bytecode for the setup block (constructor).
+    fn genSetup(self: *CodeGen, setup: *const ast.SetupBlock, ctx: *ActionCtx) anyerror!void {
+        const frame_size: i12 = 64;
+
+        // ── Prologue ─────────────────────────────────────────────────────
+        try ctx.writer.emit(riscv.ADDI(.sp, .sp, -frame_size));
+        try ctx.writer.emit(riscv.SD(.sp, .ra, 0));
+        try ctx.writer.emit(riscv.SD(.sp, .s0, 8));
+        try ctx.writer.emit(riscv.ADDI(.s0, .sp, frame_size));
+
+        // ── Bind parameters to registers ─────────────────────────────────
+        for (setup.params, 0..) |param, i| {
+            if (i < 7) {
+                const reg: Reg = @enumFromInt(@as(u5, @intCast(10 + i)));
+                ctx.reg_alloc.used[@intFromEnum(reg)] = true;
+                try ctx.locals.put(param.name, reg);
+            }
+        }
+
+        // ── Body ─────────────────────────────────────────────────────────
+        for (setup.body) |stmt| {
             try self.genStmt(&stmt, ctx);
         }
 
@@ -652,14 +820,70 @@ pub const CodeGen = struct {
     fn genExpr(self: *CodeGen, expr: *const Expr, ctx: *ActionCtx, dest: Reg) anyerror!void {
         switch (expr.kind) {
             .int_lit => |lit| {
-                const val = std.fmt.parseInt(u64, lit, 10) catch 0;
-                try self.genLoadImmediate(val, dest, ctx);
+                // Strip underscore separators before parsing
+                // (the lexer preserves them in the source text)
+                var clean_buf: [80]u8 = undefined;
+                var clean_len: usize = 0;
+                for (lit) |c| {
+                    if (c != '_') {
+                        if (clean_len >= clean_buf.len) break;
+                        clean_buf[clean_len] = c;
+                        clean_len += 1;
+                    }
+                }
+                const clean = clean_buf[0..clean_len];
+
+                // Check for hex prefix
+                const u256val: u256_mod.U256 = if (clean.len >= 2 and clean[0] == '0' and
+                    (clean[1] == 'x' or clean[1] == 'X'))
+                    u256_mod.U256.parseHex(clean[2..]) catch u256_mod.U256.zero
+                else
+                    u256_mod.U256.parseDecimal(clean) catch u256_mod.U256.zero;
+
+                if (u256val.fitsU64()) {
+                    // Fast path: value fits in one register
+                    try self.genLoadImmediate(u256val.toU64(), dest, ctx);
+                } else {
+                    // Wide path: store 32-byte little-endian value on the stack.
+                    // ZVM wide-integer convention: pass a pointer to the 32-byte
+                    // value in memory. The `dest` register receives the stack pointer
+                    // to that allocation.
+                    //
+                    // Stack layout (grows downward):
+                    //   [sp+24..sp+31] = limbs[3] (most significant)
+                    //   [sp+16..sp+23] = limbs[2]
+                    //   [sp+8..sp+15]  = limbs[1]
+                    //   [sp+0..sp+7]   = limbs[0] (least significant)
+                    try ctx.writer.emit(riscv.ADDI(.sp, .sp, -32));
+                    for (u256val.limbs, 0..) |limb, i| {
+                        const tmp = ctx.reg_alloc.alloc() orelse .t3;
+                        defer ctx.reg_alloc.free(tmp);
+                        try self.genLoadImmediate(limb, tmp, ctx);
+                        const off: i12 = @intCast(i * 8);
+                        try ctx.writer.emit(riscv.SD(.sp, tmp, off));
+                    }
+                    // dest = pointer to the 32-byte value
+                    try ctx.writer.emit(riscv.ADD(dest, .sp, .zero));
+                    // IMPORTANT: The caller that receives a wide value pointer is
+                    // responsible for freeing stack space with ADDI sp, sp, 32.
+                    // For simple assignments to state fields, genStateWrite handles this.
+                }
             },
             .bool_lit => |b| {
                 try ctx.writer.emit(riscv.ADDI(dest, .zero, if (b) 1 else 0));
             },
             .string_lit => |s| {
-                try self.genLoadImmediate(@intCast(s.len), dest, ctx);
+                // s includes surrounding double-quotes — strip them.
+                // e.g. s = `"hello"` → content = `hello`
+                const content = if (s.len >= 2) s[1..s.len-1] else s;
+                const offset = try self.internString(content);
+
+                // ZVM string convention: the gp (x3, global pointer) register holds
+                // the base address of the contract's data section at runtime.
+                // dest = gp + offset (pointer to the null-terminated string).
+                // The string length is available as content.len if needed by callers.
+                try self.genLoadImmediate(@intCast(offset), dest, ctx);
+                try ctx.writer.emit(riscv.ADD(dest, .gp, dest));
             },
             .nothing => {
                 try ctx.writer.emit(riscv.ADDI(dest, .zero, 0));
@@ -752,8 +976,14 @@ pub const CodeGen = struct {
             .try_propagate => |inner| {
                 try self.genExpr(inner, ctx, dest);
             },
-            .float_lit => |_| {
-                try ctx.writer.emit(riscv.ADDI(dest, .zero, 0));
+            .float_lit => |lit| {
+                // Forge fixed-point literals default to 18 decimal places (price18)
+                // unless the checker has annotated the expected type. Since the codegen
+                // does not yet carry resolved types per-expression, we default to 18
+                // which is the most precise (price18 / standard DeFi precision).
+                // The value will be truncated if assigned to a lower-precision type.
+                const scaled = scaleFixedPoint(lit, 18);
+                try self.genLoadImmediate(scaled, dest, ctx);
             },
             else => {
                 try ctx.writer.emit(riscv.ADDI(dest, .zero, 0));
@@ -1297,8 +1527,139 @@ pub const CodeGen = struct {
 // Section 7 — Tests
 // ============================================================================
 
-test "ZephBinHeader is exactly 64 bytes" {
+test "ZephBinHeader is still exactly 64 bytes after adding data_section_len" {
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(ZephBinHeader));
+}
+
+test "internString stores content and returns correct offset" {
+    const allocator = std.testing.allocator;
+    var diags = DiagnosticList.init(allocator);
+    defer diags.deinit();
+    var resolver = TypeResolver.init(allocator, &diags);
+    defer resolver.deinit();
+
+    var gen = CodeGen.init(allocator, &diags, &resolver);
+    defer gen.deinit();
+
+    const off1 = try gen.internString("hello");
+    try std.testing.expectEqual(@as(u32, 0), off1);
+
+    const off2 = try gen.internString("world");
+    try std.testing.expectEqual(@as(u32, 8), off2); // 5 + 1 (null) = 6 -> pad to 8
+
+    const off3 = try gen.internString("hello");
+    try std.testing.expectEqual(@as(u32, 0), off3); // deduplicated
+
+    try std.testing.expectEqualSlices(u8, "hello", gen.data_section.items[0..5]);
+    try std.testing.expectEqual(@as(u8, 0), gen.data_section.items[5]);
+}
+
+test "internString null-terminates and 4-byte aligns" {
+    const allocator = std.testing.allocator;
+    var diags = DiagnosticList.init(allocator);
+    defer diags.deinit();
+    var resolver = TypeResolver.init(allocator, &diags);
+    defer resolver.deinit();
+
+    var gen = CodeGen.init(allocator, &diags, &resolver);
+    defer gen.deinit();
+
+    const off1 = try gen.internString("hi");
+    try std.testing.expectEqual(@as(u32, 0), off1);
+    try std.testing.expectEqualSlices(u8, "hi\x00\x00", gen.data_section.items[0..4]);
+    
+    const off2 = try gen.internString("abc");
+    try std.testing.expectEqual(@as(u32, 4), off2);
+    try std.testing.expectEqualSlices(u8, "abc\x00", gen.data_section.items[4..8]);
+}
+
+test "genExpr string_lit emits gp-relative load" {
+    const allocator = std.testing.allocator;
+    var diags = DiagnosticList.init(allocator);
+    defer diags.deinit();
+    var resolver = TypeResolver.init(allocator, &diags);
+    defer resolver.deinit();
+
+    var gen = CodeGen.init(allocator, &diags, &resolver);
+    defer gen.deinit();
+
+    var field_ids = std.StringHashMap(u32).init(allocator);
+    defer field_ids.deinit();
+    var ctx = ActionCtx.init(allocator, "dummy", &field_ids);
+    defer ctx.deinit();
+
+    const expr = Expr{ .kind = .{ .string_lit = "\"hello\"" }, .span = .{ .line=1, .col=1, .len=7 } };
+    try gen.genExpr(&expr, &ctx, .a0);
+
+    const bytes = ctx.writer.toBytes();
+    try std.testing.expect(bytes.len >= 8); // Loadimmediate (4) + ADD a0, gp, a0 (4)
+    
+    const actual_load = std.mem.readInt(u32, bytes[0..4], .little);
+    const expected_load = riscv.ADDI(.a0, .zero, 0); // Offset is 0
+    try std.testing.expectEqual(expected_load, actual_load);
+
+    const actual_add = std.mem.readInt(u32, bytes[4..8], .little);
+    const expected_add = riscv.ADD(.a0, .gp, .a0);
+    try std.testing.expectEqual(expected_add, actual_add);
+
+    try std.testing.expectEqualSlices(u8, "hello\x00", gen.data_section.items[0..6]);
+}
+
+test "generate includes data section in binary" {
+    const allocator = std.testing.allocator;
+    var diags = DiagnosticList.init(allocator);
+    defer diags.deinit();
+    var resolver = TypeResolver.init(allocator, &diags);
+    defer resolver.deinit();
+
+    var gen = CodeGen.init(allocator, &diags, &resolver);
+    defer gen.deinit();
+
+    var contract = makeEmptyContract("StringContract");
+    
+    var ast_arena = std.heap.ArenaAllocator.init(allocator);
+    defer ast_arena.deinit();
+
+    // Create an action with a single string literal expr statement
+    var expr = Expr{ .kind = .{ .string_lit = "\"test_data\"" }, .span = .{ .line=1, .col=1, .len=11 } };
+    const expr_stmt = Stmt{ .kind = .{ .call_stmt = &expr }, .span = .{ .line=1, .col=1, .len=11 } };
+
+    var body_stmts = [_]Stmt{expr_stmt};
+    const action = ActionDecl{
+        .name = "test_action",
+        .visibility = .shared,
+        .type_params = &.{},
+        .params = &.{},
+        .return_type = null,
+        .annotations = &.{},
+        .accounts = &.{},
+        .body = &body_stmts,
+        .span = .{ .line=1, .col=1, .len=11 },
+    };
+
+    var actions = [_]ActionDecl{action};
+    contract.actions = &actions;
+
+    var checked = CheckedContract{
+        .name = "Test",
+        .action_lists = std.StringHashMap(AccessList).init(allocator),
+        .type_map = std.StringHashMap(ResolvedType).init(allocator),
+        .scope = types.SymbolTable.init(allocator, null),
+        .allocator = allocator,
+    };
+    defer checked.deinit();
+
+    const binary = try gen.generate(&contract, &checked);
+    defer allocator.free(binary);
+
+    const ds_len = std.mem.readInt(u32, binary[@offsetOf(ZephBinHeader, "data_section_len")..][0..4], .little);
+    try std.testing.expect(ds_len > 0);
+    try std.testing.expectEqual(@as(u32, 12), ds_len); // "test_data" is 9 chars + 1 null = 10, padded to 12
+
+    const al_len = std.mem.readInt(u32, binary[@offsetOf(ZephBinHeader, "access_list_len")..][0..4], .little);
+    const bc_len = std.mem.readInt(u32, binary[@offsetOf(ZephBinHeader, "bytecode_len")..][0..4], .little);
+    
+    try std.testing.expectEqual(@sizeOf(ZephBinHeader) + al_len + bc_len + ds_len, binary.len);
 }
 
 test "ZephBinHeader default magic is ZEPH" {
@@ -1376,3 +1737,258 @@ test "RegAlloc freeAll resets state" {
     }
     try std.testing.expectEqual(@as(usize, 14), count);
 }
+
+// ── Test Helper ──────────────────────────────────────────────────────────────
+
+fn makeEmptyContract(name: []const u8) ContractDef {
+    return .{
+        .name = name,
+        .inherits = null,
+        .implements = &.{},
+        .accounts = &.{},
+        .authorities = &.{},
+        .config = &.{},
+        .always = &.{},
+        .state = &.{},
+        .computed = &.{},
+        .setup = null,
+        .guards = &.{},
+        .actions = &.{},
+        .views = &.{},
+        .pures = &.{},
+        .helpers = &.{},
+        .events = &.{},
+        .errors_ = &.{},
+        .upgrade = null,
+        .namespaces = &.{},
+        .invariants = &.{},
+        .span = .{ .line = 1, .col = 1, .len = 12 },
+    };
+}
+
+test "generate omits setup section when setup is null" {
+    const allocator = std.testing.allocator;
+    var diags = DiagnosticList.init(allocator);
+    defer diags.deinit();
+    var resolver = TypeResolver.init(allocator, &diags);
+    defer resolver.deinit();
+
+    var gen = CodeGen.init(allocator, &diags, &resolver);
+    defer gen.deinit();
+
+    const contract = makeEmptyContract("EmptyContract");
+    var checked = CheckedContract{
+        .name = "Test",
+        .action_lists = std.StringHashMap(AccessList).init(allocator),
+        .type_map = std.StringHashMap(ResolvedType).init(allocator),
+        .scope = types.SymbolTable.init(allocator, null),
+        .allocator = allocator,
+    };
+    defer checked.deinit();
+
+    const binary = try gen.generate(&contract, &checked);
+    defer allocator.free(binary);
+
+    const action_count = std.mem.readInt(u16, binary[@offsetOf(ZephBinHeader, "action_count")..][0..2], .little);
+    try std.testing.expectEqual(@as(u16, 0), action_count);
+
+    const al_len = std.mem.readInt(u32, binary[@offsetOf(ZephBinHeader, "access_list_len")..][0..4], .little);
+    const bc_start = 64 + al_len;
+    
+    const bc_action_count = std.mem.readInt(u16, binary[bc_start..][0..2], .little);
+    try std.testing.expectEqual(@as(u16, 0), bc_action_count);
+}
+
+test "generate includes setup block in binary when present" {
+    const allocator = std.testing.allocator;
+    var diags = DiagnosticList.init(allocator);
+    defer diags.deinit();
+    var resolver = TypeResolver.init(allocator, &diags);
+    defer resolver.deinit();
+
+    var gen = CodeGen.init(allocator, &diags, &resolver);
+    defer gen.deinit();
+
+    var contract = makeEmptyContract("SetupContract");
+    
+    var ast_arena = std.heap.ArenaAllocator.init(allocator);
+    defer ast_arena.deinit();
+
+    const setup = ast.SetupBlock{
+        .params = &.{},
+        .body = &.{},
+        .span = .{ .line = 1, .col = 1, .len = 10 },
+    };
+    contract.setup = setup;
+
+    var checked = CheckedContract{
+        .name = "Test",
+        .action_lists = std.StringHashMap(AccessList).init(allocator),
+        .type_map = std.StringHashMap(ResolvedType).init(allocator),
+        .scope = types.SymbolTable.init(allocator, null),
+        .allocator = allocator,
+    };
+    defer checked.deinit();
+
+    const binary = try gen.generate(&contract, &checked);
+    defer allocator.free(binary);
+
+    const action_count = std.mem.readInt(u16, binary[@offsetOf(ZephBinHeader, "action_count")..][0..2], .little);
+    try std.testing.expectEqual(@as(u16, 1), action_count);
+
+    const al_len = std.mem.readInt(u32, binary[@offsetOf(ZephBinHeader, "access_list_len")..][0..4], .little);
+    const bc_start = 64 + al_len;
+    
+    const bc_action_count = std.mem.readInt(u16, binary[bc_start..][0..2], .little);
+    try std.testing.expectEqual(@as(u16, 1), bc_action_count);
+
+    const selector = std.mem.readInt(u32, binary[bc_start + 2 ..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 0), selector);
+}
+
+test "genSetup emits prologue and epilogue instructions" {
+    const allocator = std.testing.allocator;
+    var diags = DiagnosticList.init(allocator);
+    defer diags.deinit();
+    var resolver = TypeResolver.init(allocator, &diags);
+    defer resolver.deinit();
+
+    var gen = CodeGen.init(allocator, &diags, &resolver);
+    defer gen.deinit();
+
+    const setup = ast.SetupBlock{
+        .params = &.{},
+        .body = &.{},
+        .span = .{ .line = 1, .col = 1, .len = 10 },
+    };
+
+    var ctx = ActionCtx.init(allocator, "__setup__", &gen.field_ids);
+    defer ctx.deinit();
+
+    try gen.genSetup(&setup, &ctx);
+    
+    const bytes = ctx.writer.toBytes();
+    try std.testing.expect(bytes.len > 0);
+
+    const expected_prologue = riscv.ADDI(.sp, .sp, -64);
+    const actual_prologue = std.mem.readInt(u32, bytes[0..4], .little);
+    try std.testing.expectEqual(expected_prologue, actual_prologue);
+
+    const expected_epilogue = riscv.JALR(.zero, .ra, 0);
+    const actual_epilogue = std.mem.readInt(u32, bytes[bytes.len - 4 ..][0..4], .little);
+    try std.testing.expectEqual(expected_epilogue, actual_epilogue);
+}
+
+test "genExpr int_lit small value" {
+    const allocator = std.testing.allocator;
+    var diags = DiagnosticList.init(allocator);
+    defer diags.deinit();
+    var resolver = TypeResolver.init(allocator, &diags);
+    defer resolver.deinit();
+    var gen = CodeGen.init(allocator, &diags, &resolver);
+    defer gen.deinit();
+
+    var field_ids = std.StringHashMap(u32).init(allocator);
+    defer field_ids.deinit();
+    var ctx = ActionCtx.init(allocator, "dummy", &field_ids);
+    defer ctx.deinit();
+
+    const expr = Expr{ .kind = .{ .int_lit = "42" }, .span = .{ .line=1, .col=1, .len=2 } };
+    try gen.genExpr(&expr, &ctx, .a0);
+
+    const bytes = ctx.writer.toBytes();
+    try std.testing.expect(bytes.len >= 4);
+    const expected = riscv.ADDI(.a0, .zero, 42); // ADDI a0, zero, 42
+    const actual = std.mem.readInt(u32, bytes[0..4], .little);
+    try std.testing.expectEqual(expected, actual);
+}
+
+test "genExpr int_lit u64_max does not overflow" {
+    const allocator = std.testing.allocator;
+    var diags = DiagnosticList.init(allocator);
+    defer diags.deinit();
+    var resolver = TypeResolver.init(allocator, &diags);
+    defer resolver.deinit();
+    var gen = CodeGen.init(allocator, &diags, &resolver);
+    defer gen.deinit();
+
+    var field_ids = std.StringHashMap(u32).init(allocator);
+    defer field_ids.deinit();
+    var ctx = ActionCtx.init(allocator, "dummy", &field_ids);
+    defer ctx.deinit();
+
+    const expr = Expr{ .kind = .{ .int_lit = "18446744073709551615" }, .span = .{ .line=1, .col=1, .len=20 } };
+    try gen.genExpr(&expr, &ctx, .a0);
+    const bytes = ctx.writer.toBytes();
+    try std.testing.expect(bytes.len >= 4);
+    const zero_addi = riscv.ADDI(.a0, .zero, 0);
+    const actual = std.mem.readInt(u32, bytes[0..4], .little);
+    try std.testing.expect(actual != zero_addi);
+}
+
+test "genExpr int_lit larger than u64 emits stack pointer" {
+    const allocator = std.testing.allocator;
+    var diags = DiagnosticList.init(allocator);
+    defer diags.deinit();
+    var resolver = TypeResolver.init(allocator, &diags);
+    defer resolver.deinit();
+    var gen = CodeGen.init(allocator, &diags, &resolver);
+    defer gen.deinit();
+
+    var field_ids = std.StringHashMap(u32).init(allocator);
+    defer field_ids.deinit();
+    var ctx = ActionCtx.init(allocator, "dummy", &field_ids);
+    defer ctx.deinit();
+
+    const expr = Expr{ .kind = .{ .int_lit = "18446744073709551616" }, .span = .{ .line=1, .col=1, .len=20 } };
+    try gen.genExpr(&expr, &ctx, .a0);
+
+    const bytes = ctx.writer.toBytes();
+    try std.testing.expect(bytes.len >= 4);
+    const expected = riscv.ADDI(.sp, .sp, -32);
+    const actual = std.mem.readInt(u32, bytes[0..4], .little);
+    try std.testing.expectEqual(expected, actual);
+}
+
+test "scaleFixedPoint with 9 decimals" {
+    try std.testing.expectEqual(@as(u64, 1_500_000_000), scaleFixedPoint("1.5", 9));
+    try std.testing.expectEqual(@as(u64, 1_000_000), scaleFixedPoint("0.001", 9));
+    try std.testing.expectEqual(@as(u64, 100_000_000_000), scaleFixedPoint("100", 9));
+    try std.testing.expectEqual(@as(u64, 1_234_567_890_000), scaleFixedPoint("1_234.567890", 9));
+}
+
+test "scaleFixedPoint truncates excess decimals" {
+    try std.testing.expectEqual(@as(u64, 1_123_456_789), scaleFixedPoint("1.123456789012345", 9));
+}
+
+test "genExpr float_lit produces non-zero for non-zero input" {
+    const allocator = std.testing.allocator;
+    var diags = DiagnosticList.init(allocator);
+    defer diags.deinit();
+    var resolver = TypeResolver.init(allocator, &diags);
+    defer resolver.deinit();
+    var gen = CodeGen.init(allocator, &diags, &resolver);
+    defer gen.deinit();
+
+    var field_ids = std.StringHashMap(u32).init(allocator);
+    defer field_ids.deinit();
+    var ctx = ActionCtx.init(allocator, "dummy", &field_ids);
+    defer ctx.deinit();
+
+    const expr = Expr{ .kind = .{ .float_lit = "1.5" }, .span = .{ .line=1, .col=1, .len=3 } };
+    try gen.genExpr(&expr, &ctx, .a0);
+
+    const bytes = ctx.writer.toBytes();
+    try std.testing.expect(bytes.len >= 4);
+    const zero_addi = riscv.ADDI(.a0, .zero, 0);
+    const actual = std.mem.readInt(u32, bytes[0..4], .little);
+    try std.testing.expect(actual != zero_addi);
+}
+
+test "pow10 lookup table" {
+    try std.testing.expectEqual(@as(u64, 1), pow10(0));
+    try std.testing.expectEqual(@as(u64, 1_000_000_000), pow10(9));
+    try std.testing.expectEqual(@as(u64, 1_000_000_000_000_000_000), pow10(18));
+    try std.testing.expectEqual(std.math.maxInt(u64), pow10(19));
+}
+

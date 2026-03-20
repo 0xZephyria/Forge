@@ -218,6 +218,10 @@ pub const TypeResolver = struct {
     type_aliases: std.StringHashMap(ResolvedType),
     struct_defs: std.StringHashMap(StructInfo),
     enum_defs: std.StringHashMap(EnumInfo),
+    contract_defs: std.StringHashMap(ast.ContractDef),
+    /// Stores all declared interfaces by name.
+    /// Values are raw AST pointers — valid for the lifetime of the source AST.
+    interface_defs: std.StringHashMap(ast.InterfaceDef),
     allocator: std.mem.Allocator,
     diagnostics: *DiagnosticList,
 
@@ -228,6 +232,8 @@ pub const TypeResolver = struct {
             .type_aliases = std.StringHashMap(ResolvedType).init(allocator),
             .struct_defs = std.StringHashMap(StructInfo).init(allocator),
             .enum_defs = std.StringHashMap(EnumInfo).init(allocator),
+            .contract_defs = std.StringHashMap(ast.ContractDef).init(allocator),
+            .interface_defs = std.StringHashMap(ast.InterfaceDef).init(allocator),
             .allocator = allocator,
             .diagnostics = diagnostics,
         };
@@ -251,6 +257,16 @@ pub const TypeResolver = struct {
         self.type_aliases.deinit();
         self.struct_defs.deinit();
         self.enum_defs.deinit();
+        self.contract_defs.deinit();
+        self.interface_defs.deinit();
+    }
+
+    pub fn lookupInterface(self: *const TypeResolver, name: []const u8) ?ast.InterfaceDef {
+        return self.interface_defs.get(name);
+    }
+
+    pub fn lookupContract(self: *const TypeResolver, name: []const u8) ?ast.ContractDef {
+        return self.contract_defs.get(name);
     }
 
     /// Allocate a single `ResolvedType` on the heap and return a pointer.
@@ -590,6 +606,9 @@ pub const TypeResolver = struct {
                     });
                 },
                 .contract => |ct| {
+                    // Store the full ContractDef so child contracts can inherit from it.
+                    try self.contract_defs.put(ct.name, ct);
+
                     for (ct.state) |sf| {
                         const resolved = try self.resolve(sf.type_);
                         try self.global_scope.define(sf.name, .{
@@ -692,7 +711,19 @@ pub const TypeResolver = struct {
                 },
                 .version => {},
                 .use_import => {},
-                .interface_def => {},
+                .interface_def => |iface| {
+                    // Store the interface definition for later conformance checking.
+                    try self.interface_defs.put(iface.name, iface);
+                    // Also register the name in the global scope so the type system
+                    // can resolve `implements InterfaceName` references.
+                    try self.global_scope.define(iface.name, .{
+                        .name    = iface.name,
+                        .kind    = .type_alias,
+                        .type_   = .void_,
+                        .span    = iface.span,
+                        .mutable = false,
+                    });
+                },
             }
         }
     }
@@ -868,4 +899,140 @@ test "infer field access on struct" {
     };
     const result2 = try resolver.inferExpr(&access_bool, &scope);
     try std.testing.expectEqual(ResolvedType.bool, result2);
+}
+
+test "registerTopLevel stores interface_def" {
+    const allocator = std.testing.allocator;
+    var diags = DiagnosticList.init(allocator);
+    defer diags.deinit();
+    var resolver = TypeResolver.init(allocator, &diags);
+    defer resolver.deinit();
+
+    var params = [_]ast.Param{.{
+        .name = "to",
+        .declared_type = .account,
+        .is_private = false,
+        .span = .{ .line = 1, .col = 1, .len = 2 },
+    }};
+
+    const action = ast.InterfaceAction{
+        .name = "transfer",
+        .params = &params,
+        .return_type = null,
+        .span = .{ .line = 1, .col = 1, .len = 8 },
+    };
+
+    var members = [_]ast.InterfaceMember{.{ .action = action }};
+
+    const iface = ast.InterfaceDef{
+        .name = "Transferable",
+        .members = &members,
+        .span = .{ .line = 1, .col = 1, .len = 12 },
+    };
+
+    const tops = [_]TopLevel{.{ .interface_def = iface }};
+    try resolver.registerTopLevel(&tops);
+
+    const lookup = resolver.lookupInterface("Transferable");
+    try std.testing.expect(lookup != null);
+    try std.testing.expectEqualSlices(u8, "Transferable", lookup.?.name);
+    try std.testing.expectEqual(@as(usize, 1), lookup.?.members.len);
+}
+
+test "lookupInterface returns null for unknown interface" {
+    const allocator = std.testing.allocator;
+    var diags = DiagnosticList.init(allocator);
+    defer diags.deinit();
+    var resolver = TypeResolver.init(allocator, &diags);
+    defer resolver.deinit();
+
+    const lookup = resolver.lookupInterface("DoesNotExist");
+    try std.testing.expectEqual(@as(?ast.InterfaceDef, null), lookup);
+}
+
+test "interface name is defined in global scope" {
+    const allocator = std.testing.allocator;
+    var diags = DiagnosticList.init(allocator);
+    defer diags.deinit();
+    var resolver = TypeResolver.init(allocator, &diags);
+    defer resolver.deinit();
+
+    const iface = ast.InterfaceDef{
+        .name = "Transferable",
+        .members = &[_]ast.InterfaceMember{},
+        .span = .{ .line = 1, .col = 1, .len = 12 },
+    };
+
+    const tops = [_]TopLevel{.{ .interface_def = iface }};
+    try resolver.registerTopLevel(&tops);
+
+    const sym = resolver.global_scope.lookup("Transferable");
+    try std.testing.expect(sym != null);
+    try std.testing.expectEqual(SymbolKind.type_alias, sym.?.kind);
+}
+
+test "registerTopLevel handles multiple interfaces without error" {
+    const allocator = std.testing.allocator;
+    var diags = DiagnosticList.init(allocator);
+    defer diags.deinit();
+    var resolver = TypeResolver.init(allocator, &diags);
+    defer resolver.deinit();
+
+    const iface1 = ast.InterfaceDef{ .name = "A", .members = &[_]ast.InterfaceMember{}, .span = .{ .line = 1, .col = 1, .len = 1 } };
+    const iface2 = ast.InterfaceDef{ .name = "B", .members = &[_]ast.InterfaceMember{}, .span = .{ .line = 2, .col = 1, .len = 1 } };
+    const iface3 = ast.InterfaceDef{ .name = "C", .members = &[_]ast.InterfaceMember{}, .span = .{ .line = 3, .col = 1, .len = 1 } };
+
+    const tops = [_]TopLevel{
+        .{ .interface_def = iface1 },
+        .{ .interface_def = iface2 },
+        .{ .interface_def = iface3 },
+    };
+    try resolver.registerTopLevel(&tops);
+
+    try std.testing.expect(resolver.lookupInterface("A") != null);
+    try std.testing.expect(resolver.lookupInterface("B") != null);
+    try std.testing.expect(resolver.lookupInterface("C") != null);
+
+    try std.testing.expect(resolver.global_scope.lookup("A") != null);
+    try std.testing.expect(resolver.global_scope.lookup("B") != null);
+    try std.testing.expect(resolver.global_scope.lookup("C") != null);
+}
+
+test "registerTopLevel stores contract_def" {
+    const allocator = std.testing.allocator;
+    var diags = DiagnosticList.init(allocator);
+    defer diags.deinit();
+    var resolver = TypeResolver.init(allocator, &diags);
+    defer resolver.deinit();
+
+    const contract = ast.ContractDef{
+        .name = "MyToken",
+        .inherits = null,
+        .config = &[_]ast.ConfigField{},
+        .state = &[_]ast.StateField{},
+        .always = &[_]ast.ConstDecl{},
+        .computed = &[_]ast.ComputedField{},
+        .setup = null,
+        .events = &[_]ast.EventDecl{},
+        .errors_ = &[_]ast.ErrorDecl{},
+        .helpers = &[_]ast.HelperDecl{},
+        .actions = &[_]ast.ActionDecl{},
+        .views = &[_]ast.ViewDecl{},
+        .pures = &[_]ast.PureDecl{},
+        .guards = &[_]ast.GuardDecl{},
+        .authorities = &[_]ast.AuthorityDecl{},
+        .upgrade = null,
+        .implements = &[_][]const u8{},
+        .namespaces = &[_][]const u8{},
+        .accounts = &[_]ast.AccountDecl{},
+        .invariants = &[_]ast.InvariantDecl{},
+        .span = Span{ .line = 1, .col = 1, .len = 7 },
+    };
+
+    const tops = [_]TopLevel{.{ .contract = contract }};
+    try resolver.registerTopLevel(&tops);
+
+    const lookup = resolver.lookupContract("MyToken");
+    try std.testing.expect(lookup != null);
+    try std.testing.expectEqualSlices(u8, "MyToken", lookup.?.name);
 }
