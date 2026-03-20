@@ -15,6 +15,10 @@ contracts/*.hex
 contracts/*.polkavm
 contracts/fozbin.hex
 contracts/payload.hex
+contracts/*.json
+contracts/*.fozabi
+
+
 
 # Artifacts
 gaps_implementation_plan.md
@@ -24,4 +28,5 @@ FORGE_GEMINI_GAP_FIX_PROMPTS.md
 Gemini.md
 deploy.html
 interact.html
+forge_multi_agent_abi.md
 out/

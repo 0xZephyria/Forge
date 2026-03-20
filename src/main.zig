@@ -18,6 +18,7 @@ const codegen = @import("codegen.zig");
 const codegen_polkavm = @import("codegen_polkavm.zig");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
+const abi = @import("abi.zig");
 
 const DiagnosticList = errors.DiagnosticList;
 const TypeResolver = types.TypeResolver;
@@ -36,19 +37,13 @@ const COMPILER_VERSION = "1.0.0";
 
 /// All options that control a single compilation invocation.
 pub const CompileOptions = struct {
-    /// Output file path. Null = derive from input name.
     output: ?[]const u8 = null,
-    /// Only run type-checking, skip codegen.
     check_only: bool = false,
-    /// Print token stream and exit.
     print_tokens: bool = false,
-    /// Print AST summary and exit.
     print_ast: bool = false,
-    /// Print access lists and exit.
     print_access: bool = false,
-    /// Disable ANSI color codes.
     no_color: bool = false,
-    /// Compilation target (zephyria or polkavm)
+    evm_abi: bool = false,
     target: []const u8 = "zephyria",
 };
 
@@ -100,6 +95,8 @@ fn parseArgs(args: []const [:0]const u8) ArgResult {
             opts.print_access = true;
         } else if (std.mem.eql(u8, arg, "--no-color")) {
             opts.no_color = true;
+        } else if (std.mem.eql(u8, arg, "--evm")) {
+            opts.evm_abi = true;
         } else if (std.mem.eql(u8, arg, "--target")) {
             i += 1;
             if (i >= args.len) {
@@ -127,18 +124,23 @@ fn parseArgs(args: []const [:0]const u8) ArgResult {
 /// Print usage/help text to stderr.
 fn printUsage() void {
     std.debug.print(
-        \\Usage: forgec <input.foz> [options]
+        \\Usage: forge [command] [options] <file.foz>
+        \\
+        \\Commands:
+        \\  build      Compile a Forge source file.
         \\
         \\Options:
-        \\  -o <output>       Output file path (default depends on target)
-        \\  --target <name>   Target VM: zephyria (default), polkavm
-        \\  --check-only      Only type-check, don't emit bytecode
-        \\  --print-tokens    Print token stream and exit
-        \\  --print-ast       Print AST summary and exit
-        \\  --print-access    Print access lists for all actions and exit
-        \\  --no-color        Disable colored error output
+        \\  -o <file>       Specify output binary path (default: a.fozbin)
+        \\  --target <name> Target architecture (zephyria or polkavm, default: zephyria)
+        \\  --evm           Generate an EVM-compatible ABI (.json) instead of Zephyria Native (.fozabi)
+        \\  --check-only    Perform type checking, skip binary generation
+        \\  --print-tokens  Print lexical tokens
+        \\  --print-ast     Print AST structures
+        \\  --print-access  Print memory access maps
+        \\  --no-color      Disable colored diagnostic output
         \\  -v, --version     Print compiler version and exit
-        \\  -h, --help        Print this help and exit
+        \\  -h, --help      Print this help and exit
+        \\
         \\
     , .{});
 }
@@ -164,7 +166,6 @@ pub fn compile(
     // ── Stage 1: Lex ─────────────────────────────────────────────────────
     var lex = Lexer.init(source, file);
     const tokens = try lex.tokenize(temp_alloc, &diagnostics);
-    
 
     if (diagnostics.hasErrors()) {
         try printDiagnostics(&diagnostics);
@@ -182,7 +183,6 @@ pub fn compile(
         try printDiagnostics(&diagnostics);
         return err;
     };
-    
 
     if (diagnostics.hasErrors()) {
         try printDiagnostics(&diagnostics);
@@ -259,8 +259,27 @@ pub fn compile(
         return null;
     }
 
+    // ── Stage 7: ABI generation ──────────────────────────────────────────
+    var abi_gen = abi.AbiGenerator.init(temp_alloc, &resolver);
+    defer abi_gen.deinit();
+
+    var zeph_abi: ?[]u8 = null;
+    var evm_abi: ?[]u8 = null;
+
+    if (opts.evm_abi) {
+        const evm_abi_temp = try abi_gen.generateEVMAbi(contract);
+        evm_abi = try alloc.dupe(u8, evm_abi_temp);
+        errdefer if (evm_abi) |e| alloc.free(e);
+    } else {
+        const zeph_abi_temp = try abi_gen.generateZephAbi(contract);
+        zeph_abi = try alloc.dupe(u8, zeph_abi_temp);
+        errdefer if (zeph_abi) |z| alloc.free(z);
+    }
+
     return CompileResult{
         .binary = binary,
+        .zeph_abi = zeph_abi,
+        .evm_abi = evm_abi,
         .contract_name = contract.name,
         .action_count = contract.actions.len,
         .warning_count = 0,
@@ -270,6 +289,8 @@ pub fn compile(
 /// Compilation outcome carrying output data.
 pub const CompileResult = struct {
     binary: []u8,
+    zeph_abi: ?[]u8,
+    evm_abi: ?[]u8,
     contract_name: []const u8,
     action_count: usize,
     warning_count: usize,
@@ -424,6 +445,22 @@ fn deriveOutputPath(input_path: []const u8, target: []const u8, alloc: std.mem.A
     }
 }
 
+/// Derive ABI output path: replace extension based on given extension.
+fn deriveAbiOutputPath(binary_path: []const u8, ext: []const u8, alloc: std.mem.Allocator) anyerror![]u8 {
+    const basename = std.fs.path.basename(binary_path);
+    const dir = std.fs.path.dirname(binary_path);
+
+    var name_without_ext: []const u8 = basename;
+    if (std.mem.lastIndexOf(u8, basename, ".")) |dot_pos| {
+        name_without_ext = basename[0..dot_pos];
+    }
+
+    if (dir) |d| {
+        return std.fmt.allocPrint(alloc, "{s}/{s}{s}", .{ d, name_without_ext, ext });
+    } else {
+        return std.fmt.allocPrint(alloc, "{s}{s}", .{ name_without_ext, ext });
+    }
+}
 
 /// Derive hex output path from binary output path: replace extension with .hex.
 fn deriveHexOutputPath(binary_path: []const u8, alloc: std.mem.Allocator) anyerror![]u8 {
@@ -491,6 +528,8 @@ pub fn main() anyerror!void {
 
             if (compile_result) |cr| {
                 defer alloc.free(cr.binary);
+                defer if (cr.zeph_abi) |z| alloc.free(z);
+                defer if (cr.evm_abi) |e| alloc.free(e);
 
                 if (opts.check_only or opts.print_tokens or opts.print_ast or opts.print_access) {
                     return;
@@ -537,6 +576,42 @@ pub fn main() anyerror!void {
                     std.process.exit(2);
                 };
 
+                // ── Write ABI outputs ────────────────────────────────────
+                if (cr.zeph_abi) |zabi| {
+                    const zeph_abi_path = deriveAbiOutputPath(output_path, ".fozabi", alloc) catch |err| {
+                        std.debug.print("error: string alloc failed: {s}\n", .{@errorName(err)});
+                        std.process.exit(3);
+                    };
+                    defer alloc.free(zeph_abi_path);
+
+                    const zabi_file = std.fs.cwd().createFile(zeph_abi_path, .{}) catch |err| {
+                        std.debug.print("error: cannot write '{s}': {s}\n", .{ zeph_abi_path, @errorName(err) });
+                        std.process.exit(2);
+                    };
+                    defer zabi_file.close();
+                    zabi_file.writeAll(zabi) catch |err| {
+                        std.debug.print("error: ABI write failed: {s}\n", .{@errorName(err)});
+                        std.process.exit(2);
+                    };
+                }
+
+                if (cr.evm_abi) |eabi| {
+                    const evm_abi_path = deriveAbiOutputPath(output_path, ".json", alloc) catch |err| {
+                        std.debug.print("error: string alloc failed: {s}\n", .{@errorName(err)});
+                        std.process.exit(3);
+                    };
+                    defer alloc.free(evm_abi_path);
+
+                    const eabi_file = std.fs.cwd().createFile(evm_abi_path, .{}) catch |err| {
+                        std.debug.print("error: cannot write '{s}': {s}\n", .{ evm_abi_path, @errorName(err) });
+                        std.process.exit(2);
+                    };
+                    defer eabi_file.close();
+                    eabi_file.writeAll(eabi) catch |err| {
+                        std.debug.print("error: ABI write failed: {s}\n", .{@errorName(err)});
+                        std.process.exit(2);
+                    };
+                }
 
                 // ── Success message ──────────────────────────────────────
                 const basename = std.fs.path.basename(input_path);
