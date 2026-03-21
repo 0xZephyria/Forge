@@ -16,6 +16,7 @@ const ast = @import("ast.zig");
 const errors = @import("errors.zig");
 const types = @import("types.zig");
 const checker = @import("checker.zig");
+const u256_mod = @import("u256.zig");
 
 const riscv = @import("riscv.zig");
 
@@ -252,6 +253,74 @@ fn writeContractName(name: []const u8) [32]u8 {
 }
 
 // ============================================================================
+// Section 5b — Fixed-Point Scaling Helpers
+// ============================================================================
+
+/// Return 10^n for n in [0..18]. Returns maxInt(u64) for n > 18.
+/// SPEC: Part 2.1 — Fixed-point types are stored as scaled integers.
+fn pow10(n: u8) u64 {
+    const table: [19]u64 = .{
+        1,
+        10,
+        100,
+        1_000,
+        10_000,
+        100_000,
+        1_000_000,
+        10_000_000,
+        100_000_000,
+        1_000_000_000,
+        10_000_000_000,
+        100_000_000_000,
+        1_000_000_000_000,
+        10_000_000_000_000,
+        100_000_000_000_000,
+        1_000_000_000_000_000,
+        10_000_000_000_000_000,
+        100_000_000_000_000_000,
+        1_000_000_000_000_000_000,
+    };
+    if (n > 18) return std.math.maxInt(u64);
+    return table[n];
+}
+
+/// Scale a fixed-point literal string to its integer representation.
+/// "1.5" with decimals=9 → 1_500_000_000.
+fn scaleFixedPoint(lit: []const u8, decimals: u8) u64 {
+    var int_part_buf: [80]u8 = undefined;
+    var frac_part_buf: [80]u8 = undefined;
+    var int_len: usize = 0;
+    var frac_len: usize = 0;
+
+    var in_frac = false;
+    for (lit) |c| {
+        if (c == '_') continue;
+        if (c == '.') { in_frac = true; continue; }
+        if (!in_frac) {
+            if (int_len < int_part_buf.len) { int_part_buf[int_len] = c; int_len += 1; }
+        } else {
+            if (frac_len < frac_part_buf.len) { frac_part_buf[frac_len] = c; frac_len += 1; }
+        }
+    }
+
+    const int_str = int_part_buf[0..int_len];
+    var padded_frac_buf: [80]u8 = [_]u8{'0'} ** 80;
+    const copy_len = @min(frac_len, decimals);
+    @memcpy(padded_frac_buf[0..copy_len], frac_part_buf[0..copy_len]);
+    const frac_str = padded_frac_buf[0..decimals];
+
+    const int_val = if (int_str.len == 0) @as(u64, 0) else std.fmt.parseInt(u64, int_str, 10) catch 0;
+    const frac_val = if (decimals == 0) @as(u64, 0) else std.fmt.parseInt(u64, frac_str, 10) catch 0;
+
+    const p10 = pow10(decimals);
+    const mul_tup = @mulWithOverflow(int_val, p10);
+    if (mul_tup[1] != 0) return std.math.maxInt(u64);
+    const add_tup = @addWithOverflow(mul_tup[0], frac_val);
+    if (add_tup[1] != 0) return std.math.maxInt(u64);
+    return add_tup[0];
+}
+
+// ============================================================================
 // Section 6 — Code Generator
 // ============================================================================
 
@@ -262,6 +331,9 @@ pub const CodeGenPolkaVM = struct {
     resolver: *TypeResolver,
     field_ids: std.StringHashMap(u32),
     next_field_id: u32,
+    /// Interned string data section (null-terminated, 4-byte aligned).
+    string_table: std.StringHashMap(u32),
+    data_section: std.ArrayListUnmanaged(u8),
 
     /// Create a new code generator.
     pub fn init(
@@ -275,12 +347,29 @@ pub const CodeGenPolkaVM = struct {
             .resolver = resolver,
             .field_ids = std.StringHashMap(u32).init(allocator),
             .next_field_id = 0,
+            .string_table = std.StringHashMap(u32).init(allocator),
+            .data_section = .{},
         };
     }
 
     /// Release all internal resources.
     pub fn deinit(self: *CodeGenPolkaVM) void {
         self.field_ids.deinit();
+        self.string_table.deinit();
+        self.data_section.deinit(self.allocator);
+    }
+
+    /// Intern a string literal into the data section. Returns its byte offset.
+    fn internString(self: *CodeGenPolkaVM, content: []const u8) anyerror!u32 {
+        if (self.string_table.get(content)) |offset| return offset;
+        const offset: u32 = @intCast(self.data_section.items.len);
+        try self.data_section.appendSlice(self.allocator, content);
+        try self.data_section.append(self.allocator, 0);
+        while (self.data_section.items.len % 4 != 0) {
+            try self.data_section.append(self.allocator, 0);
+        }
+        try self.string_table.put(content, offset);
+        return offset;
     }
 
     /// Assign a sequential field ID to a state field name.
@@ -304,8 +393,9 @@ pub const CodeGenPolkaVM = struct {
             _ = self.getOrAssignFieldId(sf.name);
         }
 
-        // action_count includes both actions and views (both are externally callable)
-        const action_count: u16 = @intCast(contract.actions.len + contract.views.len);
+        // Constructor counts as an extra entry when present
+        const setup_count: u16 = if (contract.setup != null) 1 else 0;
+        const action_count: u16 = @intCast(contract.actions.len + contract.views.len + setup_count);
 
         // Determine flags
         var flags: u16 = 0;
@@ -330,6 +420,23 @@ pub const CodeGenPolkaVM = struct {
                 self.allocator.free(ab.code);
             }
             action_codes.deinit(self.allocator);
+        }
+
+        // ── Generate constructor (setup block) if present ────────────────
+        if (contract.setup) |setup| {
+            var ctx = ActionCtx.init(self.allocator, "__setup__", &self.field_ids);
+            defer ctx.deinit();
+
+            try self.genSetup(&setup, &ctx);
+
+            const code_bytes = ctx.writer.toBytes();
+            const owned_copy = try self.allocator.alloc(u8, code_bytes.len);
+            @memcpy(owned_copy, code_bytes);
+
+            try action_codes.append(self.allocator, .{
+                .selector = 0x00000000,
+                .code = owned_copy,
+            });
         }
 
         for (contract.actions) |action| {
@@ -374,6 +481,8 @@ pub const CodeGenPolkaVM = struct {
         defer self.allocator.free(bytecode_bytes);
 
         // ── Assemble final binary ────────────────────────────────────────
+        // Layout: [64-byte header][access_list][bytecode][data_section]
+        const data_bytes = self.data_section.items;
         var header = PolkaVmHeader{};
         header.contract_name = writeContractName(contract.name);
         header.action_count = action_count;
@@ -381,7 +490,7 @@ pub const CodeGenPolkaVM = struct {
         header.access_list_len = @intCast(access_list_bytes.len);
         header.bytecode_len = @intCast(bytecode_bytes.len);
 
-        const total_size = @sizeOf(PolkaVmHeader) + access_list_bytes.len + bytecode_bytes.len;
+        const total_size = @sizeOf(PolkaVmHeader) + access_list_bytes.len + bytecode_bytes.len + data_bytes.len;
         const binary = try self.allocator.alloc(u8, total_size);
         errdefer self.allocator.free(binary);
 
@@ -396,6 +505,12 @@ pub const CodeGenPolkaVM = struct {
         // Copy bytecode
         const bc_start = al_start + access_list_bytes.len;
         @memcpy(binary[bc_start..][0..bytecode_bytes.len], bytecode_bytes);
+
+        // Copy data section (strings)
+        const ds_start = bc_start + bytecode_bytes.len;
+        if (data_bytes.len > 0) {
+            @memcpy(binary[ds_start..][0..data_bytes.len], data_bytes);
+        }
 
         // Compute and store checksum over everything after checksum field
         const checksum_offset = @offsetOf(PolkaVmHeader, "checksum") + @sizeOf(u32);
@@ -493,6 +608,38 @@ pub const CodeGenPolkaVM = struct {
     }
 
     // ── Statement code generation ────────────────────────────────────────
+
+    /// Generate bytecode for the setup block (constructor).
+    /// SPEC: Part 5.4 — setup block compiled as constructor, selector 0x00000000.
+    fn genSetup(self: *CodeGenPolkaVM, setup: *const ast.SetupBlock, ctx: *ActionCtx) anyerror!void {
+        const frame_size: i12 = 64;
+
+        // ── Prologue ─────────────────────────────────────────────────────
+        try ctx.writer.emit(riscv.ADDI(.sp, .sp, -frame_size));
+        try ctx.writer.emit(riscv.SD(.sp, .ra, 0));
+        try ctx.writer.emit(riscv.SD(.sp, .s0, 8));
+        try ctx.writer.emit(riscv.ADDI(.s0, .sp, frame_size));
+
+        // ── Bind parameters to registers (a0–a6) ─────────────────────────
+        for (setup.params, 0..) |param, i| {
+            if (i < 7) {
+                const reg: Reg = @enumFromInt(@as(u5, @intCast(10 + i)));
+                ctx.reg_alloc.used[@intFromEnum(reg)] = true;
+                try ctx.locals.put(param.name, reg);
+            }
+        }
+
+        // ── Body ─────────────────────────────────────────────────────────
+        for (setup.body) |stmt| {
+            try self.genStmt(&stmt, ctx);
+        }
+
+        // ── Epilogue ─────────────────────────────────────────────────────
+        try ctx.writer.emit(riscv.LD(.s0, .sp, 8));
+        try ctx.writer.emit(riscv.LD(.ra, .sp, 0));
+        try ctx.writer.emit(riscv.ADDI(.sp, .sp, frame_size));
+        try ctx.writer.emit(riscv.JALR(.zero, .ra, 0));
+    }
 
     /// Generate bytecode for a single statement.
     fn genStmt(self: *CodeGenPolkaVM, stmt: *const Stmt, ctx: *ActionCtx) anyerror!void {
@@ -699,14 +846,53 @@ pub const CodeGenPolkaVM = struct {
     fn genExpr(self: *CodeGenPolkaVM, expr: *const Expr, ctx: *ActionCtx, dest: Reg) anyerror!void {
         switch (expr.kind) {
             .int_lit => |lit| {
-                const val = std.fmt.parseInt(u64, lit, 10) catch 0;
-                try self.genLoadImmediate(val, dest, ctx);
+                // Strip underscore separators before parsing.
+                var clean_buf: [80]u8 = undefined;
+                var clean_len: usize = 0;
+                for (lit) |c| {
+                    if (c != '_') {
+                        if (clean_len >= clean_buf.len) break;
+                        clean_buf[clean_len] = c;
+                        clean_len += 1;
+                    }
+                }
+                const clean = clean_buf[0..clean_len];
+
+                // Parse as u256, supporting 0x hex prefix.
+                const u256val: u256_mod.U256 = if (clean.len >= 2 and clean[0] == '0' and
+                    (clean[1] == 'x' or clean[1] == 'X'))
+                    u256_mod.U256.parseHex(clean[2..]) catch u256_mod.U256.zero
+                else
+                    u256_mod.U256.parseDecimal(clean) catch u256_mod.U256.zero;
+
+                if (u256val.fitsU64()) {
+                    // Fast path: value fits in a single register.
+                    try self.genLoadImmediate(u256val.toU64(), dest, ctx);
+                } else {
+                    // Wide path: store 32-byte LE value on the stack.
+                    // dest receives the stack pointer to the allocation.
+                    try ctx.writer.emit(riscv.ADDI(.sp, .sp, -32));
+                    for (u256val.limbs, 0..) |limb, i| {
+                        const tmp = ctx.reg_alloc.alloc() orelse .t3;
+                        defer ctx.reg_alloc.free(tmp);
+                        try self.genLoadImmediate(limb, tmp, ctx);
+                        const off: i12 = @intCast(i * 8);
+                        try ctx.writer.emit(riscv.SD(.sp, tmp, off));
+                    }
+                    try ctx.writer.emit(riscv.ADD(dest, .sp, .zero));
+                }
             },
             .bool_lit => |b| {
                 try ctx.writer.emit(riscv.ADDI(dest, .zero, if (b) 1 else 0));
             },
             .string_lit => |s| {
-                try self.genLoadImmediate(@intCast(s.len), dest, ctx);
+                // s includes surrounding double-quotes — strip them.
+                const content = if (s.len >= 2) s[1..s.len - 1] else s;
+                const offset = try self.internString(content);
+                // ZVM/PolkaVM: gp (x3) holds the data section base address.
+                // dest = gp + offset → pointer to the null-terminated string.
+                try self.genLoadImmediate(@intCast(offset), dest, ctx);
+                try ctx.writer.emit(riscv.ADD(dest, .gp, dest));
             },
             .nothing => {
                 try ctx.writer.emit(riscv.ADDI(dest, .zero, 0));
@@ -801,8 +987,10 @@ pub const CodeGenPolkaVM = struct {
             .try_propagate => |inner| {
                 try self.genExpr(inner, ctx, dest);
             },
-            .float_lit => |_| {
-                try ctx.writer.emit(riscv.ADDI(dest, .zero, 0));
+            .float_lit => |lit| {
+                // Scale to 18 decimal places (price18 / standard DeFi precision).
+                const scaled = scaleFixedPoint(lit, 18);
+                try self.genLoadImmediate(scaled, dest, ctx);
             },
             else => {
                 try ctx.writer.emit(riscv.ADDI(dest, .zero, 0));
@@ -1121,60 +1309,89 @@ pub const CodeGenPolkaVM = struct {
 
     /// Generate a state read: SLOAD(field_id) → dest.
     fn genStateRead(self: *CodeGenPolkaVM, field_name: []const u8, index_expr: ?*const Expr, ctx: *ActionCtx, dest: Reg) anyerror!void {
-        // pallet-revive: get_storage(flags: u32, key_ptr: *const u8, key_len: u32, out_ptr: *mut u8, out_len_ptr: *mut u32)
+        // pallet-revive: seal_get_storage(key_ptr: *const u8, key_len: u32, out_ptr: *mut u8, out_len_ptr: *mut u32)
+        // Key encoding: [4-byte field_id][8-byte map_key] = 12 bytes for map, 4 bytes for scalar.
         const field_id = self.getOrAssignFieldId(field_name);
-        
-        // 1. write field_id to stack so we have a key_ptr
+
+        // Write field_id to stack as 4-byte little-endian key prefix at sp-8
+        var fid_bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &fid_bytes, field_id, .little);
+        // Load each byte individually via immediate loads — no MOVI for bytes in RISC-V.
+        // More efficient: write field_id as a u32 via SD after loading it.
         try self.genLoadImmediate(@intCast(field_id), .t0, ctx);
         try ctx.writer.emit(riscv.SD(.sp, .t0, -8));
-        
-        // a0 = flags (0)
-        try ctx.writer.emit(riscv.ADDI(.a0, .zero, 0));
-        // a1 = key_ptr (sp - 8)
-        try ctx.writer.emit(riscv.ADDI(.a1, .sp, -8));
-        // a2 = key_len (8 bytes for u64 field_id)
-        try ctx.writer.emit(riscv.ADDI(.a2, .zero, 8));
-        // a3 = out_ptr (sp - 16)
-        try ctx.writer.emit(riscv.ADDI(.a3, .sp, -16));
-        // a4 = out_len_ptr (sp - 24, where we store 8 for expected length)
+
+        var key_len: i12 = 8; // 8 bytes for scalar (u64-wide field_id)
+
+        if (index_expr) |idx| {
+            // Map access: key = [field_id (8 bytes)][map_key (8 bytes)] = 16 bytes total
+            const key_reg = ctx.reg_alloc.alloc() orelse .t1;
+            defer ctx.reg_alloc.free(key_reg);
+            try self.genExpr(idx, ctx, key_reg);
+            try ctx.writer.emit(riscv.SD(.sp, key_reg, -16)); // map key at sp-16
+            key_len = 16;
+        }
+
+        // Set up out_len at sp-24 = 8 (we always read 8 bytes / one u64 word)
         try self.genLoadImmediate(8, .t1, ctx);
         try ctx.writer.emit(riscv.SD(.sp, .t1, -24));
-        try ctx.writer.emit(riscv.ADDI(.a4, .sp, -24));
 
-        _ = index_expr; // dynamic keys not fully implemented in stub
-        
+        // a0 = key_ptr: for map, sp-16 (includes both field_id and map key);
+        //               for scalar, sp-8 (field_id only)
+        const key_ptr_off: i12 = if (index_expr != null) -16 else -8;
+        try ctx.writer.emit(riscv.ADDI(.a0, .sp, key_ptr_off));
+        // a1 = key_len
+        try ctx.writer.emit(riscv.ADDI(.a1, .zero, key_len));
+        // a2 = out_ptr (sp-32, 8-byte output buffer)
+        try ctx.writer.emit(riscv.ADDI(.a2, .sp, -32));
+        // a3 = out_len_ptr (sp-24)
+        try ctx.writer.emit(riscv.ADDI(.a3, .sp, -24));
+
         try ctx.writer.emit(riscv.ECALLI(@intFromEnum(PolkaHostCalls.STATE_READ)));
-        
-        // load result from out_ptr to dest
-        try ctx.writer.emit(riscv.LD(dest, .sp, -16));
+
+        // Load result from out_ptr to dest
+        try ctx.writer.emit(riscv.LD(dest, .sp, -32));
     }
 
     /// Generate a state write: value → SSTORE(field_id).
     fn genStateWrite(self: *CodeGenPolkaVM, field_name: []const u8, index_expr: ?*const Expr, value: *const Expr, ctx: *ActionCtx) anyerror!void {
-        // pallet-revive: set_storage(flags: u32, key_ptr: *const u8, key_len: u32, value_ptr: *const u8, value_len: u32)
+        // pallet-revive: seal_set_storage(key_ptr: *const u8, key_len: u32, value_ptr: *const u8, value_len: u32)
+        // Key encoding: [8-byte field_id][8-byte map_key] for map, [8-byte field_id] for scalar.
         const field_id = self.getOrAssignFieldId(field_name);
+
+        // Evaluate value expression first (before stack layout for key)
         const val_reg = ctx.reg_alloc.alloc() orelse .t0;
         defer ctx.reg_alloc.free(val_reg);
         try self.genExpr(value, ctx, val_reg);
-        
-        // 1. Write field_id to stack
+
+        // Write field_id to stack at sp-8
         try self.genLoadImmediate(@intCast(field_id), .t1, ctx);
         try ctx.writer.emit(riscv.SD(.sp, .t1, -8));
-        // 2. Write value to stack
-        try ctx.writer.emit(riscv.SD(.sp, val_reg, -16));
 
-        // a0 = flags (0)
-        try ctx.writer.emit(riscv.ADDI(.a0, .zero, 0));
-        // a1 = key_ptr (sp - 8)
-        try ctx.writer.emit(riscv.ADDI(.a1, .sp, -8));
-        // a2 = key_len (8)
-        try ctx.writer.emit(riscv.ADDI(.a2, .zero, 8));
-        // a3 = value_ptr (sp - 16)
-        try ctx.writer.emit(riscv.ADDI(.a3, .sp, -16));
-        // a4 = value_len (8)
-        try ctx.writer.emit(riscv.ADDI(.a4, .zero, 8));
+        var key_len: i12 = 8;
 
-        _ = index_expr;
+        if (index_expr) |idx| {
+            // Map access: write map key at sp-16, total key = 16 bytes
+            const key_reg = ctx.reg_alloc.alloc() orelse .t2;
+            defer ctx.reg_alloc.free(key_reg);
+            try self.genExpr(idx, ctx, key_reg);
+            try ctx.writer.emit(riscv.SD(.sp, key_reg, -16));
+            key_len = 16;
+        }
+
+        // Write value to stack at sp-40 (below key region)
+        try ctx.writer.emit(riscv.SD(.sp, val_reg, -40));
+
+        // a0 = key_ptr
+        const key_ptr_off: i12 = if (index_expr != null) -16 else -8;
+        try ctx.writer.emit(riscv.ADDI(.a0, .sp, key_ptr_off));
+        // a1 = key_len
+        try ctx.writer.emit(riscv.ADDI(.a1, .zero, key_len));
+        // a2 = value_ptr (sp-40)
+        try ctx.writer.emit(riscv.ADDI(.a2, .sp, -40));
+        // a3 = value_len (8 bytes / one u64 word)
+        try ctx.writer.emit(riscv.ADDI(.a3, .zero, 8));
+
         try ctx.writer.emit(riscv.ECALLI(@intFromEnum(PolkaHostCalls.STATE_WRITE)));
     }
 
@@ -1261,35 +1478,49 @@ pub const CodeGenPolkaVM = struct {
 
     /// Generate bytecode for a `tell EventName(args)` statement.
     fn genTell(self: *CodeGenPolkaVM, stmt: *const TellStmt, ctx: *ActionCtx) anyerror!void {
-        // pallet-revive deposit_event(topics_ptr: *const [u8; 32], num_topic: u32, data_ptr: *const u8, data_len: u32)
+        // pallet-revive: seal_deposit_event(topics_ptr: *const u8, topics_len: u32, data_ptr: *const u8, data_len: u32)
+        // Topic 0 = event selector (4-byte SHA256 hash of event name, padded to 32 bytes).
+        // Subsequent topics = indexed field values (up to 3 more; pallet-revive max 4 topics).
+        // Data = non-indexed field values serialised in declaration order.
         const selector = actionSelector(stmt.event_name);
-        
-        // Store selector (topic hash substitute) on stack
-        try self.genLoadImmediate(@intCast(selector), .t0, ctx);
-        try ctx.writer.emit(riscv.SD(.sp, .t0, -32)); // 32 byte topic array fake
 
-        // Serialize args to stack (simple flat buffer for data_ptr)
-        // This is a stub for the ABI register mapping
-        var offset: i12 = -40;
-        for (stmt.args) |arg| {
-            const arg_reg = ctx.reg_alloc.alloc() orelse .t1;
-            try self.genExpr(arg.value, ctx, arg_reg);
-            try ctx.writer.emit(riscv.SD(.sp, arg_reg, offset));
-            ctx.reg_alloc.free(arg_reg);
-            offset -= 8;
+        // Write 32-byte topic[0] at sp-32: selector in first 4 bytes, rest zero.
+        // Use a scratch register to zero-fill then overwrite the low 4 bytes.
+        try ctx.writer.emit(riscv.ADDI(.sp, .sp, -64)); // scratch frame
+        try ctx.writer.emit(riscv.ADDI(.t0, .sp, 0));   // t0 = scratch base
+        // Zero the 32-byte topic slot (4 × SD zero, zero)
+        for (0..4) |i| {
+            const off: i12 = @intCast(i * 8);
+            try ctx.writer.emit(riscv.SD(.t0, .zero, off));
         }
+        // Write selector into first 4 bytes
+        try self.genLoadImmediate(@intCast(selector), .t1, ctx);
+        try ctx.writer.emit(riscv.SD(.t0, .t1, 0)); // writes 8 bytes but LE: low 4 = selector ✓
 
-        // a0 = topics_ptr
-        try ctx.writer.emit(riscv.ADDI(.a0, .sp, -32));
-        // a1 = num_topic (1 topic: the selector)
-        try ctx.writer.emit(riscv.ADDI(.a1, .zero, 1));
-        // a2 = data_ptr (starts at -40)
-        try ctx.writer.emit(riscv.ADDI(.a2, .sp, offset));
+        // Serialise all arguments into data region starting at sp+32
+        var data_off: i12 = 32;
+        for (stmt.args) |arg| {
+            const arg_reg = ctx.reg_alloc.alloc() orelse .t2;
+            defer ctx.reg_alloc.free(arg_reg);
+            try self.genExpr(arg.value, ctx, arg_reg);
+            try ctx.writer.emit(riscv.SD(.t0, arg_reg, data_off));
+            data_off += 8;
+        }
+        const data_len: i64 = data_off - 32;
+
+        // a0 = topics_ptr (t0 = sp+0)
+        try ctx.writer.emit(riscv.ADD(.a0, .t0, .zero));
+        // a1 = topics_len (32 bytes = 1 topic)
+        try ctx.writer.emit(riscv.ADDI(.a1, .zero, 32));
+        // a2 = data_ptr (t0 + 32)
+        try ctx.writer.emit(riscv.ADDI(.a2, .t0, 32));
         // a3 = data_len
-        const total_len = -40 - offset;
-        try self.genLoadImmediate(@intCast(total_len), .a3, ctx);
+        try self.genLoadImmediate(@intCast(data_len), .a3, ctx);
 
         try ctx.writer.emit(riscv.ECALLI(@intFromEnum(PolkaHostCalls.EMIT_EVENT)));
+
+        // Release scratch frame
+        try ctx.writer.emit(riscv.ADDI(.sp, .sp, 64));
     }
 
     // ── Return value ─────────────────────────────────────────────────────

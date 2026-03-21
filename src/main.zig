@@ -271,7 +271,7 @@ pub fn compile(
         evm_abi = try alloc.dupe(u8, evm_abi_temp);
         errdefer if (evm_abi) |e| alloc.free(e);
     } else {
-        const zeph_abi_temp = try abi_gen.generateZephAbi(contract);
+        const zeph_abi_temp = try abi_gen.generateZephAbi(contract, &checked);
         zeph_abi = try alloc.dupe(u8, zeph_abi_temp);
         errdefer if (zeph_abi) |z| alloc.free(z);
     }
