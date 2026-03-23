@@ -46,6 +46,32 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
+    // ── Wasm: forge.wasm ──────────────────────────────────────────────────
+    const wasm_mod = b.createModule(.{
+        .root_source_file = b.path("src/wasm.zig"),
+        .target = b.resolveTargetQuery(.{
+            .cpu_arch = .wasm32,
+            .os_tag = .freestanding,
+        }),
+        .optimize = .ReleaseSmall,
+    });
+
+    const wasm = b.addExecutable(.{
+        .name = "forge",
+        .root_module = wasm_mod,
+    });
+    wasm.entry = .disabled;
+    wasm.rdynamic = true; // Export all public functions
+
+    // Install the Wasm file to root `out/` directory to make it easy to find
+    const install_wasm = b.addInstallArtifact(wasm, .{
+        .dest_dir = .{ .override = .{ .custom = "../out" } },
+    });
+    b.getInstallStep().dependOn(&install_wasm.step);
+
+    const wasm_step = b.step("wasm", "Build the WebAssembly compiler module");
+    wasm_step.dependOn(&install_wasm.step);
+
     // ── Run step ─────────────────────────────────────────────────────────
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -72,6 +98,7 @@ pub fn build(b: *std.Build) void {
         "src/codegen_evm.zig",
         "src/u256.zig",
         "src/main.zig",
+        "src/wasm.zig",
     };
 
     // Build test filter array from the option

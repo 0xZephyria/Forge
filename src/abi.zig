@@ -432,7 +432,7 @@ pub const AbiGenerator = struct {
 // is simpler, faster, and dependency-free.
 
 /// Serialize `value` to a heap-allocated, caller-owned JSON string.
-fn serializeJson(value: anytype, allocator: std.mem.Allocator) anyerror![]u8 {
+pub fn serializeJson(value: anytype, allocator: std.mem.Allocator) anyerror![]u8 {
     var buf = std.ArrayListUnmanaged(u8){};
     errdefer buf.deinit(allocator);
     try jsonAppend(&buf, allocator, value);
@@ -440,7 +440,7 @@ fn serializeJson(value: anytype, allocator: std.mem.Allocator) anyerror![]u8 {
 }
 
 /// Recursively append the JSON representation of `value` into `buf`.
-fn jsonAppend(buf: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, value: anytype) anyerror!void {
+pub fn jsonAppend(buf: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, value: anytype) anyerror!void {
     const T = @TypeOf(value);
     const info = @typeInfo(T);
 
