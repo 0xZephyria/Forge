@@ -69,6 +69,8 @@ pub fn build(b: *std.Build) void {
         "src/riscv.zig",
         "src/codegen.zig",
         "src/codegen_polkavm.zig",
+        "src/codegen_evm.zig",
+        "src/u256.zig",
         "src/main.zig",
     };
 

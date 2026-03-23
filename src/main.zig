@@ -16,6 +16,7 @@ const types = @import("types.zig");
 const checker = @import("checker.zig");
 const codegen = @import("codegen.zig");
 const codegen_polkavm = @import("codegen_polkavm.zig");
+const codegen_evm = @import("codegen_evm.zig");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const abi = @import("abi.zig");
@@ -27,6 +28,7 @@ const Parser = parser.Parser;
 const Checker = checker.Checker;
 const CodeGen = codegen.CodeGen;
 const CodeGenPolkaVM = codegen_polkavm.CodeGenPolkaVM;
+const CodeGenEVM = codegen_evm.EVMCodeGen;
 const TopLevel = ast.TopLevel;
 
 const COMPILER_VERSION = "1.0.0";
@@ -241,7 +243,12 @@ pub fn compile(
 
     // ── Stage 6: Code generation ─────────────────────────────────────────
     var binary: []u8 = undefined;
-    if (std.mem.eql(u8, opts.target, "polkavm")) {
+    if (opts.evm_abi) {
+        var gen = CodeGenEVM.init(temp_alloc, &diagnostics, &resolver);
+        defer gen.deinit();
+        const tmp_bin = try gen.generate(contract, &checked);
+        binary = try alloc.dupe(u8, tmp_bin);
+    } else if (std.mem.eql(u8, opts.target, "polkavm")) {
         var gen = CodeGenPolkaVM.init(temp_alloc, &diagnostics, &resolver);
         defer gen.deinit();
         const tmp_bin = try gen.generate(contract, &checked);
@@ -436,7 +443,14 @@ fn deriveOutputPath(input_path: []const u8, target: []const u8, alloc: std.mem.A
         name_without_ext = basename[0..dot_pos];
     }
 
-    const ext = if (std.mem.eql(u8, target, "polkavm")) ".polkavm" else ".fozbin";
+    var ext: []const u8 = undefined;
+    if (std.mem.eql(u8, target, "polkavm")) {
+        ext = ".polkavm";
+    } else if (std.mem.eql(u8, target, "evm")) {
+        ext = ".bin"; // EVM usually uses .bin
+    } else {
+        ext = ".fozbin";
+    }
 
     if (dir) |d| {
         return std.fmt.allocPrint(alloc, "{s}/{s}{s}", .{ d, name_without_ext, ext });
@@ -514,10 +528,12 @@ pub fn main() anyerror!void {
             defer alloc.free(source);
 
             // ── Derive output path ───────────────────────────────────────
+            // Ensure target is treated as "evm" when --evm is provided
+            const effective_target = if (opts.evm_abi) "evm" else opts.target;
             const output_path = if (opts.output) |o|
                 try alloc.dupe(u8, o)
             else
-                try deriveOutputPath(input_path, opts.target, alloc);
+                try deriveOutputPath(input_path, effective_target, alloc);
             defer alloc.free(output_path);
 
             // ── Compile ──────────────────────────────────────────────────

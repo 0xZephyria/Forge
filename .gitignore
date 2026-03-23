@@ -17,6 +17,11 @@ contracts/fozbin.hex
 contracts/payload.hex
 contracts/*.json
 contracts/*.fozabi
+contracts/*.bin
+contracts/*.log
+contracts/*.sh
+
+
 
 
 
@@ -30,3 +35,6 @@ deploy.html
 interact.html
 forge_multi_agent_abi.md
 out/
+src.zip
+src 2.zip
+Archive.zip
