@@ -120,6 +120,20 @@ pub const ZephAuthority = struct {
     covers: []const []const u8,
 };
 
+/// SPEC: Novel Idea 1 — Conservation proof entry in ABI.
+pub const ZephConservation = struct {
+    equation:      []const u8,
+    op:            []const u8,
+    at_all_times:  bool,
+};
+
+/// SPEC: Novel Idea 2 — Complexity class entry in ABI.
+pub const ZephComplexity = struct {
+    action:        []const u8,
+    class:         []const u8,
+    max_n:         ?u64,
+};
+
 pub const ZephABI = struct {
     forge_abi_version: []const u8,
     contract:          []const u8,
@@ -131,6 +145,8 @@ pub const ZephABI = struct {
     errors:            []const ZephError,
     state_layout:      []const ZephStateField,
     authorities:       []const ZephAuthority,
+    conservation_proofs: []const ZephConservation,
+    complexity_classes:  []const ZephComplexity,
     encoding:          []const u8,
 };
 
@@ -297,6 +313,47 @@ pub const AbiGenerator = struct {
             break :blk ZephConstructor{ .params = ctor_params.items };
         } else null;
 
+        // Conservation proofs
+        var conservation = std.ArrayListUnmanaged(ZephConservation){};
+        defer conservation.deinit(self.allocator);
+        for (contract.conserves) |eq| {
+            const op_str: []const u8 = switch (eq.op) {
+                .equals => "equals",
+                .gte => ">=",
+                .lte => "<=",
+                .gt => ">",
+                .lt => "<",
+            };
+            try conservation.append(self.allocator, .{
+                .equation = "conservation",
+                .op = op_str,
+                .at_all_times = eq.at_all_times,
+            });
+        }
+
+        // Complexity classes
+        var complexity = std.ArrayListUnmanaged(ZephComplexity){};
+        defer complexity.deinit(self.allocator);
+        for (contract.actions) |action| {
+            if (action.complexity_class) |cc| {
+                const class_str: []const u8 = switch (cc) {
+                    .constant => "O(1)",
+                    .linear => "O(n)",
+                    .quadratic => "O(n^2)",
+                };
+                const max_n_val: ?u64 = switch (cc) {
+                    .linear => |maybe_b| if (maybe_b) |b| b.max_value else null,
+                    .quadratic => |maybe_b| if (maybe_b) |b| b.max_value else null,
+                    .constant => null,
+                };
+                try complexity.append(self.allocator, .{
+                    .action = action.name,
+                    .class = class_str,
+                    .max_n = max_n_val,
+                });
+            }
+        }
+
         const abi_doc = ZephABI{
             .forge_abi_version = "1.0",
             .contract          = contract.name,
@@ -308,6 +365,8 @@ pub const AbiGenerator = struct {
             .errors            = errs.items,
             .state_layout      = state_layout.items,
             .authorities       = auths.items,
+            .conservation_proofs = conservation.items,
+            .complexity_classes  = complexity.items,
             .encoding          = "zvm_native_le",
         };
 
@@ -557,6 +616,8 @@ fn mapEVMType(ty: types.ResolvedType) []const u8 {
         .enum_    => "uint8",
         .result   => "bytes",
         .linear   => "bytes",
+        .capability => "bytes",
+        .proof    => "bytes",
         .void_    => "void",
     };
 }
@@ -608,6 +669,8 @@ fn mapZephType(ty: types.ResolvedType) []const u8 {
         .enum_      => |info| info.name,
         .result     => "result",
         .linear     => "linear",
+        .capability => |name| name,
+        .proof      => "proof",
         .void_      => "void",
     };
 }
@@ -752,7 +815,9 @@ test "generateZephAbi and generateEVMAbi minimal contract" {
         .state = &.{}, .computed = &.{}, .setup = null, .guards = &.{},
         .actions = &.{}, .views = &.{}, .pures = &.{}, .helpers = &.{},
         .events = &.{}, .errors_ = &.{}, .upgrade = null, .namespaces = &.{},
-        .invariants = &.{}, .span = .{ .line = 1, .col = 1, .len = 0 },
+        .invariants = &.{}, .conserves = &.{}, .adversary_blocks = &.{},
+        .fallback = null, .receive_ = null,
+        .span = .{ .line = 1, .col = 1, .len = 0 },
     };
     var checked = checker_mod.CheckedContract{
         .name = "Minimal",

@@ -95,8 +95,15 @@ fn errorCodeFromDiag(d: errors.Diagnostic) u16 {
         error.UnboundedLoopMissingAnnotation => 26,
         error.LinearAssetDropped => 27,
         error.LinearAssetUsedTwice => 28,
-        error.OutOfMemory => 29,
-        error.InternalError => 30,
+        error.ConservationViolated => 29,
+        error.ComplexityViolated => 30,
+        error.AttackSucceeded => 31,
+        error.AttackBlocked => 32,
+        error.ImmutableFieldViolation => 35,
+        error.InvalidAnnotationArgument => 36,
+        error.InvalidHookSignature => 37,
+        error.OutOfMemory => 33,
+        error.InternalError => 34,
     };
 }
 
@@ -151,7 +158,7 @@ fn compileInternal(alloc: std.mem.Allocator, source: []const u8, target_evm: boo
         const contract = contract_ptr.?;
 
         // Stage 4: Check
-        var chk = checker.Checker.init(&resolver, &diagnostics, temp_alloc);
+        var chk = checker.Checker.init(&resolver, &diagnostics, temp_alloc, "main.foz");
         checked = try chk.checkContract(contract);
 
         if (!diagnostics.hasErrors()) {

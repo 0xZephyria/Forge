@@ -81,6 +81,18 @@ pub const EnumVariant    = ast.EnumVariant;
 pub const TypeAliasDef   = ast.TypeAliasDef;
 pub const SourceFile     = ast.SourceFile;
 
+// Novel feature types
+pub const ConservationExpr = ast.ConservationExpr;
+pub const ConservationOp   = ast.ConservationOp;
+pub const AggregatorKind   = ast.AggregatorKind;
+pub const ComplexityClass  = ast.ComplexityClass;
+pub const BoundExpr        = ast.BoundExpr;
+pub const AdversaryBlock   = ast.AdversaryBlock;
+pub const AttackSpec       = ast.AttackSpec;
+pub const AttackCall       = ast.AttackCall;
+pub const AttackOutcome    = ast.AttackOutcome;
+pub const CapabilityDef    = ast.CapabilityDef;
+
 // Statements
 pub const LetBind        = ast.LetBind;
 pub const Assign         = ast.Assign;
@@ -156,7 +168,15 @@ pub const Parser = struct {
 
         while (self.peekKind() != .eof) {
             self.skipTrivia();
-            if (self.peekKind() == .eof) break;
+            const kind = self.peekKind();
+            if (kind == .eof) break;
+
+            // Handle optional "End;" terminator at top-level
+            if (kind == .kw_end) {
+                _ = self.advance();
+                _ = try self.expect(.semicolon);
+                continue;
+            }
 
             if (try self.parseTopLevel()) |tl| {
                 try list.append(self.allocator, tl);
@@ -272,6 +292,7 @@ pub const Parser = struct {
     /// or we've hit EOF.
     fn isBlockEnd(self: *const Parser, block_indent: u32) bool {
         if (self.peekKind() == .eof) return true;
+        if (self.peekKind() == .kw_end) return true;
         const ind = self.currentIndent();
         return ind < block_indent;
     }
@@ -596,9 +617,11 @@ pub const Parser = struct {
     }
 
     fn parseTransferHook(self: *Parser, when: ast.AssetHookWhen, parent_indent: u32) anyerror!ast.AssetTransferHook {
+        const params = try self.parseParamList();
+        _ = try self.expect(.colon);
         const hook_indent = try self.expectIndentIncrease(parent_indent);
         const body = try self.parseBlock(hook_indent);
-        return .{ .when = when, .params = &.{}, .body = body, .span = self.peek().span };
+        return .{ .when = when, .params = params, .body = body, .span = self.peek().span };
     }
 
     // ── interface Name { ... } ─────────────────────────────────────────
@@ -715,8 +738,12 @@ pub const Parser = struct {
         var errs:        std.ArrayListUnmanaged(ErrorDecl)     = .{};
         var namespaces:  std.ArrayListUnmanaged([]const u8)    = .{};
         var invariants:  std.ArrayListUnmanaged(InvariantDecl) = .{};
+        var conserves:   std.ArrayListUnmanaged(ConservationExpr) = .{};
+        var adversary_blocks: std.ArrayListUnmanaged(AdversaryBlock) = .{};
         var setup_block: ?SetupBlock     = null;
         var upgrade:     ?UpgradeBlock   = null;
+        var fallback_h:  ?ActionDecl     = null;
+        var receive_h:   ?ActionDecl     = null;
 
         while (!self.isBlockEnd(block_indent)) {
             self.skipTrivia();
@@ -754,7 +781,7 @@ pub const Parser = struct {
                     const gd = try self.parseGuard(block_indent);
                     try guards.append(self.allocator, gd);
                 },
-                .kw_action => {
+                .hash_sym, .kw_action => {
                     const ad = try self.parseAction(block_indent);
                     try actions.append(self.allocator, ad);
                 },
@@ -790,8 +817,32 @@ pub const Parser = struct {
                 .kw_upgrade => {
                     upgrade = try self.parseUpgrade(block_indent);
                 },
+                .kw_conserves => {
+                    const cons = try self.parseConservesBlock(block_indent);
+                    try conserves.appendSlice(self.allocator, cons);
+                },
+                .kw_adversary => {
+                    const adv = try self.parseAdversaryBlock(block_indent);
+                    try adversary_blocks.append(self.allocator, adv);
+                },
+                .kw_fallback => {
+                    _ = self.advance(); // skip fallback
+                    _ = try self.expect(.colon);
+                    fallback_h = try self.parseAction(block_indent);
+                },
+                .kw_receive => {
+                    _ = self.advance(); // skip receive
+                    _ = try self.expect(.colon);
+                    receive_h = try self.parseAction(block_indent);
+                },
                 else => _ = self.advance(),
             }
+        }
+
+        // Consume optional explicit `End;` contract terminator.
+        if (self.peekKind() == .kw_end) {
+            _ = self.advance();
+            _ = self.matchAny(&.{.semicolon});
         }
 
         return .{
@@ -815,6 +866,10 @@ pub const Parser = struct {
             .upgrade     = upgrade,
             .namespaces  = try namespaces.toOwnedSlice(self.allocator),
             .invariants  = try invariants.toOwnedSlice(self.allocator),
+            .conserves   = try conserves.toOwnedSlice(self.allocator),
+            .adversary_blocks = try adversary_blocks.toOwnedSlice(self.allocator),
+            .fallback    = fallback_h,
+            .receive_    = receive_h,
             .span        = start,
         };
     }
@@ -848,6 +903,11 @@ pub const Parser = struct {
         if (!self.check(.lparen)) return list.toOwnedSlice(self.allocator);
         _ = self.advance();
         while (!self.check(.rparen) and self.peekKind() != .eof) {
+            var is_private = false;
+            while (self.check(.hash_sym)) {
+                const ann = try self.parseAnnotation();
+                if (ann.kind == .private) is_private = true;
+            }
             const span  = self.peek().span;
             const pname = (try self.expect(.identifier)).text;
             _ = try self.expect(.kw_is);
@@ -855,7 +915,7 @@ pub const Parser = struct {
             try list.append(self.allocator, .{
                 .name          = pname,
                 .declared_type = ty,
-                .is_private    = false,
+                .is_private    = is_private,
                 .span          = span,
             });
             _ = self.matchAny(&.{.comma});
@@ -1341,6 +1401,29 @@ pub const Parser = struct {
         const params = try self.parseParamList();
         var ret: ?TypeExpr = null;
         if (self.check(.kw_gives)) { _ = self.advance(); ret = try self.parseType(); }
+        var complexity_class: ?ComplexityClass = null;
+        if (self.check(.kw_complexity)) {
+            _ = self.advance();
+            _ = try self.expect(.identifier); // 'O'
+            _ = try self.expect(.lparen);
+            if (self.check(.int_literal) and std.mem.eql(u8, self.peek().text, "1")) {
+                _ = self.advance();
+                complexity_class = .constant;
+            } else if (self.check(.identifier) and std.mem.eql(u8, self.peek().text, "n")) {
+                _ = self.advance();
+                var bound: ?BoundExpr = null;
+                if (self.check(.kw_where)) {
+                    _ = self.advance();
+                    _ = try self.expect(.identifier); // 'n'
+                    _ = try self.expect(.lte);
+                    const val = try self.expect(.int_literal);
+                    bound = .{ .var_name = "n", .max_value = try std.fmt.parseInt(u64, val.text, 10) };
+                }
+                complexity_class = .{ .linear = bound };
+            }
+            _ = try self.expect(.rparen);
+        }
+
         _ = try self.expect(.colon);
         const block_indent = try self.expectIndentIncrease(parent_indent);
         var accs: []AccountDecl = &.{};
@@ -1352,7 +1435,9 @@ pub const Parser = struct {
             .name = name, .visibility = vis, .type_params = &.{},
             .params = params, .return_type = ret,
             .annotations = try anns.toOwnedSlice(self.allocator),
-            .accounts = accs, .body = body, .span = span,
+            .accounts = accs, .body = body,
+            .complexity_class = complexity_class,
+            .span = span,
         };
     }
 
@@ -1466,6 +1551,86 @@ pub const Parser = struct {
         return .{ .name = name, .cond = cond, .span = span };
     }
 
+    /// SPEC: Novel Idea 1 — Economic Conservation Proofs.
+    /// Parse a `conserves:` block containing one or more conservation equations.
+    /// Syntax: `conserves:\n    [aggregator(]expr[)] op expr [at_all_times]`
+    fn parseConservesBlock(self: *Parser, parent_indent: u32) anyerror![]ConservationExpr {
+        _ = try self.expect(.kw_conserves);
+        _ = try self.expect(.colon);
+        const block_indent = try self.expectIndentIncrease(parent_indent);
+        var list: std.ArrayListUnmanaged(ConservationExpr) = .{};
+        errdefer list.deinit(self.allocator);
+
+        while (!self.isBlockEnd(block_indent)) {
+            self.skipTrivia();
+            if (self.isBlockEnd(block_indent)) break;
+
+            const span = self.peek().span;
+
+            // Parse optional aggregator: sum(...), max_val(...), count(...)
+            var aggregator: AggregatorKind = .identity;
+            if (self.peekKind() == .kw_sum) {
+                _ = self.advance();
+                _ = try self.expect(.lparen);
+                aggregator = .sum;
+            } else if (self.peekKind() == .kw_max_val) {
+                _ = self.advance();
+                _ = try self.expect(.lparen);
+                aggregator = .max_val;
+            } else if (self.peekKind() == .kw_count_fn) {
+                _ = self.advance();
+                _ = try self.expect(.lparen);
+                aggregator = .count;
+            }
+
+            // Parse LHS expression
+            // Parse LHS expression — use parseAddSub to avoid consuming the comparison operator
+            const lhs = try self.parseAddSub();
+
+            // Close aggregator paren if present
+            if (aggregator != .identity) {
+                _ = try self.expect(.rparen);
+            }
+
+            // Parse comparison operator
+            const op: ConservationOp = switch (self.peekKind()) {
+                .kw_equals => blk: { _ = self.advance(); break :blk .equals; },
+                .gte       => blk: { _ = self.advance(); break :blk .gte; },
+                .lte       => blk: { _ = self.advance(); break :blk .lte; },
+                .gt        => blk: { _ = self.advance(); break :blk .gt; },
+                .lt        => blk: { _ = self.advance(); break :blk .lt; },
+                else       => blk: {
+                    const tok = self.peek();
+                    try self.emitErr(tok.span, error.ExpectedToken,
+                        "expected comparison operator in conserves equation, found '{s}'", .{tok.text});
+                    break :blk .equals;
+                },
+            };
+
+            // Parse RHS expression
+            // Parse RHS expression — use parseAddSub to avoid consuming trailing modifiers
+            const rhs = try self.parseAddSub();
+
+            // Parse optional `at_all_times` modifier
+            var at_all_times = false;
+            if (self.peekKind() == .kw_at_all_times) {
+                _ = self.advance();
+                at_all_times = true;
+            }
+
+            try list.append(self.allocator, .{
+                .aggregator = aggregator,
+                .lhs = lhs,
+                .op = op,
+                .rhs = rhs,
+                .at_all_times = at_all_times,
+                .span = span,
+            });
+        }
+
+        return list.toOwnedSlice(self.allocator);
+    }
+
     fn parseUpgrade(self: *Parser, parent_indent: u32) anyerror!UpgradeBlock {
         const span = self.peek().span;
         _ = try self.expect(.kw_upgrade);
@@ -1474,10 +1639,12 @@ pub const Parser = struct {
         var authority:  []const u8 = "";
         var migrate_fn: ?[]const u8 = null;
         var version:    ?*Expr     = null;
+        var imm_fields: std.ArrayListUnmanaged([]const u8) = .{};
         while (!self.isBlockEnd(block_indent)) {
             self.skipTrivia();
             if (self.isBlockEnd(block_indent)) break;
-            const key = (try self.expect(.identifier)).text;
+            const key_tok = self.advance();
+            const key = key_tok.text;
             _ = try self.expect(.colon);
             if (std.mem.eql(u8, key, "authority")) {
                 authority  = (try self.expect(.identifier)).text;
@@ -1485,9 +1652,99 @@ pub const Parser = struct {
                 migrate_fn = (try self.expect(.identifier)).text;
             } else if (std.mem.eql(u8, key, "version")) {
                 version    = try self.parseExpr();
+            } else if (std.mem.eql(u8, key, "immutable_fields")) {
+                // Parse comma-separated field names
+                while (self.peekKind() == .identifier) {
+                    try imm_fields.append(self.allocator, (try self.expect(.identifier)).text);
+                    _ = self.matchAny(&.{.comma});
+                }
             } else { _ = self.advance(); }
         }
-        return .{ .authority = authority, .migrate_fn = migrate_fn, .version = version, .span = span };
+        return .{
+            .authority = authority,
+            .migrate_fn = migrate_fn,
+            .version = version,
+            .immutable_fields = try imm_fields.toOwnedSlice(self.allocator),
+            .span = span,
+        };
+    }
+
+    fn parseAdversaryBlock(self: *Parser, parent_indent: u32) anyerror!AdversaryBlock {
+        const span = self.peek().span;
+        _ = try self.expect(.kw_adversary);
+        _ = try self.expect(.kw_tries);
+        _ = try self.expect(.colon);
+        const block_indent = try self.expectIndentIncrease(parent_indent);
+        var attacks: std.ArrayListUnmanaged(AttackSpec) = .{};
+        errdefer attacks.deinit(self.allocator);
+
+        while (!self.isBlockEnd(block_indent)) {
+            self.skipTrivia();
+            if (self.isBlockEnd(block_indent)) break;
+            const attack = try self.parseAttackSpec(block_indent);
+            try attacks.append(self.allocator, attack);
+        }
+
+        return .{
+            .attacks = try attacks.toOwnedSlice(self.allocator),
+            .span = span,
+        };
+    }
+
+    fn parseAttackSpec(self: *Parser, parent_indent: u32) anyerror!AttackSpec {
+        const span = self.peek().span;
+        _ = try self.expect(.kw_attack);
+        const name = (try self.expect(.identifier)).text;
+        _ = try self.expect(.colon);
+        const block_indent = try self.expectIndentIncrease(parent_indent);
+        var calls: std.ArrayListUnmanaged(AttackCall) = .{};
+        errdefer calls.deinit(self.allocator);
+
+        var outcome: AttackOutcome = .conservation_violated;
+
+        while (!self.isBlockEnd(block_indent)) {
+            self.skipTrivia();
+            if (self.isBlockEnd(block_indent)) break;
+
+            if (self.check(.kw_expects)) {
+                _ = self.advance();
+                outcome = blk: switch (self.peekKind()) {
+                    .kw_conservation_violated => { _ = self.advance(); break :blk .conservation_violated; },
+                    .kw_action_blocked        => { _ = self.advance(); break :blk .action_blocked; },
+                    .kw_invariant_broken      => { _ = self.advance(); break :blk .invariant_broken; },
+                    else => {
+                        const tok = self.peek();
+                        try self.emitErr(tok.span, error.ExpectedToken, "expected attack outcome (conservation_violated, action_blocked, etc.), found '{s}'", .{tok.text});
+                        break :blk .conservation_violated;
+                    },
+                };
+            } else if (self.check(.kw_call)) {
+                _ = self.advance();
+                const call_name = (try self.expect(.identifier)).text;
+                _ = try self.expect(.lparen);
+                var args: std.ArrayListUnmanaged(Argument) = .{};
+                while (!self.check(.rparen) and self.peekKind() != .eof) {
+                    const a = try self.parseExpr();
+                    try args.append(self.allocator, .{ .name = null, .value = a, .span = a.span });
+                    _ = self.matchAny(&.{.comma});
+                }
+                _ = try self.expect(.rparen);
+                try calls.append(self.allocator, .{
+                    .action_name = call_name,
+                    .args = try args.toOwnedSlice(self.allocator),
+                    .span = span,
+                });
+            } else {
+                _ = self.advance(); // skip unknown
+            }
+        }
+
+        return .{
+            .name = name,
+            .calls = try calls.toOwnedSlice(self.allocator),
+            .expected_outcome = outcome,
+            .span = span,
+        };
     }
 
     // ── Annotation: #[kind args...] ───────────────────────────
@@ -1499,14 +1756,16 @@ pub const Parser = struct {
         const kind_tok = self.peek();
         const kind: AnnotationKind = if (kind_tok.kind == .kw_parallel) blk: {
             _ = self.advance(); break :blk .parallel;
+        } else if (kind_tok.kind == .kw_zk_proof) blk: {
+            _ = self.advance(); break :blk .zk_proof;
+        } else if (kind_tok.kind == .kw_private) blk: {
+            _ = self.advance(); break :blk .private;
         } else blk: {
             const text = (try self.expect(.identifier)).text;
             break :blk if (std.mem.eql(u8, text, "reads"))             .reads
               else if (std.mem.eql(u8, text, "writes"))                 .writes
               else if (std.mem.eql(u8, text, "max_iterations"))         .max_iterations
               else if (std.mem.eql(u8, text, "gas_check"))              .gas_check
-              else if (std.mem.eql(u8, text, "zk_proof"))               .zk_proof
-              else if (std.mem.eql(u8, text, "private"))                .private
               else if (std.mem.eql(u8, text, "gas_sponsored_for"))      .gas_sponsored_for
               else .parallel;
         };
@@ -1719,6 +1978,7 @@ pub const Parser = struct {
             .kw_move      => try self.parseMoveAsset(),
             .kw_transfer_ownership => try self.parseTransferOwnership(),
             .kw_schedule  => try self.parseSchedule(),
+            .kw_verify    => try self.parseVerify(),
             .eof          => null,
             else          => try self.parseAssignOrCall(),
         };
@@ -1977,9 +2237,8 @@ pub const Parser = struct {
         const body_indent = try self.expectIndentIncrease(span.col - 1);
         // OnlyStmt in ast.zig stores only requirement+span; the body is parsed
         // but used as guard context — discard via underscore assignment.
-        const _only_body = try self.parseBlock(body_indent);
-        _ = _only_body;
-        return .{ .kind = .{ .only = .{ .requirement = req, .span = span } }, .span = span };
+        const only_body = try self.parseBlock(body_indent);
+        return .{ .kind = .{ .only = .{ .requirement = req, .body = only_body, .span = span } }, .span = span };
     }
 
     fn parseRemove(self: *Parser) anyerror!Stmt {
@@ -2047,6 +2306,16 @@ pub const Parser = struct {
         const new_owner = try self.parseExpr();
         return .{ .kind = .{ .transfer_ownership = .{ .account = new_owner, .new_owner = new_owner, .span = span } }, .span = span };
     }
+    
+    fn parseVerify(self: *Parser) anyerror!Stmt {
+        const span = self.peek().span;
+        _ = try self.expect(.kw_verify);
+        const proof = try self.parseExpr();
+        _ = try self.expect(.kw_against);
+        const commitment = try self.parseExpr();
+        return .{ .kind = .{ .verify = .{ .proof = proof, .commitment = commitment, .span = span } }, .span = span };
+    }
+
     fn parseSchedule(self: *Parser) anyerror!Stmt {
         const span = self.peek().span;
         _ = try self.expect(.kw_schedule);
@@ -2286,7 +2555,7 @@ pub const Parser = struct {
                 _ = try self.expect(.rparen);
                 return inner;
             },
-            .identifier, .kw_mine, .kw_this => {
+            .identifier, .kw_mine, .kw_this, .kw_oracle, .kw_vrf_random, .kw_zk_proof, .kw_private => {
                 _ = self.advance();
                 return self.makeExprNode(.{ .identifier = tok.text }, span);
             },

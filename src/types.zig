@@ -98,6 +98,13 @@ pub const ResolvedType = union(enum) {
     // ── Linear types (for asset tracking) ─────────────────────────────────
     /// Wraps an asset type for linear (move-only) semantics.
     linear: *ResolvedType,
+    // ── Capability types (Novel Idea 6) ───────────────────────────────────
+    /// SPEC: Novel Idea 6 — Capability Token Types (Structural Authority).
+    /// A resolved capability type, always linear. Identified by definition name.
+    capability: []const u8,
+    // ── ZK / Privacy ──────────────────────────────────────────────────────
+    /// `Proof[T]` — ZK Proof payload mapped to parametric assertion type.
+    proof: *ResolvedType,
 };
 
 // ============================================================================
@@ -149,6 +156,7 @@ pub const SymbolKind = enum {
     type_alias,
     struct_type,
     enum_type,
+    asset,
 };
 
 /// A single symbol recorded in the symbol table.
@@ -158,6 +166,7 @@ pub const Symbol = struct {
     type_: ResolvedType,
     span: Span,
     mutable: bool,
+    is_private: bool = false,
 };
 
 /// A hierarchical symbol table with parent-chain lookup.
@@ -219,9 +228,13 @@ pub const TypeResolver = struct {
     struct_defs: std.StringHashMap(StructInfo),
     enum_defs: std.StringHashMap(EnumInfo),
     contract_defs: std.StringHashMap(ast.ContractDef),
+    /// Stores all declared asset definitions by name.
+    asset_defs: std.StringHashMap(ast.AssetDef),
     /// Stores all declared interfaces by name.
     /// Values are raw AST pointers — valid for the lifetime of the source AST.
     interface_defs: std.StringHashMap(ast.InterfaceDef),
+    /// SPEC: Novel Idea 6 — Track capability type names for linear resolution.
+    capability_names: std.StringHashMap(void),
     allocator: std.mem.Allocator,
     diagnostics: *DiagnosticList,
 
@@ -233,7 +246,9 @@ pub const TypeResolver = struct {
             .struct_defs = std.StringHashMap(StructInfo).init(allocator),
             .enum_defs = std.StringHashMap(EnumInfo).init(allocator),
             .contract_defs = std.StringHashMap(ast.ContractDef).init(allocator),
+            .asset_defs = std.StringHashMap(ast.AssetDef).init(allocator),
             .interface_defs = std.StringHashMap(ast.InterfaceDef).init(allocator),
+            .capability_names = std.StringHashMap(void).init(allocator),
             .allocator = allocator,
             .diagnostics = diagnostics,
         };
@@ -258,7 +273,9 @@ pub const TypeResolver = struct {
         self.struct_defs.deinit();
         self.enum_defs.deinit();
         self.contract_defs.deinit();
+        self.asset_defs.deinit();
         self.interface_defs.deinit();
+        self.capability_names.deinit();
     }
 
     pub fn lookupInterface(self: *const TypeResolver, name: []const u8) ?ast.InterfaceDef {
@@ -375,6 +392,10 @@ pub const TypeResolver = struct {
                 if (self.type_aliases.get(name)) |aliased| {
                     return aliased;
                 }
+                // SPEC: Novel Idea 6 — Capabilities resolve as capability type.
+                if (self.capability_names.contains(name)) {
+                    return .{ .capability = name };
+                }
                 if (self.struct_defs.getPtr(name)) |info| {
                     return .{ .struct_ = info };
                 }
@@ -389,6 +410,12 @@ pub const TypeResolver = struct {
                     _ = inner;
                     return .{ .fixed_point = 18 };
                 }
+                if (std.mem.eql(u8, g.name, "Proof") and g.params.len == 1) {
+                    const inner = try self.resolve(g.params[0].*);
+                    const ptr = try self.allocator.create(ResolvedType);
+                    ptr.* = inner;
+                    return .{ .proof = ptr };
+                }
                 return .void_;
             },
             .span => .void_,
@@ -398,7 +425,6 @@ pub const TypeResolver = struct {
     /// Check if two resolved types are assignment-compatible.
     /// Handles subtype relationships per Spec §2.1.
     pub fn isCompatible(self: *TypeResolver, from: ResolvedType, to: ResolvedType) bool {
-        _ = self;
         // Exact match via tag comparison
         const from_tag = std.meta.activeTag(from);
         const to_tag = std.meta.activeTag(to);
@@ -406,7 +432,8 @@ pub const TypeResolver = struct {
             return switch (from) {
                 .fixed_point => |fd| fd == to.fixed_point,
                 .bytes_n => |fn_| fn_ == to.bytes_n,
-                .asset => |name| std.mem.eql(u8, name, to.asset),
+                .asset => |n| std.mem.eql(u8, n, to.asset),
+                .proof => |p| self.isCompatible(p.*, to.proof.*),
                 else => true,
             };
         }
@@ -684,10 +711,13 @@ pub const TypeResolver = struct {
                     }
                 },
                 .asset_def => |ad| {
+                    // Record the AST pointer for the checker.
+                    try self.asset_defs.put(ad.name, ad);
+                    // Also define as a type in the global scope.
                     try self.global_scope.define(ad.name, .{
                         .name = ad.name,
-                        .kind = .type_alias,
-                        .type_ = .{ .asset = ad.name },
+                        .kind = .asset,
+                        .type_ = .{ .linear = try self.allocResolvedType(.{ .asset = ad.name }) },
                         .span = ad.span,
                         .mutable = false,
                     });
@@ -724,6 +754,27 @@ pub const TypeResolver = struct {
                         .mutable = false,
                     });
                 },
+                .capability_def => |cap| {
+                    // SPEC: Novel Idea 6 — Capability Token Types.
+                    // Register capability as a struct-like type in the global scope.
+                    const fields = try self.allocator.alloc(ResolvedField, cap.fields.len);
+                    for (cap.fields, 0..) |f, i| {
+                        fields[i] = .{
+                            .name = f.name,
+                            .type_ = try self.resolve(f.type_),
+                        };
+                    }
+                    try self.struct_defs.put(cap.name, .{ .name = cap.name, .fields = fields });
+                    try self.capability_names.put(cap.name, {});
+                    try self.global_scope.define(cap.name, .{
+                        .name = cap.name,
+                        .kind = .struct_type,
+                        .type_ = .void_,
+                        .span = cap.span,
+                        .mutable = false,
+                    });
+                },
+                .global_invariant => {},
             }
         }
     }
@@ -1026,6 +1077,10 @@ test "registerTopLevel stores contract_def" {
         .namespaces = &[_][]const u8{},
         .accounts = &[_]ast.AccountDecl{},
         .invariants = &[_]ast.InvariantDecl{},
+        .conserves = &[_]ast.ConservationExpr{},
+        .adversary_blocks = &[_]ast.AdversaryBlock{},
+        .fallback = null,
+        .receive_ = null,
         .span = Span{ .line = 1, .col = 1, .len = 7 },
     };
 

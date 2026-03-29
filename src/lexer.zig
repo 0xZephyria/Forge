@@ -225,6 +225,41 @@ pub const TokenKind = enum {
     kw_debit,
     kw_credit,
 
+    // ── Keywords — Novel features (Conservation, Complexity, Adversary, Capability)
+    kw_conserves,
+    kw_sum,
+    kw_count_fn,
+    kw_max_val,
+    kw_at_all_times,
+    kw_complexity,
+    kw_adversary,
+    kw_tries,
+    kw_attack,
+    kw_call,
+    kw_expects,
+    kw_conservation_violated,
+    kw_action_blocked,
+    kw_invariant_broken,
+    kw_capability,
+    kw_global_invariant,
+
+    // ── Keywords — Contract terminator ─────────────────────────────────
+    kw_end,
+
+    // ── Keywords — Fallback / Receive (Spec Part 5.13) ────────────────
+    kw_fallback,
+    kw_receive,
+
+    // ── Keywords — Oracle & VRF (Spec Part 14) ─────────────────────────
+    kw_oracle,
+    kw_vrf_random,
+
+    // ── Keywords — ZK Annotations (Spec Part 12) ───────────────────────
+    kw_zk_proof,
+    kw_private,
+    kw_verify,
+    kw_against,
+
     // ── Punctuation ───────────────────────────────────────────────────────
     colon,          // :
     double_colon,   // ::
@@ -499,6 +534,36 @@ const keyword_map = std.StaticStringMap(TokenKind).initComptime(.{
     .{ "follows",               .kw_follows             },
     .{ "debit",                 .kw_debit               },
     .{ "credit",                .kw_credit              },
+    // Novel features
+    .{ "conserves",             .kw_conserves           },
+    .{ "sum",                   .kw_sum                 },
+    .{ "count",                 .kw_count_fn            },
+    .{ "max_val",               .kw_max_val             },
+    .{ "at_all_times",          .kw_at_all_times        },
+    .{ "complexity",            .kw_complexity          },
+    .{ "adversary",             .kw_adversary           },
+    .{ "tries",                 .kw_tries               },
+    .{ "attack",                .kw_attack              },
+    .{ "call",                  .kw_call                },
+    .{ "expects",               .kw_expects             },
+    .{ "conservation_violated", .kw_conservation_violated },
+    .{ "action_blocked",        .kw_action_blocked      },
+    .{ "invariant_broken",      .kw_invariant_broken    },
+    .{ "capability",            .kw_capability          },
+    .{ "global_invariant",      .kw_global_invariant    },
+    // Contract terminator
+    .{ "End",                   .kw_end                 },
+    // Fallback / Receive (Spec Part 5.13)
+    .{ "fallback",              .kw_fallback            },
+    .{ "receive",               .kw_receive             },
+    // Oracle & VRF
+    .{ "oracle",                .kw_oracle              },
+    .{ "vrf_random",            .kw_vrf_random          },
+    // ZK Annotations
+    .{ "zk_proof",              .kw_zk_proof            },
+    .{ "private",               .kw_private             },
+    .{ "verify",                .kw_verify              },
+    .{ "against",               .kw_against             },
 });
 
 /// Look up whether a source word is a reserved keyword.

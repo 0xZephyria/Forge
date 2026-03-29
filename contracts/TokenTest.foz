@@ -6,11 +6,12 @@ contract TokenTest:
     authorities:
         admin is AdminAuthority
             held_by Wallet
-            initially deployer
+            initially 0x5B38Da6a701c568545dCfcB03FcB875f56beddC4
 
     has:
         total_supply is u256
         is_paused    is bool
+        balances     is Map[Account -> u256]
 
     // GAP-4: zero-field error declarations WITHOUT parentheses — previously crashed the parser
     error SupplyOverflow
@@ -23,20 +24,24 @@ contract TokenTest:
     event Retired(amount is u256)
 
     setup():
-        total_supply = 0
+        total_supply = 1000000
         is_paused = no
+        balances[0x5B38Da6a701c568545dCfcB03FcB875f56beddC4] = 1000000
 
     action issue(recipient is Account, amount is u256):
         only admin:
             need amount > 0 else "zero amount"
             total_supply += amount
+            balances[recipient] += amount
             tell Issued(recipient, amount)
 
     action retire(amount is u256):
         need not is_paused else "paused"
         need amount > 0 else "zero amount"
         need total_supply >= amount else "underflow"
+        need balances[caller] >= amount else "insufficient balance"
         total_supply -= amount
+        balances[caller] -= amount
         tell Retired(amount)
 
     action set_paused(flag is bool):
@@ -49,3 +54,6 @@ contract TokenTest:
 
     view check_supply() gives u256:
         give back total_supply
+
+    view check_balance(acc is Account) gives u256:
+        give back balances[acc]

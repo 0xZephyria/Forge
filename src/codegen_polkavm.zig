@@ -63,6 +63,10 @@ pub const PolkaHostCalls = enum(u12) {
     GET_BLOCK = 36,
     /// Maps to pallet-revive `value_transferred`
     GET_VALUE = 37,
+    /// Maps to pallet-revive extension `oracle_query`
+    ORACLE_QUERY = 38,
+    /// Maps to pallet-revive extension `vrf_random`
+    VRF_RANDOM = 39,
 };
 
 
@@ -121,8 +125,10 @@ pub const PolkaVmHeader = extern struct {
     bytecode_len: u32 = 0,
     /// CRC32 of entire file after this field.
     checksum: u32 = 0,
-    /// Reserved padding to reach exactly 64 bytes.
-    _reserved: [8]u8 = [_]u8{0} ** 8,
+    /// Byte length of the static data section.
+    data_section_len: u32 = 0,
+    /// SPEC: Novel Idea 1 — Byte length of conservation metadata section.
+    conservation_len: u32 = 0,
 };
 comptime {
     std.debug.assert(@sizeOf(PolkaVmHeader) == 64);
@@ -395,7 +401,9 @@ pub const CodeGenPolkaVM = struct {
 
         // Constructor counts as an extra entry when present
         const setup_count: u16 = if (contract.setup != null) 1 else 0;
-        const action_count: u16 = @intCast(contract.actions.len + contract.views.len + setup_count);
+        const fb_count: u16 = @as(u16, if (contract.fallback != null) 1 else 0) +
+            @as(u16, if (contract.receive_ != null) 1 else 0);
+        const action_count: u16 = @intCast(contract.actions.len + contract.views.len + setup_count + fb_count);
 
         // Determine flags
         var flags: u16 = 0;
@@ -472,6 +480,34 @@ pub const CodeGenPolkaVM = struct {
             });
         }
 
+        // ── SPEC: Part 5.13 — Fallback handler ──────────────────────────
+        if (contract.fallback) |fb| {
+            var ctx = ActionCtx.init(self.allocator, "__fallback__", &self.field_ids);
+            defer ctx.deinit();
+            try self.genAction(&fb, &ctx);
+            const code_bytes = ctx.writer.toBytes();
+            const owned_copy = try self.allocator.alloc(u8, code_bytes.len);
+            @memcpy(owned_copy, code_bytes);
+            try action_codes.append(self.allocator, .{
+                .selector = 0xFFFFFFFF,
+                .code = owned_copy,
+            });
+        }
+
+        // ── SPEC: Part 5.13 — Receive handler ───────────────────────────
+        if (contract.receive_) |rc| {
+            var ctx = ActionCtx.init(self.allocator, "__receive__", &self.field_ids);
+            defer ctx.deinit();
+            try self.genAction(&rc, &ctx);
+            const code_bytes = ctx.writer.toBytes();
+            const owned_copy = try self.allocator.alloc(u8, code_bytes.len);
+            @memcpy(owned_copy, code_bytes);
+            try action_codes.append(self.allocator, .{
+                .selector = 0xFFFFFFFE,
+                .code = owned_copy,
+            });
+        }
+
         // ── Serialize access list section ────────────────────────────────
         const access_list_bytes = try self.serializeAccessList(contract, checked);
         defer self.allocator.free(access_list_bytes);
@@ -481,7 +517,7 @@ pub const CodeGenPolkaVM = struct {
         defer self.allocator.free(bytecode_bytes);
 
         // ── Assemble final binary ────────────────────────────────────────
-        // Layout: [64-byte header][access_list][bytecode][data_section]
+        // Layout: [64-byte header][access_list][bytecode][data_section][conservation]
         const data_bytes = self.data_section.items;
         var header = PolkaVmHeader{};
         header.contract_name = writeContractName(contract.name);
@@ -489,8 +525,14 @@ pub const CodeGenPolkaVM = struct {
         header.flags = flags;
         header.access_list_len = @intCast(access_list_bytes.len);
         header.bytecode_len = @intCast(bytecode_bytes.len);
+        header.data_section_len = @intCast(data_bytes.len);
 
-        const total_size = @sizeOf(PolkaVmHeader) + access_list_bytes.len + bytecode_bytes.len + data_bytes.len;
+        // Serialize conservation metadata
+        const conservation_bytes = try self.serializeConservationMetadata(contract);
+        defer self.allocator.free(conservation_bytes);
+        header.conservation_len = @intCast(conservation_bytes.len);
+
+        const total_size = @sizeOf(PolkaVmHeader) + access_list_bytes.len + bytecode_bytes.len + data_bytes.len + conservation_bytes.len;
         const binary = try self.allocator.alloc(u8, total_size);
         errdefer self.allocator.free(binary);
 
@@ -510,6 +552,12 @@ pub const CodeGenPolkaVM = struct {
         const ds_start = bc_start + bytecode_bytes.len;
         if (data_bytes.len > 0) {
             @memcpy(binary[ds_start..][0..data_bytes.len], data_bytes);
+        }
+
+        // Copy conservation metadata section
+        const cm_start = ds_start + data_bytes.len;
+        if (conservation_bytes.len > 0) {
+            @memcpy(binary[cm_start..][0..conservation_bytes.len], conservation_bytes);
         }
 
         // Compute and store checksum over everything after checksum field
@@ -1418,10 +1466,16 @@ pub const CodeGenPolkaVM = struct {
         // Determine call target
         switch (callee.kind) {
             .identifier => |name| {
-                // Internal call via selector
-                const selector = actionSelector(name);
-                try self.genLoadImmediate(@intCast(selector), .t0, ctx);
-                try ctx.writer.emit(riscv.JALR(.ra, .t0, 0));
+                if (std.mem.eql(u8, name, "oracle")) {
+                    try ctx.writer.emit(riscv.ECALLI(@intFromEnum(PolkaHostCalls.ORACLE_QUERY)));
+                } else if (std.mem.eql(u8, name, "vrf_random")) {
+                    try ctx.writer.emit(riscv.ECALLI(@intFromEnum(PolkaHostCalls.VRF_RANDOM)));
+                } else {
+                    // Internal call via selector
+                    const selector = actionSelector(name);
+                    try self.genLoadImmediate(@intCast(selector), .t0, ctx);
+                    try ctx.writer.emit(riscv.JALR(.ra, .t0, 0));
+                }
             },
             .field_access => |fa| {
                 if (fa.object.kind == .identifier) {
@@ -1617,6 +1671,85 @@ pub const CodeGenPolkaVM = struct {
         }
 
         return buf.toOwnedSlice(self.allocator);
+    }
+
+    /// SPEC: Novel Idea 1 — Serialize conservation equations into the PolkaVM binary.
+    /// Format: [2-byte eq_count]
+    ///   per equation: [1-byte op] [1-byte flags(at_all_times)]
+    ///                 [lhs_field_ref][rhs_field_ref]
+    fn serializeConservationMetadata(self: *CodeGenPolkaVM, contract: *const ContractDef) anyerror![]u8 {
+        if (contract.conserves.len == 0) {
+            const empty = try self.allocator.alloc(u8, 0);
+            return empty;
+        }
+
+        var buf = std.ArrayListUnmanaged(u8){};
+        errdefer buf.deinit(self.allocator);
+
+        // Equation count
+        var count_bytes: [2]u8 = undefined;
+        std.mem.writeInt(u16, &count_bytes, @intCast(contract.conserves.len), .little);
+        try buf.appendSlice(self.allocator, &count_bytes);
+
+        for (contract.conserves) |eq| {
+            const op_byte: u8 = switch (eq.op) {
+                .equals => 0x00,
+                .gte => 0x01,
+                .lte => 0x02,
+                .gt => 0x03,
+                .lt => 0x04,
+            };
+            try buf.append(self.allocator, op_byte);
+
+            const flags_byte: u8 = if (eq.at_all_times) 0x01 else 0x00;
+            try buf.append(self.allocator, flags_byte);
+
+            try self.serializeExprRef(&buf, eq.lhs);
+            try self.serializeExprRef(&buf, eq.rhs);
+        }
+
+        return buf.toOwnedSlice(self.allocator);
+    }
+
+    /// Serialize an expression reference for conservation metadata.
+    fn serializeExprRef(self: *CodeGenPolkaVM, buf: *std.ArrayListUnmanaged(u8), expr: *const ast.Expr) anyerror!void {
+        switch (expr.kind) {
+            .identifier => |name| {
+                const name_len: u8 = @intCast(@min(name.len, 255));
+                try buf.append(self.allocator, name_len);
+                try buf.appendSlice(self.allocator, name[0..name_len]);
+            },
+            .field_access => |fa| {
+                const field = fa.field;
+                if (fa.object.kind == .identifier) {
+                    const obj = fa.object.kind.identifier;
+                    const total_len = @min(obj.len + 1 + field.len, 255);
+                    try buf.append(self.allocator, @intCast(total_len));
+                    try buf.appendSlice(self.allocator, obj);
+                    try buf.append(self.allocator, '.');
+                    try buf.appendSlice(self.allocator, field);
+                } else {
+                    const flen: u8 = @intCast(@min(field.len, 255));
+                    try buf.append(self.allocator, flen);
+                    try buf.appendSlice(self.allocator, field[0..flen]);
+                }
+            },
+            .bin_op => |bop| {
+                try buf.append(self.allocator, 0xFF);
+                const op_byte: u8 = switch (bop.op) {
+                    .plus => 0x10,
+                    .minus => 0x11,
+                    .times => 0x12,
+                    else => 0x1F,
+                };
+                try buf.append(self.allocator, op_byte);
+                try self.serializeExprRef(buf, bop.left);
+                try self.serializeExprRef(buf, bop.right);
+            },
+            else => {
+                try buf.append(self.allocator, 0);
+            },
+        }
     }
 };
 

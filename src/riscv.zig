@@ -377,6 +377,8 @@ pub const ZephCustomOp = enum(u8) {
     AUTH_CHECK = 0x10,
     /// Assert access list entry is valid. a7=op, a0=entry_ptr
     ACCESS_ASSERT = 0x11,
+    /// Delegate gas payment to another account. a7=op, a0=payer_addr
+    DELEGATE_GAS = 0x12,
 
     // ── custom-2 (opcode 0x5B): Asset & Payment operations ──
     /// Transfer asset. a7=op, a0=asset_id, a1=from, a2=to, a3=amount
@@ -405,6 +407,10 @@ pub const ZephCustomOp = enum(u8) {
     GET_BLOCK = 0x36,
     /// Get sent native value. a7=op → a0=u64
     GET_VALUE = 0x37,
+    /// Query Oracle value. a7=op, a0=query_string_ptr → a0=u256_ptr
+    ORACLE_QUERY = 0x38,
+    /// Get VRF randomness. a7=op → a0=u256_ptr
+    VRF_RANDOM = 0x39,
 
     /// Return the custom-N base opcode for this operation.
     pub fn baseOpcode(self: ZephCustomOp) u7 {
