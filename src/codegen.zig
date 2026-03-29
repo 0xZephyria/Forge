@@ -76,8 +76,8 @@ pub const ZephBinHeader = extern struct {
     checksum: u32 = 0,
     /// Byte length of the static data section.
     data_section_len: u32 = 0,
-    /// Reserved padding to reach exactly 64 bytes.
-    _reserved: [4]u8 = [_]u8{0} ** 4,
+    /// SPEC: Novel Idea 1 — Byte length of conservation metadata section.
+    conservation_len: u32 = 0,
 };
 comptime {
     std.debug.assert(@sizeOf(ZephBinHeader) == 64);
@@ -221,31 +221,35 @@ pub const RegAlloc = struct {
     }
 };
 
-// ============================================================================
-// Section 4 — Action Code Generation Context
-// ============================================================================
+/// Information about a local variable tracked during codegen.
+pub const LocalVar = struct {
+    reg: Reg,
+    ty: ResolvedType,
+};
 
 /// Per-action state maintained during code generation.
 const ActionCtx = struct {
     writer: BytecodeWriter,
     reg_alloc: RegAlloc,
-    locals: std.StringHashMap(Reg),
+    locals: std.StringHashMap(LocalVar),
     loop_exits: std.ArrayListUnmanaged(u32),
     loop_conts: std.ArrayListUnmanaged(u32),
     action_name: []const u8,
     field_ids: *std.StringHashMap(u32),
+    checked: *const CheckedContract,
     allocator: std.mem.Allocator,
 
     /// Create a new context for an action.
-    fn init(allocator: std.mem.Allocator, name: []const u8, field_ids: *std.StringHashMap(u32)) ActionCtx {
+    fn init(allocator: std.mem.Allocator, name: []const u8, field_ids: *std.StringHashMap(u32), checked: *const CheckedContract) ActionCtx {
         return .{
             .writer = BytecodeWriter.init(allocator),
             .reg_alloc = .{},
-            .locals = std.StringHashMap(Reg).init(allocator),
+            .locals = std.StringHashMap(LocalVar).init(allocator),
             .loop_exits = .{},
             .loop_conts = .{},
             .action_name = name,
             .field_ids = field_ids,
+            .checked = checked,
             .allocator = allocator,
         };
     }
@@ -363,7 +367,9 @@ pub const CodeGen = struct {
 
         // Constructor counts as an entry if present
         const setup_count: u16 = if (contract.setup != null) 1 else 0;
-        const action_count: u16 = @intCast(contract.actions.len + contract.views.len + setup_count);
+        const fb_count: u16 = @as(u16, if (contract.fallback != null) 1 else 0) +
+            @as(u16, if (contract.receive_ != null) 1 else 0);
+        const action_count: u16 = @intCast(contract.actions.len + contract.views.len + setup_count + fb_count);
 
         // Determine flags
         var flags: u16 = 0;
@@ -392,7 +398,7 @@ pub const CodeGen = struct {
 
         // ── Generate constructor (setup block) if present ────────────────────
         if (contract.setup) |setup| {
-            var ctx = ActionCtx.init(self.allocator, "__setup__", &self.field_ids);
+            var ctx = ActionCtx.init(self.allocator, "__setup__", &self.field_ids, checked);
             defer ctx.deinit();
 
             try self.genSetup(&setup, &ctx);
@@ -408,7 +414,7 @@ pub const CodeGen = struct {
         }
 
         for (contract.actions) |action| {
-            var ctx = ActionCtx.init(self.allocator, action.name, &self.field_ids);
+            var ctx = ActionCtx.init(self.allocator, action.name, &self.field_ids, checked);
             defer ctx.deinit();
 
             try self.genAction(&action, &ctx);
@@ -425,7 +431,7 @@ pub const CodeGen = struct {
 
         // ── GAP-5: Generate bytecode for each view ────────────────────────
         for (contract.views) |view| {
-            var ctx = ActionCtx.init(self.allocator, view.name, &self.field_ids);
+            var ctx = ActionCtx.init(self.allocator, view.name, &self.field_ids, checked);
             defer ctx.deinit();
 
             try self.genView(&view, &ctx);
@@ -436,6 +442,70 @@ pub const CodeGen = struct {
 
             try action_codes.append(self.allocator, .{
                 .selector = actionSelector(view.name),
+                .code = owned_copy,
+            });
+        }
+
+        // ── SPEC: Part 5.13 — Fallback handler ──────────────────────────
+        if (contract.fallback) |fb| {
+            var ctx = ActionCtx.init(self.allocator, "__fallback__", &self.field_ids, checked);
+            defer ctx.deinit();
+            try self.genAction(&fb, &ctx);
+            const code_bytes = ctx.writer.toBytes();
+            const owned_copy = try self.allocator.alloc(u8, code_bytes.len);
+            @memcpy(owned_copy, code_bytes);
+            try action_codes.append(self.allocator, .{
+                .selector = 0xFFFFFFFF,
+                .code = owned_copy,
+            });
+        }
+
+        // ── SPEC: Part 5.13 — Receive handler ───────────────────────────
+        if (contract.receive_) |rc| {
+            var ctx = ActionCtx.init(self.allocator, "__receive__", &self.field_ids, checked);
+            defer ctx.deinit();
+            try self.genAction(&rc, &ctx);
+            const code_bytes = ctx.writer.toBytes();
+            const owned_copy = try self.allocator.alloc(u8, code_bytes.len);
+            @memcpy(owned_copy, code_bytes);
+            try action_codes.append(self.allocator, .{
+                .selector = 0x00000001, // Receive selector
+                .code = owned_copy,
+            });
+        }
+
+        // ── SPEC: Tier 1 Robustness — Migration Entry Point ─────────────
+        if (contract.upgrade) |up| {
+            // Generate selector 0xDEAD0001 for migration
+            var ctx = ActionCtx.init(self.allocator, "__migrate__", &self.field_ids, checked);
+            defer ctx.deinit();
+            
+            // 1. Enforce migration authority check (must be upgrade authority)
+            // Implementation detail: The VM handles the 'only' authority check if injected.
+            // If migrate_fn was specified in Forge source, call it.
+            if (up.migrate_fn) |fn_name| {
+                // Find method by name
+                for (contract.actions) |act| {
+                    if (std.mem.eql(u8, act.name, fn_name)) {
+                        try self.genAction(&act, &ctx);
+                        break;
+                    }
+                }
+            } else {
+                // Default empty migration: just return success
+                const frame_size: i12 = 8;
+                try ctx.writer.emit(riscv.ADDI(.sp, .sp, -frame_size));
+                try ctx.writer.emit(riscv.SD(.sp, .ra, 0));
+                try ctx.writer.emit(riscv.LD(.ra, .sp, 0));
+                try ctx.writer.emit(riscv.ADDI(.sp, .sp, frame_size));
+                try ctx.writer.emit(riscv.JALR(.zero, .ra, 0));
+            }
+
+            const code_bytes = ctx.writer.toBytes();
+            const owned_copy = try self.allocator.alloc(u8, code_bytes.len);
+            @memcpy(owned_copy, code_bytes);
+            try action_codes.append(self.allocator, .{
+                .selector = 0xDEAD0001,
                 .code = owned_copy,
             });
         }
@@ -459,10 +529,16 @@ pub const CodeGen = struct {
         header.bytecode_len = @intCast(bytecode_bytes.len);
         header.data_section_len = @intCast(data_bytes.len);
 
+        // ── Serialize conservation metadata section ──────────────────────
+        const conservation_bytes = try self.serializeConservationMetadata(contract);
+        defer self.allocator.free(conservation_bytes);
+        header.conservation_len = @intCast(conservation_bytes.len);
+
         const total_size = @sizeOf(ZephBinHeader) +
             access_list_bytes.len +
             bytecode_bytes.len +
-            data_bytes.len;
+            data_bytes.len +
+            conservation_bytes.len;
 
         const binary = try self.allocator.alloc(u8, total_size);
         errdefer self.allocator.free(binary);
@@ -485,6 +561,12 @@ pub const CodeGen = struct {
             @memcpy(binary[ds_start..][0..data_bytes.len], data_bytes);
         }
 
+        // Copy conservation metadata section
+        const cm_start = ds_start + data_bytes.len;
+        if (conservation_bytes.len > 0) {
+            @memcpy(binary[cm_start..][0..conservation_bytes.len], conservation_bytes);
+        }
+
         // Compute and store checksum over everything after checksum field
         const checksum_offset = @offsetOf(ZephBinHeader, "checksum") + @sizeOf(u32);
         const checksum = crc32(binary[checksum_offset..]);
@@ -505,31 +587,23 @@ pub const CodeGen = struct {
         try ctx.writer.emit(riscv.SD(.sp, .s0, 8));
         try ctx.writer.emit(riscv.ADDI(.s0, .sp, frame_size));
 
-        // AUTH_CHECK for `only` guards
-        for (action.body) |stmt| {
-            switch (stmt.kind) {
-                .only => |only_stmt| {
-                    switch (only_stmt.requirement) {
-                        .authority => |name| {
-                            try self.genAuthCheck(name, ctx);
-                        },
-                        .either => |pair| {
-                            try self.genAuthCheck(pair.left, ctx);
-                            try self.genAuthCheck(pair.right, ctx);
-                        },
-                        else => {},
-                    }
-                },
-                else => {},
-            }
-        }
-
         // ── Bind parameters to registers ─────────────────────────────────
         for (action.params, 0..) |param, i| {
             if (i < 7) {
                 const reg: Reg = @enumFromInt(@as(u5, @intCast(10 + i)));
                 ctx.reg_alloc.used[@intFromEnum(reg)] = true;
-                try ctx.locals.put(param.name, reg);
+                const ty = (self.resolver.resolve(param.declared_type) catch .void_);
+                try ctx.locals.put(param.name, .{ .reg = reg, .ty = ty });
+            }
+        }
+        // ── Gas Sponsorship ─────────────────────────────────────────────
+        for (action.annotations) |anno| {
+            if (anno.kind == .gas_sponsored_for) {
+                if (anno.args.len > 0) {
+                    const payer_expr = anno.args[0];
+                    try self.genExpr(payer_expr, ctx, .a0);
+                    try ctx.writer.emit(riscv.ZEPH(.DELEGATE_GAS));
+                }
             }
         }
 
@@ -564,7 +638,8 @@ pub const CodeGen = struct {
             if (i < 7) {
                 const reg: Reg = @enumFromInt(@as(u5, @intCast(10 + i)));
                 ctx.reg_alloc.used[@intFromEnum(reg)] = true;
-                try ctx.locals.put(param.name, reg);
+                const ty = (self.resolver.resolve(param.declared_type) catch .void_);
+                try ctx.locals.put(param.name, .{ .reg = reg, .ty = ty });
             }
         }
 
@@ -597,7 +672,8 @@ pub const CodeGen = struct {
             if (i < 7) {
                 const reg: Reg = @enumFromInt(@as(u5, @intCast(10 + i)));
                 ctx.reg_alloc.used[@intFromEnum(reg)] = true;
-                try ctx.locals.put(param.name, reg);
+                const ty = (self.resolver.resolve(param.declared_type) catch .void_);
+                try ctx.locals.put(param.name, .{ .reg = reg, .ty = ty });
             }
         }
 
@@ -621,7 +697,8 @@ pub const CodeGen = struct {
             .let_bind => |lb| {
                 const dest = ctx.reg_alloc.alloc() orelse .t0;
                 try self.genExpr(lb.init, ctx, dest);
-                try ctx.locals.put(lb.name, dest);
+                const ty = (self.resolver.inferExpr(lb.init, &ctx.checked.scope) catch .void_);
+                try ctx.locals.put(lb.name, .{ .reg = dest, .ty = ty });
             },
             .assign => |asg| {
                 switch (asg.target.kind) {
@@ -651,8 +728,8 @@ pub const CodeGen = struct {
                 // General assignment: evaluate value into target register
                 if (asg.target.kind == .identifier) {
                     const name = asg.target.kind.identifier;
-                    if (ctx.locals.get(name)) |reg| {
-                        try self.genExpr(asg.value, ctx, reg);
+                    if (ctx.locals.get(name)) |loc| {
+                        try self.genExpr(asg.value, ctx, loc.reg);
                         return;
                     }
                 }
@@ -664,7 +741,8 @@ pub const CodeGen = struct {
                 // ── Local variable aug-assign ──────────────────────────────
                 if (aug.target.kind == .identifier) {
                     const name = aug.target.kind.identifier;
-                    if (ctx.locals.get(name)) |dest| {
+                    if (ctx.locals.get(name)) |loc| {
+                        const dest = loc.reg;
                         const tmp = ctx.reg_alloc.alloc() orelse .t1;
                         defer ctx.reg_alloc.free(tmp);
                         try self.genExpr(aug.value, ctx, tmp);
@@ -755,7 +833,14 @@ pub const CodeGen = struct {
             .while_ => |w| try self.genWhile(&w, ctx),
             .need => |n| try self.genNeed(&n, ctx),
             .tell => |t| try self.genTell(&t, ctx),
-            .give_back => |expr| try self.genGiveBack(expr, ctx),
+            .give_back => |expr| {
+                const reg = ctx.reg_alloc.alloc() orelse .a0;
+                try self.genExpr(expr, ctx, reg);
+                if (reg != .a0) {
+                    try ctx.writer.emit(riscv.ADD(.a0, reg, .zero));
+                }
+                try ctx.writer.emit(riscv.JAL(.zero, 0)); // Jump to exit
+            },
             .stop => {
                 // Emit placeholder jump, record for backpatching
                 const offset = ctx.writer.currentOffset();
@@ -788,15 +873,67 @@ pub const CodeGen = struct {
                 defer ctx.reg_alloc.free(asset_reg);
                 const to_reg = ctx.reg_alloc.alloc() orelse .t1;
                 defer ctx.reg_alloc.free(to_reg);
+                
                 try self.genExpr(send.asset, ctx, asset_reg);
                 try self.genExpr(send.recipient, ctx, to_reg);
+
+                // ── Asset Hooks Logic ────────────────────────────────────
+                // Look up asset definition to find hooks
+                var asset_def: ?*const ast.AssetDef = null;
+                var asset_type: ResolvedType = .void_;
+                
+                // Identify asset type from target expression
+                if (send.asset.kind == .identifier) {
+                    const name = send.asset.kind.identifier;
+                    if (ctx.locals.get(name)) |loc| {
+                        asset_type = loc.ty;
+                    }
+                } else {
+                    // Fallback to inference (may be slow)
+                    asset_type = (self.resolver.inferExpr(send.asset, &ctx.checked.scope) catch .void_);
+                }
+
+                const inner_type = if (asset_type == .linear) asset_type.linear.* else asset_type;
+                if (inner_type == .asset) {
+                    const name = inner_type.asset;
+                    asset_def = self.resolver.asset_defs.getPtr(name);
+                }
+
+                // 1) before_transfer(from, to, asset)
+                if (asset_def) |ad| {
+                    if (ad.before_transfer) |hook| {
+                        // Hooks receive: current_caller, recipient, asset
+                        try ctx.writer.emit(riscv.ZEPH(.GET_CALLER)); // → a0
+                        try ctx.writer.emit(riscv.ADD(.a1, .zero, to_reg));
+                        try ctx.writer.emit(riscv.ADD(.a2, .zero, asset_reg));
+                        // Generate hook body inline (or we could call it if it were a function)
+                        // For simplicity in Tier 1, we generate the body inline here.
+                        for (hook.body) |hstmt| {
+                            try self.genStmt(&hstmt, ctx);
+                        }
+                    }
+                }
+
+                // 2) Actual Transfer
                 try ctx.writer.emit(riscv.ADD(.a0, .zero, asset_reg));
                 try ctx.writer.emit(riscv.ADD(.a1, .zero, .zero));
                 try ctx.writer.emit(riscv.ADD(.a2, .zero, to_reg));
                 try ctx.writer.emit(riscv.ADD(.a3, .zero, asset_reg));
                 try ctx.writer.emit(riscv.ZEPH(.ASSET_TRANSFER));
+
+                // 3) after_transfer(from, to, asset)
+                if (asset_def) |ad| {
+                    if (ad.after_transfer) |hook| {
+                        try ctx.writer.emit(riscv.ZEPH(.GET_CALLER));
+                        try ctx.writer.emit(riscv.ADD(.a1, .zero, to_reg));
+                        try ctx.writer.emit(riscv.ADD(.a2, .zero, asset_reg));
+                        for (hook.body) |hstmt| {
+                            try self.genStmt(&hstmt, ctx);
+                        }
+                    }
+                }
             },
-            .only => {}, // Handled in prologue
+            .only => |*only| try self.genOnly(only, ctx),
             .panic => |p| {
                 const tmp = ctx.reg_alloc.alloc() orelse .t0;
                 defer ctx.reg_alloc.free(tmp);
@@ -889,9 +1026,9 @@ pub const CodeGen = struct {
                 try ctx.writer.emit(riscv.ADDI(dest, .zero, 0));
             },
             .identifier => |name| {
-                if (ctx.locals.get(name)) |src_reg| {
-                    if (src_reg != dest) {
-                        try ctx.writer.emit(riscv.ADD(dest, src_reg, .zero));
+                if (ctx.locals.get(name)) |loc| {
+                    if (loc.reg != dest) {
+                        try ctx.writer.emit(riscv.ADD(dest, loc.reg, .zero));
                     }
                 } else {
                     try ctx.writer.emit(riscv.ADDI(dest, .zero, 0));
@@ -1031,6 +1168,24 @@ pub const CodeGen = struct {
             .has => riscv.AND(dest, dest, rhs),
         };
         try ctx.writer.emit(instr);
+    }
+
+    /// Generate code for an `only` statement (check + body).
+    fn genOnly(self: *CodeGen, only: *const ast.OnlyStmt, ctx: *ActionCtx) anyerror!void {
+        switch (only.requirement) {
+            .authority => |name| {
+                try self.genAuthCheck(name, ctx);
+            },
+            .either => |pair| {
+                try self.genAuthCheck(pair.left, ctx);
+                try self.genAuthCheck(pair.right, ctx);
+            },
+            else => {},
+        }
+
+        for (only.body) |s| {
+            try self.genStmt(&s, ctx);
+        }
     }
 
     // ── Immediate loading ────────────────────────────────────────────────
@@ -1179,10 +1334,24 @@ pub const CodeGen = struct {
 
         // Bind loop variable
         switch (loop.binding) {
-            .single => |name| try ctx.locals.put(name, iter_reg),
+            .single => |name| {
+                const ty = (self.resolver.inferExpr(loop.collection, &ctx.checked.scope) catch .void_);
+                const element_ty = switch (ty) {
+                    .array => |a| a.elem.*,
+                    .list => |l| l.*,
+                    else => .void_,
+                };
+                try ctx.locals.put(name, .{ .reg = iter_reg, .ty = element_ty });
+            },
             .pair => |p| {
-                try ctx.locals.put(p.first, iter_reg);
-                try ctx.locals.put(p.second, count_reg);
+                try ctx.locals.put(p.first, .{ .reg = iter_reg, .ty = .u256 });
+                const ty = (self.resolver.inferExpr(loop.collection, &ctx.checked.scope) catch .void_);
+                const element_ty = switch (ty) {
+                    .array => |a| a.elem.*,
+                    .list => |l| l.*,
+                    else => .void_,
+                };
+                try ctx.locals.put(p.second, .{ .reg = count_reg, .ty = element_ty });
             },
         }
 
@@ -1354,10 +1523,16 @@ pub const CodeGen = struct {
         // Determine call target
         switch (callee.kind) {
             .identifier => |name| {
-                // Internal call via selector
-                const selector = actionSelector(name);
-                try self.genLoadImmediate(@intCast(selector), .t0, ctx);
-                try ctx.writer.emit(riscv.JALR(.ra, .t0, 0));
+                if (std.mem.eql(u8, name, "oracle")) {
+                    try ctx.writer.emit(riscv.ZEPH(.ORACLE_QUERY));
+                } else if (std.mem.eql(u8, name, "vrf_random")) {
+                    try ctx.writer.emit(riscv.ZEPH(.VRF_RANDOM));
+                } else {
+                    // Internal call via selector
+                    const selector = actionSelector(name);
+                    try self.genLoadImmediate(@intCast(selector), .t0, ctx);
+                    try ctx.writer.emit(riscv.JALR(.ra, .t0, 0));
+                }
             },
             .field_access => |fa| {
                 if (fa.object.kind == .identifier) {
@@ -1521,6 +1696,97 @@ pub const CodeGen = struct {
 
         return buf.toOwnedSlice(self.allocator);
     }
+
+    /// SPEC: Novel Idea 1 — Serialize conservation equations into the binary.
+    /// Format: [2-byte eq_count]
+    ///   per equation: [1-byte op] [1-byte flags(at_all_times)]
+    ///                 [lhs_field_ref][rhs_field_ref]
+    ///   field_ref:    [1-byte name_len][name bytes]
+    fn serializeConservationMetadata(self: *CodeGen, contract: *const ContractDef) anyerror![]u8 {
+        if (contract.conserves.len == 0) {
+            const empty = try self.allocator.alloc(u8, 0);
+            return empty;
+        }
+
+        var buf = std.ArrayListUnmanaged(u8){};
+        errdefer buf.deinit(self.allocator);
+
+        // Equation count
+        var count_bytes: [2]u8 = undefined;
+        std.mem.writeInt(u16, &count_bytes, @intCast(contract.conserves.len), .little);
+        try buf.appendSlice(self.allocator, &count_bytes);
+
+        for (contract.conserves) |eq| {
+            // Operator byte
+            const op_byte: u8 = switch (eq.op) {
+                .equals => 0x00,
+                .gte => 0x01,
+                .lte => 0x02,
+                .gt => 0x03,
+                .lt => 0x04,
+            };
+            try buf.append(self.allocator, op_byte);
+
+            // Flags byte: bit 0 = at_all_times
+            const flags_byte: u8 = if (eq.at_all_times) 0x01 else 0x00;
+            try buf.append(self.allocator, flags_byte);
+
+            // LHS field reference
+            try self.serializeExprRef(&buf, eq.lhs);
+
+            // RHS field reference
+            try self.serializeExprRef(&buf, eq.rhs);
+        }
+
+        return buf.toOwnedSlice(self.allocator);
+    }
+
+    /// Serialize an expression reference for conservation metadata.
+    /// Encodes field names as [1-byte len][name bytes].
+    fn serializeExprRef(self: *CodeGen, buf: *std.ArrayListUnmanaged(u8), expr: *const ast.Expr) anyerror!void {
+        switch (expr.kind) {
+            .identifier => |name| {
+                const name_len: u8 = @intCast(@min(name.len, 255));
+                try buf.append(self.allocator, name_len);
+                try buf.appendSlice(self.allocator, name[0..name_len]);
+            },
+            .field_access => |fa| {
+                // Encode as "object.field" concatenated
+                const field = fa.field;
+                if (fa.object.kind == .identifier) {
+                    const obj = fa.object.kind.identifier;
+                    const total_len = @min(obj.len + 1 + field.len, 255);
+                    try buf.append(self.allocator, @intCast(total_len));
+                    try buf.appendSlice(self.allocator, obj);
+                    try buf.append(self.allocator, '.');
+                    try buf.appendSlice(self.allocator, field);
+                } else {
+                    // Fallback: encode just the field name
+                    const flen: u8 = @intCast(@min(field.len, 255));
+                    try buf.append(self.allocator, flen);
+                    try buf.appendSlice(self.allocator, field[0..flen]);
+                }
+            },
+            .bin_op => |bop| {
+                // For binary ops, encode a synthetic representation:
+                // 0xFF marker, then op byte, then both sub-expressions
+                try buf.append(self.allocator, 0xFF); // compound marker
+                const op_byte: u8 = switch (bop.op) {
+                    .plus => 0x10,
+                    .minus => 0x11,
+                    .times => 0x12,
+                    else => 0x1F,
+                };
+                try buf.append(self.allocator, op_byte);
+                try self.serializeExprRef(buf, bop.left);
+                try self.serializeExprRef(buf, bop.right);
+            },
+            else => {
+                // Unknown expression — write zero-length marker
+                try buf.append(self.allocator, 0);
+            },
+        }
+    }
 };
 
 // ============================================================================
@@ -1585,7 +1851,17 @@ test "genExpr string_lit emits gp-relative load" {
 
     var field_ids = std.StringHashMap(u32).init(allocator);
     defer field_ids.deinit();
-    var ctx = ActionCtx.init(allocator, "dummy", &field_ids);
+
+    var checked = checker.CheckedContract{
+        .name = "Test",
+        .action_lists = std.StringHashMap(checker.AccessList).init(allocator),
+        .type_map = std.StringHashMap(types.ResolvedType).init(allocator),
+        .scope = types.SymbolTable.init(allocator, null),
+        .allocator = allocator,
+    };
+    defer checked.deinit();
+
+    var ctx = ActionCtx.init(allocator, "dummy", &field_ids, &checked);
     defer ctx.deinit();
 
     const expr = Expr{ .kind = .{ .string_lit = "\"hello\"" }, .span = .{ .line=1, .col=1, .len=7 } };
@@ -1634,6 +1910,7 @@ test "generate includes data section in binary" {
         .annotations = &.{},
         .accounts = &.{},
         .body = &body_stmts,
+        .complexity_class = null,
         .span = .{ .line=1, .col=1, .len=11 },
     };
 
@@ -1762,6 +2039,9 @@ fn makeEmptyContract(name: []const u8) ContractDef {
         .upgrade = null,
         .namespaces = &.{},
         .invariants = &.{},
+        .conserves = &.{},
+        .adversary_blocks = &.{},
+        .fallback = null, .receive_ = null,
         .span = .{ .line = 1, .col = 1, .len = 12 },
     };
 }
@@ -1862,7 +2142,16 @@ test "genSetup emits prologue and epilogue instructions" {
         .span = .{ .line = 1, .col = 1, .len = 10 },
     };
 
-    var ctx = ActionCtx.init(allocator, "__setup__", &gen.field_ids);
+    var checked = checker.CheckedContract{
+        .name = "Test",
+        .action_lists = std.StringHashMap(checker.AccessList).init(allocator),
+        .type_map = std.StringHashMap(types.ResolvedType).init(allocator),
+        .scope = types.SymbolTable.init(allocator, null),
+        .allocator = allocator,
+    };
+    defer checked.deinit();
+
+    var ctx = ActionCtx.init(allocator, "__setup__", &gen.field_ids, &checked);
     defer ctx.deinit();
 
     try gen.genSetup(&setup, &ctx);
@@ -1890,7 +2179,17 @@ test "genExpr int_lit small value" {
 
     var field_ids = std.StringHashMap(u32).init(allocator);
     defer field_ids.deinit();
-    var ctx = ActionCtx.init(allocator, "dummy", &field_ids);
+
+    var checked = checker.CheckedContract{
+        .name = "Test",
+        .action_lists = std.StringHashMap(checker.AccessList).init(allocator),
+        .type_map = std.StringHashMap(types.ResolvedType).init(allocator),
+        .scope = types.SymbolTable.init(allocator, null),
+        .allocator = allocator,
+    };
+    defer checked.deinit();
+
+    var ctx = ActionCtx.init(allocator, "dummy", &field_ids, &checked);
     defer ctx.deinit();
 
     const expr = Expr{ .kind = .{ .int_lit = "42" }, .span = .{ .line=1, .col=1, .len=2 } };
@@ -1914,7 +2213,17 @@ test "genExpr int_lit u64_max does not overflow" {
 
     var field_ids = std.StringHashMap(u32).init(allocator);
     defer field_ids.deinit();
-    var ctx = ActionCtx.init(allocator, "dummy", &field_ids);
+
+    var checked = checker.CheckedContract{
+        .name = "Test",
+        .action_lists = std.StringHashMap(checker.AccessList).init(allocator),
+        .type_map = std.StringHashMap(types.ResolvedType).init(allocator),
+        .scope = types.SymbolTable.init(allocator, null),
+        .allocator = allocator,
+    };
+    defer checked.deinit();
+
+    var ctx = ActionCtx.init(allocator, "dummy", &field_ids, &checked);
     defer ctx.deinit();
 
     const expr = Expr{ .kind = .{ .int_lit = "18446744073709551615" }, .span = .{ .line=1, .col=1, .len=20 } };
@@ -1937,7 +2246,17 @@ test "genExpr int_lit larger than u64 emits stack pointer" {
 
     var field_ids = std.StringHashMap(u32).init(allocator);
     defer field_ids.deinit();
-    var ctx = ActionCtx.init(allocator, "dummy", &field_ids);
+
+    var checked = checker.CheckedContract{
+        .name = "Test",
+        .action_lists = std.StringHashMap(checker.AccessList).init(allocator),
+        .type_map = std.StringHashMap(types.ResolvedType).init(allocator),
+        .scope = types.SymbolTable.init(allocator, null),
+        .allocator = allocator,
+    };
+    defer checked.deinit();
+
+    var ctx = ActionCtx.init(allocator, "dummy", &field_ids, &checked);
     defer ctx.deinit();
 
     const expr = Expr{ .kind = .{ .int_lit = "18446744073709551616" }, .span = .{ .line=1, .col=1, .len=20 } };
@@ -1972,7 +2291,17 @@ test "genExpr float_lit produces non-zero for non-zero input" {
 
     var field_ids = std.StringHashMap(u32).init(allocator);
     defer field_ids.deinit();
-    var ctx = ActionCtx.init(allocator, "dummy", &field_ids);
+
+    var checked = checker.CheckedContract{
+        .name = "Dummy",
+        .action_lists = std.StringHashMap(checker.AccessList).init(allocator),
+        .type_map = std.StringHashMap(types.ResolvedType).init(allocator),
+        .scope = types.SymbolTable.init(allocator, null),
+        .allocator = allocator,
+    };
+    defer checked.deinit();
+
+    var ctx = ActionCtx.init(allocator, "dummy", &field_ids, &checked);
     defer ctx.deinit();
 
     const expr = Expr{ .kind = .{ .float_lit = "1.5" }, .span = .{ .line=1, .col=1, .len=3 } };

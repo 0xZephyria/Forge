@@ -220,7 +220,7 @@ pub fn compile(
     const contract = contract_ptr.?;
 
     // ── Stage 5: Semantic check ──────────────────────────────────────────
-    var chk = Checker.init(&resolver, &diagnostics, temp_alloc);
+    var chk = Checker.init(&resolver, &diagnostics, temp_alloc, file);
     var checked = try chk.checkContract(contract);
     defer checked.deinit();
 
@@ -362,8 +362,17 @@ fn errorCodeFromDiag(d: errors.Diagnostic) u16 {
         error.UnboundedLoopMissingAnnotation => 26,
         error.LinearAssetDropped => 27,
         error.LinearAssetUsedTwice => 28,
-        error.OutOfMemory => 29,
-        error.InternalError => 30,
+        error.ImmutableFieldViolation => 29,
+        error.InvalidAnnotationArgument => 30,
+        error.InvalidHookSignature => 31,
+        // Novel features
+        error.ConservationViolated => 32,
+        error.ComplexityViolated => 33,
+        error.AttackSucceeded => 34,
+        error.AttackBlocked => 35,
+        // General
+        error.OutOfMemory => 36,
+        error.InternalError => 37,
     };
 }
 
@@ -402,6 +411,8 @@ fn printAstSummary(top_levels: []const TopLevel) void {
             .record_def => |r| std.debug.print("record {s}\n", .{r.name}),
             .enum_def => |e| std.debug.print("enum {s}\n", .{e.name}),
             .type_alias => |t| std.debug.print("alias {s}\n", .{t.name}),
+            .capability_def => |cap| std.debug.print("capability {s}\n", .{cap.name}),
+            .global_invariant => |gi| std.debug.print("global invariant {s}\n", .{gi.name}),
         }
     }
 }

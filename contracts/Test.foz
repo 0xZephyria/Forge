@@ -9,3 +9,5 @@ contract Test:
 
     action test_this():
         let y = caller
+
+End;

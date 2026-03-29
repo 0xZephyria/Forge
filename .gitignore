@@ -20,9 +20,15 @@ contracts/*.fozabi
 contracts/*.bin
 contracts/*.log
 contracts/*.sh
+contracts/BadTier1.foz
+contracts/zk_basis_robust.foz
+contracts/mixed_test.foz
+contracts/zk_basis.foz
+contracts/NovelFeaturesTest.foz
 
 
-
+# Folders
+skills/
 
 
 # Artifacts
@@ -30,11 +36,11 @@ gaps_implementation_plan.md
 Claude.md
 FORGE_LANGUAGE_SPEC.md
 FORGE_GEMINI_GAP_FIX_PROMPTS.md
+FORGE_PENDING_AND_NOVEL_IDEAS.md
 Gemini.md
 deploy.html
 interact.html
 forge_multi_agent_abi.md
 out/
-src.zip
-src 2.zip
-Archive.zip
+*.zip
+*.log

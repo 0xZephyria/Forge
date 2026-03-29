@@ -18,7 +18,7 @@ contract Escrow:
         seller = s
         arbiter = a
         amount = expected_amount
-        locked_balance = 0
+        locked_balance = 10000
         is_funded = no
         is_released = no
 

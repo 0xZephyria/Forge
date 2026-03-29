@@ -429,6 +429,10 @@ pub const StmtKind = union(enum) {
     /// `attempt: … on_error E: … always_after: …`
     attempt:    AttemptStmt,
 
+    // ── ZK / Privacy ──────────────────────────────────────────────────────
+    /// `verify proof_expr against commitment_expr` — evaluate off-chain ZK proofs.
+    verify:     VerifyStmt,
+
     // ── Expression statement ──────────────────────────────────────────────
     /// A bare call expression used as a statement (return value discarded).
     call_stmt:  *Expr,
@@ -683,6 +687,7 @@ pub const ScheduleStmt = struct {
 /// `only auth` / `only auth1 or auth2` / `only [addr, addr]`.
 pub const OnlyStmt = struct {
     requirement: OnlyRequirement,
+    body:        []Stmt,
     span:        Span,
 };
 
@@ -947,6 +952,8 @@ pub const ActionDecl = struct {
     /// Local account declarations inside the action.
     accounts:    []AccountDecl,
     body:        []Stmt,
+    /// SPEC: Novel Idea 2 — Gas Complexity Class Annotations.
+    complexity_class: ?ComplexityClass,
     span:        Span,
 };
 
@@ -1049,6 +1056,8 @@ pub const UpgradeBlock = struct {
     migrate_fn: ?[]const u8,
     /// Optional version guard expression.
     version:    ?*Expr,
+    /// SPEC: Part 13 — Fields that must not be removed during upgrade.
+    immutable_fields: [][]const u8,
     span:       Span,
 };
 
@@ -1127,6 +1136,15 @@ pub const InterfaceDef = struct {
     span:    Span,
 };
 
+
+// ── ZK / Privacy ────────────────────────────────────────────────────────────
+
+pub const VerifyStmt = struct {
+    proof:      *Expr,
+    commitment: *Expr,
+    span:       Span,
+};
+
 // ============================================================================
 // SECTION 14 — Top-Level File Nodes
 // ============================================================================
@@ -1162,6 +1180,10 @@ pub const TopLevel = union(enum) {
     enum_def:      EnumDef,
     /// `alias NewName = ExistingType`.
     type_alias:    TypeAliasDef,
+    /// `capability Name<T>:` — capability token type (Novel Idea 6).
+    capability_def: CapabilityDef,
+    /// `global invariant Name:` — cross-contract invariant (Novel Idea 5).
+    global_invariant: GlobalInvariantDef,
 };
 
 // ── User-defined type definitions ────────────────────────────────────────────
@@ -1213,6 +1235,129 @@ pub const TypeAliasDef = struct {
 };
 
 // ============================================================================
+// SECTION 15a — Novel Feature Types
+// ============================================================================
+
+/// SPEC: Novel Idea 1 — Economic Conservation Proofs.
+/// Aggregator function used in the left side of a conservation equation.
+pub const AggregatorKind = enum {
+    /// `sum(collection)` — total of all values.
+    sum,
+    /// `max_val(collection)` — maximum value.
+    max_val,
+    /// `count(collection)` — number of entries.
+    count,
+    /// No aggregator — direct field reference (e.g. `mine.total_supply`).
+    identity,
+};
+
+/// SPEC: Novel Idea 1 — Economic Conservation Proofs.
+/// Comparison operator in a conservation equation.
+pub const ConservationOp = enum {
+    /// `equals` — exact equality.
+    equals,
+    /// `>=`
+    gte,
+    /// `<=`
+    lte,
+    /// `>`
+    gt,
+    /// `<`
+    lt,
+};
+
+/// SPEC: Novel Idea 1 — Economic Conservation Proofs.
+/// A single conservation equation: `[aggregator(]lhs[)] op rhs [at_all_times]`.
+pub const ConservationExpr = struct {
+    /// Aggregator applied to the LHS (identity if no aggregator).
+    aggregator: AggregatorKind,
+    /// Left-hand side expression (e.g. `mine.balances`).
+    lhs: *Expr,
+    /// Comparison operator.
+    op: ConservationOp,
+    /// Right-hand side expression (e.g. `mine.total_supply`).
+    rhs: *Expr,
+    /// True when `at_all_times` modifier is present (range constraint).
+    at_all_times: bool,
+    /// Source location.
+    span: Span,
+};
+
+/// SPEC: Novel Idea 2 — Gas Complexity Class Annotations.
+/// Upper bound expression for a complexity variable.
+pub const BoundExpr = struct {
+    /// The variable name used in the bound (e.g. `n`).
+    var_name: []const u8,
+    /// The maximum value of the variable (e.g. 100 in `where n <= 100`).
+    max_value: ?u64,
+};
+
+/// SPEC: Novel Idea 2 — Gas Complexity Class Annotations.
+/// Declared gas complexity class of an action.
+pub const ComplexityClass = union(enum) {
+    /// O(1) — constant time, no unbounded loops.
+    constant: void,
+    /// O(n) — linear, with optional upper-bound.
+    linear: ?BoundExpr,
+    /// O(n²) — quadratic, with optional upper-bound.
+    quadratic: ?BoundExpr,
+};
+
+/// SPEC: Novel Idea 3 — Adversary Blocks (In-Language Attack Simulation).
+/// Expected outcome of an attack specification.
+pub const AttackOutcome = enum {
+    /// The attacker expects to violate a conservation proof.
+    conservation_violated,
+    /// The attacker expects to be blocked (e.g. reentrancy guard).
+    action_blocked,
+    /// The attacker expects to break a declared invariant.
+    invariant_broken,
+};
+
+/// SPEC: Novel Idea 3 — A single call step within an attack sequence.
+pub const AttackCall = struct {
+    /// Name of the action to call.
+    action_name: []const u8,
+    /// Arguments to the call.
+    args: []Argument,
+    /// Source location.
+    span: Span,
+};
+
+/// SPEC: Novel Idea 3 — A named attack specification.
+pub const AttackSpec = struct {
+    /// Attack name (e.g. `borrow_without_collateral`).
+    name: []const u8,
+    /// Sequence of action calls that constitute the attack.
+    calls: []AttackCall,
+    /// The outcome the attacker expects to achieve.
+    expected_outcome: AttackOutcome,
+    /// Source location.
+    span: Span,
+};
+
+/// SPEC: Novel Idea 3 — An `adversary tries:` block.
+pub const AdversaryBlock = struct {
+    /// Named attack specifications.
+    attacks: []AttackSpec,
+    /// Source location.
+    span: Span,
+};
+
+/// SPEC: Novel Idea 6 — Capability Token Types (Structural Authority).
+/// A top-level `capability Name<T>:` declaration.
+pub const CapabilityDef = struct {
+    /// Capability type name.
+    name: []const u8,
+    /// Generic type parameters.
+    type_params: []TypeParam,
+    /// Fields of the capability (like a struct).
+    fields: []RecordField,
+    /// Source location.
+    span: Span,
+};
+
+// ============================================================================
 // SECTION 15 — ContractDef (Part 5)
 // ============================================================================
 
@@ -1258,7 +1403,47 @@ pub const ContractDef = struct {
     namespaces:  [][]const u8,
     /// Invariant declarations for formal verification.
     invariants:  []InvariantDecl,
+    /// `conserves:` block — economic conservation proofs (Novel Idea 1).
+    conserves:   []ConservationExpr,
+    /// `adversary tries:` blocks — in-language attack simulation (Novel Idea 3).
+    adversary_blocks: []AdversaryBlock,
+    /// `fallback:` handler (Spec Part 5.13) — called on unknown selectors.
+    fallback:    ?ActionDecl,
+    /// `receive:` handler (Spec Part 5.13) — called on plain value transfers.
+    receive_:    ?ActionDecl,
     span:        Span,
+};
+
+/// SPEC: Novel Idea 5 — Cross-Contract Global Invariants.
+/// A `global invariant Name:` declaration from a `.fozi` interface file.
+pub const GlobalInvariantDef = struct {
+    /// Invariant name (e.g. `ProtocolSolvency`).
+    name: []const u8,
+    /// Participant contract names.
+    participants: [][]const u8,
+    /// Always-condition expressions (evaluated after every touching transaction).
+    always_conditions: []InvariantDecl,
+    /// On-violation handler statements.
+    on_violation: []Stmt,
+    /// Source location.
+    span: Span,
+};
+
+/// SPEC: Novel Idea 4 — Semantic Upgrade Diffs.
+/// Structured diff generated when compiling a contract with an `upgrade:` block.
+pub const SemanticDiff = struct {
+    /// State fields added in the new version.
+    state_added: [][]const u8,
+    /// State fields removed from the new version.
+    state_removed: [][]const u8,
+    /// Action names whose signatures or bodies changed.
+    behavior_changed: [][]const u8,
+    /// New public actions (potential new attack surface).
+    new_attack_surface: [][]const u8,
+    /// Conservation proofs that still hold after the upgrade.
+    invariants_preserved: [][]const u8,
+    /// Conservation proofs broken by the upgrade.
+    invariants_broken: [][]const u8,
 };
 
 /// The parsed representation of an entire `.foz` source file.

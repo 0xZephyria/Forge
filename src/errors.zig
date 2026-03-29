@@ -118,6 +118,26 @@ pub const CompileError = error{
     /// A linear asset value was consumed more than once (move semantics
     /// violation).
     LinearAssetUsedTwice,
+    /// A field marked as `immutable_fields` in an `upgrade:` block was modified.
+    ImmutableFieldViolation,
+    /// An annotation argument is malformed (e.g. invalid hex for sponsorship).
+    InvalidAnnotationArgument,
+    /// An asset transfer hook (`before_transfer`, etc.) has an invalid signature.
+    InvalidHookSignature,
+
+    // ── Novel feature errors ──────────────────────────────────────────────
+    /// An action provably breaks a declared `conserves` equation.
+    /// SPEC: Novel Idea 1 — Economic Conservation Proofs.
+    ConservationViolated,
+    /// An action body exceeds its declared gas complexity class.
+    /// SPEC: Novel Idea 2 — Gas Complexity Class Annotations.
+    ComplexityViolated,
+    /// An adversary block achieved its expected bad outcome, indicating a bug.
+    /// SPEC: Novel Idea 3 — Adversary Blocks.
+    AttackSucceeded,
+    /// An adversary attack was successfully prevented (informational).
+    /// SPEC: Novel Idea 3 — Adversary Blocks.
+    AttackBlocked,
 
     // ── General ───────────────────────────────────────────────────────────
     /// The allocator returned `error.OutOfMemory` during compilation.
@@ -273,9 +293,17 @@ fn errorCode(kind: CompileError) u16 {
         // Asset
         error.LinearAssetDropped             => 27,
         error.LinearAssetUsedTwice           => 28,
+        error.ImmutableFieldViolation        => 29,
+        error.InvalidAnnotationArgument      => 30,
+        error.InvalidHookSignature           => 31,
+        // Novel features
+        error.ConservationViolated           => 32,
+        error.ComplexityViolated             => 33,
+        error.AttackSucceeded               => 34,
+        error.AttackBlocked                 => 35,
         // General
-        error.OutOfMemory                    => 29,
-        error.InternalError                  => 30,
+        error.OutOfMemory                    => 36,
+        error.InternalError                  => 37,
     };
 }
 
@@ -311,6 +339,15 @@ fn errorLabel(kind: CompileError) []const u8 {
         error.UnboundedLoopMissingAnnotation => "unbounded loop missing #[max_iterations] annotation",
         error.LinearAssetDropped             => "linear asset dropped without consumption",
         error.LinearAssetUsedTwice           => "linear asset used more than once",
+        error.ImmutableFieldViolation        => "immutable field modification violation",
+        error.InvalidAnnotationArgument      => "invalid annotation argument",
+        error.InvalidHookSignature           => "invalid asset transfer hook signature",
+        // Novel features
+        error.ConservationViolated           => "conservation proof violation",
+        error.ComplexityViolated             => "gas complexity class exceeded",
+        error.AttackSucceeded               => "adversary attack succeeded (potential vulnerability)",
+        error.AttackBlocked                 => "adversary attack was blocked",
+        // General
         error.OutOfMemory                    => "out of memory",
         error.InternalError                  => "internal compiler error",
     };
