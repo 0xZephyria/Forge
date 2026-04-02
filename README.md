@@ -73,7 +73,7 @@ Usage: `forgec <input.foz> [options]`
 ### Documentation
 
 For more detailed information on the language and how to use it, please refer to the:
-👉 [**FORGE_DOCUMENTATION_GUIDE.md**](FORGE_DOCUMENTATION_GUIDE.md)
+👉 [**FORGE_DOCUMENTATION.md**](FORGE_DOCUMENTATION.md)
 
 ## License
 
