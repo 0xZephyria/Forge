@@ -16,6 +16,7 @@ const ast = @import("ast.zig");
 const errors = @import("errors.zig");
 const types = @import("types.zig");
 const checker = @import("checker.zig");
+const mir_mod = @import("mir.zig");
 const u256_mod = @import("u256.zig");
 
 const riscv = @import("riscv.zig");
@@ -1749,6 +1750,445 @@ pub const CodeGenPolkaVM = struct {
             else => {
                 try buf.append(self.allocator, 0);
             },
+        }
+    }
+
+    // ========================================================================
+    // MIR-Based Code Generation (unified backend entry point)
+    // ========================================================================
+
+    /// SPEC: Part 5, Part 20 — Generate complete .fozbin binary from a MirModule.
+    /// This is the new unified entry point that replaces direct AST walking.
+    pub fn generateFromMir(
+        self: *CodeGenPolkaVM,
+        mir: *const mir_mod.MirModule,
+    ) anyerror![]u8 {
+        // Pre-assign field IDs from MIR state field descriptors.
+        for (mir.state_fields) |sf| {
+            _ = self.getOrAssignFieldId(sf.name);
+        }
+
+        // Count dispatchable functions.
+        var action_count: u16 = 0;
+        for (mir.functions) |func| {
+            switch (func.kind) {
+                .action, .view, .pure, .setup, .fallback, .receive => {
+                    action_count += 1;
+                },
+                else => {},
+            }
+        }
+
+        // Determine flags.
+        var flags: u16 = 0;
+        if (mir.inherits != null) flags |= 0x01;
+
+        // Generate bytecode for each function.
+        const FuncBytecode = struct { selector: u32, code: []const u8 };
+        var func_codes = std.ArrayListUnmanaged(FuncBytecode){};
+        defer {
+            for (func_codes.items) |fb| self.allocator.free(fb.code);
+            func_codes.deinit(self.allocator);
+        }
+
+        for (mir.functions) |func| {
+            const is_emittable = switch (func.kind) {
+                .action, .view, .pure, .setup, .fallback, .receive => true,
+                else => false,
+            };
+            if (!is_emittable) continue;
+
+            var writer = BytecodeWriter.init(self.allocator);
+            defer writer.deinit();
+            var ra = RegAlloc{};
+
+            // Map MIR regs → RISC-V regs.
+            var reg_map = std.AutoHashMap(mir_mod.Reg, Reg).init(self.allocator);
+            defer reg_map.deinit();
+
+            // Allocate param regs (a0-a6).
+            for (func.params, 0..) |_, pi| {
+                const mir_reg: mir_mod.Reg = @intCast(pi);
+                if (ra.alloc()) |hw_reg| {
+                    try reg_map.put(mir_reg, hw_reg);
+                }
+            }
+
+            // Label → bytecode offset.
+            var label_map = std.AutoHashMap(mir_mod.LabelId, u32).init(self.allocator);
+            defer label_map.deinit();
+            var label_patches = std.AutoHashMap(mir_mod.LabelId, std.ArrayListUnmanaged(u32)).init(self.allocator);
+            defer {
+                var it = label_patches.valueIterator();
+                while (it.next()) |list| list.deinit(self.allocator);
+                label_patches.deinit();
+            }
+
+            // Emit MIR instructions as RISC-V.
+            for (func.body) |instr| {
+                try self.mirEmitRiscV(&instr, &writer, &ra, &reg_map, &label_map, &label_patches);
+            }
+
+            // Epilogue: ret.
+            try writer.emit(riscv.JALR(.zero, .ra, 0));
+
+            // Backpatch labels.
+            var pit = label_patches.iterator();
+            while (pit.next()) |entry| {
+                if (label_map.get(entry.key_ptr.*)) |target| {
+                    for (entry.value_ptr.items) |patch_off| {
+                        writer.patchAt(patch_off, riscv.JAL(.zero, @intCast(@as(i32, @intCast(target)) - @as(i32, @intCast(patch_off)))));
+                    }
+                }
+            }
+
+            const code_bytes = writer.toBytes();
+            const owned = try self.allocator.alloc(u8, code_bytes.len);
+            @memcpy(owned, code_bytes);
+
+            const selector: u32 = if (func.kind == .setup) 0 else func.selector;
+            try func_codes.append(self.allocator, .{ .selector = selector, .code = owned });
+        }
+
+        // Assemble binary: header + access list + bytecode sections.
+        var output = std.ArrayListUnmanaged(u8){};
+        defer output.deinit(self.allocator);
+
+        // Calculate total bytecode length.
+        var total_bc: u32 = 0;
+        for (func_codes.items) |fb| {
+            total_bc += 8 + @as(u32, @intCast(fb.code.len)); // selector(4) + len(4) + code
+        }
+
+        // Header.
+        var header = PolkaVmHeader{};
+        header.contract_name = writeContractName(mir.name);
+        header.action_count = action_count;
+        header.flags = flags;
+        header.bytecode_len = total_bc;
+        header.data_section_len = @intCast(mir.data_section.len);
+        // Access list placeholder (empty for now).
+        header.access_list_len = 0;
+
+        const header_bytes: [64]u8 = @bitCast(header);
+        try output.appendSlice(self.allocator, &header_bytes);
+
+        // Bytecode section: for each func → [selector: u32LE] [len: u32LE] [code...]
+        for (func_codes.items) |fb| {
+            var sel_bytes: [4]u8 = undefined;
+            std.mem.writeInt(u32, &sel_bytes, fb.selector, .little);
+            try output.appendSlice(self.allocator, &sel_bytes);
+
+            var len_bytes: [4]u8 = undefined;
+            std.mem.writeInt(u32, &len_bytes, @intCast(fb.code.len), .little);
+            try output.appendSlice(self.allocator, &len_bytes);
+
+            try output.appendSlice(self.allocator, fb.code);
+        }
+
+        // Data section.
+        if (mir.data_section.len > 0) {
+            try output.appendSlice(self.allocator, mir.data_section);
+        }
+
+        // Checksum.
+        if (output.items.len > 64) {
+            const payload = output.items[60..]; // After checksum field
+            const chk = crc32(payload);
+            std.mem.writeInt(u32, output.items[56..60], chk, .little);
+        }
+
+        return output.toOwnedSlice(self.allocator);
+    }
+
+    /// SPEC: Part 5 — Emit one MIR instruction as RISC-V bytecode.
+    fn mirEmitRiscV(
+        self: *CodeGenPolkaVM,
+        instr: *const mir_mod.MirInstr,
+        w: *BytecodeWriter,
+        ra: *RegAlloc,
+        reg_map: *std.AutoHashMap(mir_mod.Reg, Reg),
+        label_map: *std.AutoHashMap(mir_mod.LabelId, u32),
+        label_patches: *std.AutoHashMap(mir_mod.LabelId, std.ArrayListUnmanaged(u32)),
+    ) anyerror!void {
+        // Helper: get or allocate a hardware register for a MIR virtual reg.
+        const getReg = struct {
+            fn call(rm: *std.AutoHashMap(mir_mod.Reg, Reg), alloc: *RegAlloc, vr: mir_mod.Reg) Reg {
+                if (rm.get(vr)) |r| return r;
+                const r = alloc.alloc() orelse .t0;
+                rm.put(vr, r) catch {};
+                return r;
+            }
+        }.call;
+
+        switch (instr.op) {
+            // ── Constants ─────────────────────────────────────────────────
+            .const_i64 => |c| {
+                const rd = getReg(reg_map, ra, c.dst);
+                // LUI + ADDI sequence for 32-bit values.
+                const val: u32 = @bitCast(@as(i32, @truncate(c.value)));
+                try w.emit(riscv.LUI(rd, @truncate(val >> 12)));
+                try w.emit(riscv.ADDI(rd, rd, @truncate(@as(i32, @intCast(val & 0xFFF)))));
+            },
+            .const_i256 => |c| {
+                const rd = getReg(reg_map, ra, c.dst);
+                const low: u32 = @bitCast(std.mem.readInt(i32, c.bytes[28..32], .big));
+                try w.emit(riscv.LUI(rd, @truncate(low >> 12)));
+                try w.emit(riscv.ADDI(rd, rd, @truncate(@as(i32, @intCast(low & 0xFFF)))));
+            },
+            .const_bool => |c| {
+                const rd = getReg(reg_map, ra, c.dst);
+                try w.emit(riscv.ADDI(rd, .zero, if (c.value) 1 else 0));
+            },
+            .const_data => |c| {
+                const rd = getReg(reg_map, ra, c.dst);
+                try w.emit(riscv.LUI(rd, @truncate(c.offset >> 12)));
+                try w.emit(riscv.ADDI(rd, rd, @truncate(@as(i32, @intCast(c.offset & 0xFFF)))));
+            },
+
+            // ── Arithmetic ────────────────────────────────────────────────
+            .add => |a| {
+                try w.emit(riscv.ADD(getReg(reg_map, ra, a.dst), getReg(reg_map, ra, a.lhs), getReg(reg_map, ra, a.rhs)));
+            },
+            .sub => |a| {
+                try w.emit(riscv.SUB(getReg(reg_map, ra, a.dst), getReg(reg_map, ra, a.lhs), getReg(reg_map, ra, a.rhs)));
+            },
+            .mul => |a| {
+                try w.emit(riscv.MUL(getReg(reg_map, ra, a.dst), getReg(reg_map, ra, a.lhs), getReg(reg_map, ra, a.rhs)));
+            },
+            .div => |a| {
+                try w.emit(riscv.DIV(getReg(reg_map, ra, a.dst), getReg(reg_map, ra, a.lhs), getReg(reg_map, ra, a.rhs)));
+            },
+            .mod => |a| {
+                try w.emit(riscv.REM(getReg(reg_map, ra, a.dst), getReg(reg_map, ra, a.lhs), getReg(reg_map, ra, a.rhs)));
+            },
+            .negate => |u| {
+                try w.emit(riscv.SUB(getReg(reg_map, ra, u.dst), .zero, getReg(reg_map, ra, u.operand)));
+            },
+
+            // ── Comparison ────────────────────────────────────────────────
+            .eq => |a| {
+                const rd = getReg(reg_map, ra, a.dst);
+                const r1 = getReg(reg_map, ra, a.lhs);
+                const r2 = getReg(reg_map, ra, a.rhs);
+                try w.emit(riscv.SUB(rd, r1, r2));
+                try w.emit(riscv.encodeI(1, rd, 0x3, rd, 0x13)); // SLTIU rd, rd, 1
+            },
+            .ne => |a| {
+                const rd = getReg(reg_map, ra, a.dst);
+                try w.emit(riscv.SUB(rd, getReg(reg_map, ra, a.lhs), getReg(reg_map, ra, a.rhs)));
+                try w.emit(riscv.encodeR(0, rd, .zero, 0x3, rd, 0x33)); // SLTU rd, zero, rd
+            },
+            .lt => |a| {
+                try w.emit(riscv.encodeR(0, getReg(reg_map, ra, a.rhs), getReg(reg_map, ra, a.lhs), 0x3, getReg(reg_map, ra, a.dst), 0x33)); // SLTU
+            },
+            .gt => |a| {
+                try w.emit(riscv.encodeR(0, getReg(reg_map, ra, a.lhs), getReg(reg_map, ra, a.rhs), 0x3, getReg(reg_map, ra, a.dst), 0x33)); // SLTU
+            },
+            .le => |a| {
+                const rd = getReg(reg_map, ra, a.dst);
+                try w.emit(riscv.encodeR(0, getReg(reg_map, ra, a.lhs), getReg(reg_map, ra, a.rhs), 0x3, rd, 0x33)); // SLTU rd, rhs, lhs  (gt)
+                try w.emit(riscv.encodeI(1, rd, 0x4, rd, 0x13)); // XORI rd, rd, 1
+            },
+            .ge => |a| {
+                const rd = getReg(reg_map, ra, a.dst);
+                try w.emit(riscv.encodeR(0, getReg(reg_map, ra, a.rhs), getReg(reg_map, ra, a.lhs), 0x3, rd, 0x33)); // SLTU rd, lhs, rhs  (lt)
+                try w.emit(riscv.encodeI(1, rd, 0x4, rd, 0x13)); // XORI rd, rd, 1
+            },
+
+            // ── Logic ─────────────────────────────────────────────────────
+            .bool_and => |a| {
+                try w.emit(riscv.AND(getReg(reg_map, ra, a.dst), getReg(reg_map, ra, a.lhs), getReg(reg_map, ra, a.rhs)));
+            },
+            .bool_or => |a| {
+                try w.emit(riscv.OR(getReg(reg_map, ra, a.dst), getReg(reg_map, ra, a.lhs), getReg(reg_map, ra, a.rhs)));
+            },
+            .bool_not => |u| {
+                const rd = getReg(reg_map, ra, u.dst);
+                try w.emit(riscv.encodeI(1, getReg(reg_map, ra, u.operand), 0x3, rd, 0x13)); // SLTIU rd, rs, 1
+            },
+
+            // ── Move ──────────────────────────────────────────────────────
+            .mov => |m| {
+                try w.emit(riscv.ADDI(getReg(reg_map, ra, m.dst), getReg(reg_map, ra, m.src), 0));
+            },
+
+            // ── Control flow ──────────────────────────────────────────────
+            .label => |l| {
+                const off = w.currentOffset();
+                try label_map.put(l.id, off);
+                if (label_patches.getPtr(l.id)) |patches| {
+                    for (patches.items) |p| {
+                        const rel = @as(i32, @intCast(off)) - @as(i32, @intCast(p));
+                        w.patchAt(p, riscv.JAL(.zero, @truncate(rel)));
+                    }
+                    patches.clearRetainingCapacity();
+                }
+            },
+            .jump => |j| {
+                if (label_map.get(j.target)) |target_off| {
+                    const cur = w.currentOffset();
+                    const rel = @as(i32, @intCast(target_off)) - @as(i32, @intCast(cur));
+                    try w.emit(riscv.JAL(.zero, @truncate(rel)));
+                } else {
+                    const cur = w.currentOffset();
+                    try w.emit(riscv.JAL(.zero, 0));
+                    const entry = try label_patches.getOrPut(j.target);
+                    if (!entry.found_existing) entry.value_ptr.* = .{};
+                    try entry.value_ptr.append(self.allocator, cur);
+                }
+            },
+            .branch => |b| {
+                const rc = getReg(reg_map, ra, b.cond);
+                // BNE cond, zero → then_
+                if (label_map.get(b.then_)) |target| {
+                    const cur = w.currentOffset();
+                    const rel = @as(i32, @intCast(target)) - @as(i32, @intCast(cur));
+                    try w.emit(riscv.BNE(rc, .zero, @truncate(rel)));
+                } else {
+                    const cur = w.currentOffset();
+                    try w.emit(riscv.BNE(rc, .zero, 0));
+                    const entry = try label_patches.getOrPut(b.then_);
+                    if (!entry.found_existing) entry.value_ptr.* = .{};
+                    try entry.value_ptr.append(self.allocator, cur);
+                }
+                // Fall-through = else_
+                if (label_map.get(b.else_)) |target| {
+                    const cur = w.currentOffset();
+                    const rel = @as(i32, @intCast(target)) - @as(i32, @intCast(cur));
+                    try w.emit(riscv.JAL(.zero, @truncate(rel)));
+                } else {
+                    const cur2 = w.currentOffset();
+                    try w.emit(riscv.JAL(.zero, 0));
+                    const entry2 = try label_patches.getOrPut(b.else_);
+                    if (!entry2.found_existing) entry2.value_ptr.* = .{};
+                    try entry2.value_ptr.append(self.allocator, cur2);
+                }
+            },
+            .ret => |r| {
+                if (r.value) |val| {
+                    try w.emit(riscv.ADD(.a0, getReg(reg_map, ra, val), .zero));
+                }
+                try w.emit(riscv.JALR(.zero, .ra, 0));
+            },
+
+            // ── State access via host calls ───────────────────────────────
+            .state_read => |sr| {
+                const rd = getReg(reg_map, ra, sr.dst);
+                try w.emit(riscv.ADDI(.a0, .zero, @intCast(sr.field_id)));
+                if (sr.key) |k| {
+                    try w.emit(riscv.ADD(.a1, getReg(reg_map, ra, k), .zero));
+                }
+                try w.emit(riscv.ECALLI(@intFromEnum(PolkaHostCalls.STATE_READ)));
+                try w.emit(riscv.ADD(rd, .a0, .zero));
+            },
+            .state_write => |sw| {
+                try w.emit(riscv.ADDI(.a0, .zero, @intCast(sw.field_id)));
+                try w.emit(riscv.ADD(.a1, getReg(reg_map, ra, sw.value), .zero));
+                if (sw.key) |k| {
+                    try w.emit(riscv.ADD(.a2, getReg(reg_map, ra, k), .zero));
+                }
+                try w.emit(riscv.ECALLI(@intFromEnum(PolkaHostCalls.STATE_WRITE)));
+            },
+            .state_delete => |sd| {
+                try w.emit(riscv.ADDI(.a0, .zero, @intCast(sd.field_id)));
+                try w.emit(riscv.ADD(.a1, getReg(reg_map, ra, sd.key), .zero));
+                try w.emit(riscv.ECALLI(@intFromEnum(PolkaHostCalls.STATE_DELETE)));
+            },
+
+            // ── Events ────────────────────────────────────────────────────
+            .emit_event => |ev| {
+                try w.emit(riscv.ADDI(.a0, .zero, @intCast(ev.event_id)));
+                for (ev.args, 0..) |arg, i| {
+                    if (i >= 6) break;
+                    const arg_reg: Reg = @enumFromInt(@as(u5, @intCast(11 + i)));
+                    try w.emit(riscv.ADD(arg_reg, getReg(reg_map, ra, arg), .zero));
+                }
+                try w.emit(riscv.ECALLI(@intFromEnum(PolkaHostCalls.EMIT_EVENT)));
+            },
+
+            // ── Assertions ────────────────────────────────────────────────
+            .need => |n| {
+                const rc = getReg(reg_map, ra, n.cond);
+                try w.emit(riscv.BNE(rc, .zero, 12)); // skip revert
+                try w.emit(riscv.ADDI(.a0, .zero, @intCast(n.msg_offset)));
+                try w.emit(riscv.ECALLI(@intFromEnum(PolkaHostCalls.REVERT)));
+            },
+            .ensure => |e| {
+                const rc = getReg(reg_map, ra, e.cond);
+                try w.emit(riscv.BNE(rc, .zero, 12)); // skip revert
+                try w.emit(riscv.ADDI(.a0, .zero, @intCast(e.msg_offset)));
+                try w.emit(riscv.ECALLI(@intFromEnum(PolkaHostCalls.REVERT)));
+            },
+            .panic => |p| {
+                try w.emit(riscv.ADDI(.a0, .zero, @intCast(p.msg_offset)));
+                try w.emit(riscv.ECALLI(@intFromEnum(PolkaHostCalls.REVERT)));
+            },
+
+            // ── Native transfer ───────────────────────────────────────────
+            .pay => |p| {
+                try w.emit(riscv.ADD(.a0, getReg(reg_map, ra, p.recipient), .zero));
+                try w.emit(riscv.ADD(.a1, getReg(reg_map, ra, p.amount), .zero));
+                try w.emit(riscv.ECALLI(@intFromEnum(PolkaHostCalls.NATIVE_PAY)));
+            },
+
+            // ── Builtins ──────────────────────────────────────────────────
+            .get_caller => |gc| {
+                try w.emit(riscv.ECALLI(@intFromEnum(PolkaHostCalls.GET_CALLER)));
+                try w.emit(riscv.ADD(getReg(reg_map, ra, gc.dst), .a0, .zero));
+            },
+            .get_value => |gv| {
+                try w.emit(riscv.ECALLI(@intFromEnum(PolkaHostCalls.GET_VALUE)));
+                try w.emit(riscv.ADD(getReg(reg_map, ra, gv.dst), .a0, .zero));
+            },
+            .get_timestamp => |gt| {
+                try w.emit(riscv.ECALLI(@intFromEnum(PolkaHostCalls.GET_NOW)));
+                try w.emit(riscv.ADD(getReg(reg_map, ra, gt.dst), .a0, .zero));
+            },
+            .get_block => |gb| {
+                try w.emit(riscv.ECALLI(@intFromEnum(PolkaHostCalls.GET_BLOCK)));
+                try w.emit(riscv.ADD(getReg(reg_map, ra, gb.dst), .a0, .zero));
+            },
+
+            // ── Authority ─────────────────────────────────────────────────
+            .auth_check => |ac| {
+                try w.emit(riscv.ADDI(.a0, .zero, @intCast(ac.name_offset)));
+                try w.emit(riscv.ECALLI(@intFromEnum(PolkaHostCalls.AUTH_CHECK)));
+            },
+            .auth_gate_begin => |ag| {
+                try w.emit(riscv.ADDI(.a0, .zero, @intCast(ag.name_offset)));
+                try w.emit(riscv.ECALLI(@intFromEnum(PolkaHostCalls.ACCESS_ASSERT)));
+            },
+            .auth_gate_end => {},
+            .throw_error => |te| {
+                try w.emit(riscv.ADDI(.a0, .zero, @intCast(te.error_id)));
+                try w.emit(riscv.ECALLI(@intFromEnum(PolkaHostCalls.REVERT)));
+            },
+
+            // ── Asset operations ─────────────────────────────────────────
+            .asset_send => |as_| {
+                try w.emit(riscv.ADD(.a0, getReg(reg_map, ra, as_.asset), .zero));
+                try w.emit(riscv.ADD(.a1, getReg(reg_map, ra, as_.recipient), .zero));
+                try w.emit(riscv.ECALLI(@intFromEnum(PolkaHostCalls.ASSET_TRANSFER)));
+            },
+            .asset_mint => |am| {
+                try w.emit(riscv.ADDI(.a0, .zero, @intCast(am.type_id)));
+                try w.emit(riscv.ADD(.a1, getReg(reg_map, ra, am.amount), .zero));
+                try w.emit(riscv.ECALLI(@intFromEnum(PolkaHostCalls.ASSET_MINT)));
+                try w.emit(riscv.ADD(getReg(reg_map, ra, am.dst), .a0, .zero));
+            },
+            .asset_burn => |ab| {
+                try w.emit(riscv.ADD(.a0, getReg(reg_map, ra, ab.asset), .zero));
+                try w.emit(riscv.ECALLI(@intFromEnum(PolkaHostCalls.ASSET_BURN)));
+            },
+
+            // ── Placeholders (not critical path) ─────────────────────────
+            .asset_split, .asset_merge, .asset_wrap, .asset_unwrap,
+            .expand_account, .close_account, .freeze_account, .unfreeze_account,
+            .transfer_ownership, .schedule_call, .oracle_read, .vrf_random,
+            .zk_verify, .delegate_gas, .has_check, .get_gas, .get_this,
+            .get_deployer, .get_zero_addr, .attempt_begin, .attempt_end,
+            .call_internal, .call_external, .nop => {},
         }
     }
 };

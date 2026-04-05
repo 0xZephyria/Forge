@@ -17,6 +17,7 @@ const checker = @import("checker.zig");
 const codegen = @import("codegen.zig");
 const codegen_polkavm = @import("codegen_polkavm.zig");
 const codegen_evm = @import("codegen_evm.zig");
+const mir = @import("mir.zig");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const abi = @import("abi.zig");
@@ -244,14 +245,26 @@ pub fn compile(
     // ── Stage 6: Code generation ─────────────────────────────────────────
     var binary: []u8 = undefined;
     if (opts.evm_abi) {
+        // ── MIR-based EVM pipeline: AST → MIR → EVM bytecode ──────────
+        var lowerer = mir.MirLowerer.init(temp_alloc, &resolver, &diagnostics);
+        defer lowerer.deinit();
+        const mir_module = try lowerer.lowerContract(contract, &checked);
+
         var gen = CodeGenEVM.init(temp_alloc, &diagnostics, &resolver);
         defer gen.deinit();
-        const tmp_bin = try gen.generate(contract, &checked);
+        gen.mir_data = mir_module.data_section;
+        gen.mir_events = mir_module.events;
+        const tmp_bin = try gen.generateFromMir(&mir_module);
         binary = try alloc.dupe(u8, tmp_bin);
     } else if (std.mem.eql(u8, opts.target, "polkavm")) {
+        // ── MIR-based PolkaVM pipeline: AST → MIR → RISC-V bytecode ──
+        var lowerer = mir.MirLowerer.init(temp_alloc, &resolver, &diagnostics);
+        defer lowerer.deinit();
+        const mir_module = try lowerer.lowerContract(contract, &checked);
+
         var gen = CodeGenPolkaVM.init(temp_alloc, &diagnostics, &resolver);
         defer gen.deinit();
-        const tmp_bin = try gen.generate(contract, &checked);
+        const tmp_bin = try gen.generateFromMir(&mir_module);
         binary = try alloc.dupe(u8, tmp_bin);
     } else {
         var gen = CodeGen.init(temp_alloc, &diagnostics, &resolver);
