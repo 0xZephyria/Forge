@@ -38,6 +38,7 @@ const ast = @import("ast.zig");
 const errors = @import("errors.zig");
 const types = @import("types.zig");
 const checker = @import("checker.zig");
+const mir_mod = @import("mir.zig");
 
 const Span = ast.Span;
 const Expr = ast.Expr;
@@ -634,6 +635,10 @@ pub const EVMCodeGen = struct {
     diagnostics: *DiagnosticList,
     resolver: *TypeResolver,
     slots: SlotMap,
+    /// MIR data section reference (set before generateFromMir).
+    mir_data: ?[]const u8,
+    /// MIR event descriptors (set before generateFromMir).
+    mir_events: []const mir_mod.EventDesc,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -645,6 +650,8 @@ pub const EVMCodeGen = struct {
             .diagnostics = diagnostics,
             .resolver = resolver,
             .slots = SlotMap.init(allocator),
+            .mir_data = null,
+            .mir_events = &.{},
         };
     }
 
@@ -2933,6 +2940,967 @@ pub const EVMCodeGen = struct {
         try w.pushU32(total);
         try w.push0();
         try w.op(.REVERT);
+    }
+
+    // ========================================================================
+    // MIR-Based Code Generation (unified backend entry point)
+    // ========================================================================
+
+    /// SPEC: Part 5, Part 14 — Generate complete EVM initcode from a MirModule.
+    /// This is the new unified entry point that replaces direct AST walking.
+    /// All backends share the same MirModule; only this lowering layer is
+    /// target-specific.
+    pub fn generateFromMir(
+        self: *EVMCodeGen,
+        mir: *const mir_mod.MirModule,
+    ) anyerror![]u8 {
+        // Pre-register state field storage slots from MIR descriptors.
+        for (mir.state_fields) |sf| {
+            try self.slots.register(sf.name);
+        }
+
+        // Generate runtime bytecode from MIR functions.
+        const runtime = try self.mirRuntime(mir);
+        defer self.allocator.free(runtime);
+
+        // Generate deploy (initcode) from MIR setup function.
+        const deploy = try self.mirDeploy(mir, runtime);
+        defer self.allocator.free(deploy);
+
+        // Concatenate: [deploy][runtime]
+        const total = deploy.len + runtime.len;
+        const out = try self.allocator.alloc(u8, total);
+        @memcpy(out[0..deploy.len], deploy);
+        @memcpy(out[deploy.len..], runtime);
+        return out;
+    }
+
+    /// SPEC: Part 5.1 — Generate EVM deploy (initcode) from MIR.
+    fn mirDeploy(
+        self: *EVMCodeGen,
+        mir: *const mir_mod.MirModule,
+        runtime: []const u8,
+    ) anyerror![]u8 {
+        var w = EVMWriter.init(self.allocator);
+        defer w.deinit();
+
+        // Init free-memory pointer: memory[0x40] = 0x80
+        try w.push1(0x80);
+        try w.push1(0x40);
+        try w.op(.MSTORE);
+
+        // Store deployer address.
+        try w.op(.CALLER);
+        try w.pushU256BE(keccak256("__deployer__"));
+        try w.op(.SSTORE);
+
+        // Initialize authorities from MIR data section.
+        for (mir.authorities) |auth| {
+            // Store CALLER as initial authority holder.
+            try w.op(.CALLER);
+            try w.pushU256BE(keccak256(auth.name));
+            try w.op(.SSTORE);
+        }
+
+        // Find and emit setup function body.
+        for (mir.functions) |func| {
+            if (func.kind == .setup) {
+                // ABI-decode constructor params from calldata (no selector).
+                for (func.params, 0..) |_, i| {
+                    const cd_offset: u32 = @intCast(i * 32);
+                    try w.pushU32(cd_offset);
+                    try w.op(.CALLDATALOAD);
+                    const mem_slot: u32 = @intCast(LOCAL_START + i * 32);
+                    try w.pushU32(mem_slot);
+                    try w.op(.MSTORE);
+                }
+                // Emit MIR instructions for setup body.
+                try self.mirEmitFuncBody(&func, &w);
+                break;
+            }
+        }
+
+        // CODECOPY runtime into memory[0x00] and RETURN it.
+        const appendix_size: u32 = 13;
+        const deploy_code_len: u32 = w.offset() + appendix_size;
+        const runtime_len: u16 = @intCast(runtime.len);
+
+        try w.push2(runtime_len);
+        try w.push2(@intCast(deploy_code_len));
+        try w.push0();
+        try w.op(.CODECOPY);
+
+        try w.push2(runtime_len);
+        try w.push0();
+        try w.op(.RETURN);
+
+        return w.toOwnedSlice();
+    }
+
+    /// SPEC: Part 5.2 — Generate EVM runtime bytecode from MIR.
+    fn mirRuntime(
+        self: *EVMCodeGen,
+        mir: *const mir_mod.MirModule,
+    ) anyerror![]u8 {
+        var w = EVMWriter.init(self.allocator);
+        defer w.deinit();
+
+        // Init free-memory pointer.
+        try w.push1(0x80);
+        try w.push1(0x40);
+        try w.op(.MSTORE);
+
+        // Selector extraction: check calldatasize >= 4.
+        try w.push1(4);
+        try w.op(.CALLDATASIZE);
+        try w.op(.LT);
+        const fallback_patch = try w.push2Placeholder();
+        try w.op(.JUMPI);
+
+        // Extract 4-byte selector.
+        try w.push0();
+        try w.op(.CALLDATALOAD);
+        try w.push1(0xe0);
+        try w.op(.SHR);
+
+        // Build dispatch table from MIR functions.
+        const DispatchEntry = struct { patch: u32 };
+        var dispatch_entries = std.ArrayListUnmanaged(DispatchEntry){};
+        defer dispatch_entries.deinit(self.allocator);
+        var dispatch_funcs = std.ArrayListUnmanaged(usize){};
+        defer dispatch_funcs.deinit(self.allocator);
+
+        for (mir.functions, 0..) |func, fi| {
+            const is_dispatchable = switch (func.kind) {
+                .action, .view, .pure => true,
+                else => false,
+            };
+            if (!is_dispatchable) continue;
+
+            // Build EVM ABI selector from MIR function metadata.
+            const sel = self.mirBuildSelector(&func);
+            try w.op(.DUP1);
+            try w.push4(sel);
+            try w.op(.EQ);
+            const patch = try w.push2Placeholder();
+            try w.op(.JUMPI);
+            try dispatch_entries.append(self.allocator, .{ .patch = patch });
+            try dispatch_funcs.append(self.allocator, fi);
+        }
+
+        // Fallback: calldatasize < 4 or no selector match.
+        const fallback_dest = w.offset();
+        w.patchU16(fallback_patch, fallback_dest);
+        try w.op(.JUMPDEST);
+
+        // Look for receive handler (value > 0).
+        var has_receive = false;
+        var has_fallback = false;
+        for (mir.functions) |func| {
+            if (func.kind == .receive) has_receive = true;
+            if (func.kind == .fallback) has_fallback = true;
+        }
+
+        if (has_receive) {
+            try w.op(.CALLVALUE);
+            const receive_patch = try w.push2Placeholder();
+            try w.op(.JUMPI);
+            // No value — fall through to fallback or revert.
+            if (has_fallback) {
+                for (mir.functions) |func| {
+                    if (func.kind == .fallback) {
+                        try self.mirEmitFuncBody(&func, &w);
+                        break;
+                    }
+                }
+            } else {
+                try w.push0();
+                try w.push0();
+                try w.op(.REVERT);
+            }
+            // Receive handler.
+            const receive_dest = w.offset();
+            w.patchU16(receive_patch, receive_dest);
+            try w.op(.JUMPDEST);
+            for (mir.functions) |func| {
+                if (func.kind == .receive) {
+                    try self.mirEmitFuncBody(&func, &w);
+                    break;
+                }
+            }
+        } else if (has_fallback) {
+            for (mir.functions) |func| {
+                if (func.kind == .fallback) {
+                    try self.mirEmitFuncBody(&func, &w);
+                    break;
+                }
+            }
+        } else {
+            try w.push0();
+            try w.push0();
+            try w.op(.REVERT);
+        }
+
+        // No-match destination (selector dispatch exhaustion).
+        const no_match_dest = w.offset();
+        try w.op(.JUMPDEST);
+        try w.op(.POP); // pop selector
+        try w.push0();
+        try w.push0();
+        try w.op(.REVERT);
+        _ = no_match_dest;
+
+        // Function handlers.
+        for (dispatch_entries.items, 0..) |entry, di| {
+            const fi = dispatch_funcs.items[di];
+            const func = &mir.functions[fi];
+
+            const handler_dest = w.offset();
+            w.patchU16(entry.patch, handler_dest);
+            try w.op(.JUMPDEST);
+            try w.op(.POP); // pop selector
+
+            // ABI-decode calldata params into memory.
+            for (func.params, 0..) |_, pi| {
+                const cd_off: u32 = @intCast(4 + pi * 32);
+                try w.pushU32(cd_off);
+                try w.op(.CALLDATALOAD);
+                const mem_slot: u32 = @intCast(LOCAL_START + pi * 32);
+                try w.pushU32(mem_slot);
+                try w.op(.MSTORE);
+            }
+
+            // Emit MIR function body.
+            try self.mirEmitFuncBody(func, &w);
+
+            // Epilogue.
+            if (func.kind == .view or func.kind == .pure) {
+                // Default return 0 for views/pures without explicit return.
+                try w.push0();
+                try w.push1(0x00);
+                try w.op(.MSTORE);
+                try w.push1(32);
+                try w.push0();
+                try w.op(.RETURN);
+            } else {
+                try w.op(.STOP);
+            }
+        }
+
+        return w.toOwnedSlice();
+    }
+
+    /// Build a MIR-derived EVM ABI selector: keccak256("name(type0,type1,...)")
+    fn mirBuildSelector(self: *EVMCodeGen, func: *const mir_mod.MirFunction) u32 {
+        var buf = std.ArrayListUnmanaged(u8){};
+        defer buf.deinit(self.allocator);
+        buf.appendSlice(self.allocator, func.name) catch return func.selector;
+        buf.append(self.allocator, '(') catch return func.selector;
+        for (func.params, 0..) |p, i| {
+            if (i > 0) buf.append(self.allocator, ',') catch {};
+            const abi_str = mirTypeToAbi(p.resolved);
+            buf.appendSlice(self.allocator, abi_str) catch {};
+        }
+        buf.append(self.allocator, ')') catch return func.selector;
+        return evmSelector(buf.items);
+    }
+
+    /// Map a ResolvedType (carried through MIR) to EVM ABI type string.
+    fn mirTypeToAbi(rt: ResolvedType) []const u8 {
+        return evmAbiType(rt);
+    }
+
+    /// SPEC: Part 5 — Emit EVM bytecode for one MIR function's instruction stream.
+    fn mirEmitFuncBody(
+        self: *EVMCodeGen,
+        func: *const mir_mod.MirFunction,
+        w: *EVMWriter,
+    ) anyerror!void {
+        // Register file: map virtual MIR registers → memory offsets.
+        var reg_mem = std.AutoHashMap(mir_mod.Reg, u32).init(self.allocator);
+        defer reg_mem.deinit();
+        var next_mem: u32 = LOCAL_START;
+
+        // Allocate memory for parameters.
+        for (func.params, 0..) |_, i| {
+            const reg: mir_mod.Reg = @intCast(i);
+            try reg_mem.put(reg, @intCast(LOCAL_START + i * 32));
+            next_mem = @intCast(LOCAL_START + (i + 1) * 32);
+        }
+
+        // Label → bytecode offset map for jump resolution.
+        var label_offsets = std.AutoHashMap(mir_mod.LabelId, u32).init(self.allocator);
+        defer label_offsets.deinit();
+
+        // Forward-reference patches: label → list of patch offsets.
+        var label_patches = std.AutoHashMap(mir_mod.LabelId, std.ArrayListUnmanaged(u32)).init(self.allocator);
+        defer {
+            var it = label_patches.valueIterator();
+            while (it.next()) |list| {
+                list.deinit(self.allocator);
+            }
+            label_patches.deinit();
+        }
+
+        // Helper: get or allocate memory for a register.
+        const RegCtx = struct {
+            reg_mem: *std.AutoHashMap(mir_mod.Reg, u32),
+            next_mem: *u32,
+
+            fn memOf(ctx: @This(), reg: mir_mod.Reg) u32 {
+                if (ctx.reg_mem.get(reg)) |off| return off;
+                const off = ctx.next_mem.*;
+                ctx.reg_mem.put(reg, off) catch {};
+                ctx.next_mem.* += 32;
+                return off;
+            }
+        };
+        var rctx = RegCtx{ .reg_mem = &reg_mem, .next_mem = &next_mem };
+
+        for (func.body) |instr| {
+            try self.mirLowerInstr(&instr, w, &rctx, &label_offsets, &label_patches);
+        }
+
+        // Backpatch all forward label references.
+        var patch_it = label_patches.iterator();
+        while (patch_it.next()) |entry| {
+            if (label_offsets.get(entry.key_ptr.*)) |target| {
+                for (entry.value_ptr.items) |patch_off| {
+                    w.patchU16(patch_off, target);
+                }
+            }
+        }
+    }
+
+    /// SPEC: Part 5 — Lower one MIR instruction to EVM bytecode.
+    fn mirLowerInstr(
+        self: *EVMCodeGen,
+        instr: *const mir_mod.MirInstr,
+        w: *EVMWriter,
+        rctx: anytype,
+        label_offsets: *std.AutoHashMap(mir_mod.LabelId, u32),
+        label_patches: *std.AutoHashMap(mir_mod.LabelId, std.ArrayListUnmanaged(u32)),
+    ) anyerror!void {
+        switch (instr.op) {
+            // ── Constants ─────────────────────────────────────────────────
+            .const_i256 => |c| {
+                try w.pushU256BE(c.bytes);
+                const off = rctx.memOf(c.dst);
+                try w.pushU32(off);
+                try w.op(.MSTORE);
+            },
+            .const_bool => |c| {
+                if (c.value) try w.push1(1) else try w.push0();
+                const off = rctx.memOf(c.dst);
+                try w.pushU32(off);
+                try w.op(.MSTORE);
+            },
+            .const_data => |c| {
+                // Push data offset and length as a packed value.
+                try w.pushU64(@intCast(c.offset));
+                const off = rctx.memOf(c.dst);
+                try w.pushU32(off);
+                try w.op(.MSTORE);
+            },
+
+            // ── Arithmetic ────────────────────────────────────────────────
+            .add => |a| {
+                try w.pushU32(rctx.memOf(a.lhs));
+                try w.op(.MLOAD);
+                try w.pushU32(rctx.memOf(a.rhs));
+                try w.op(.MLOAD);
+                try w.op(.ADD);
+                try w.pushU32(rctx.memOf(a.dst));
+                try w.op(.MSTORE);
+            },
+            .sub => |a| {
+                try w.pushU32(rctx.memOf(a.lhs));
+                try w.op(.MLOAD);
+                try w.pushU32(rctx.memOf(a.rhs));
+                try w.op(.MLOAD);
+                try w.op(.SUB);
+                try w.pushU32(rctx.memOf(a.dst));
+                try w.op(.MSTORE);
+            },
+            .mul => |a| {
+                try w.pushU32(rctx.memOf(a.lhs));
+                try w.op(.MLOAD);
+                try w.pushU32(rctx.memOf(a.rhs));
+                try w.op(.MLOAD);
+                try w.op(.MUL);
+                try w.pushU32(rctx.memOf(a.dst));
+                try w.op(.MSTORE);
+            },
+            .div => |a| {
+                try w.pushU32(rctx.memOf(a.lhs));
+                try w.op(.MLOAD);
+                try w.pushU32(rctx.memOf(a.rhs));
+                try w.op(.MLOAD);
+                try w.op(.DIV);
+                try w.pushU32(rctx.memOf(a.dst));
+                try w.op(.MSTORE);
+            },
+            .mod => |a| {
+                try w.pushU32(rctx.memOf(a.lhs));
+                try w.op(.MLOAD);
+                try w.pushU32(rctx.memOf(a.rhs));
+                try w.op(.MLOAD);
+                try w.op(.MOD);
+                try w.pushU32(rctx.memOf(a.dst));
+                try w.op(.MSTORE);
+            },
+            .negate => |u| {
+                try w.push0();
+                try w.pushU32(rctx.memOf(u.operand));
+                try w.op(.MLOAD);
+                try w.op(.SUB);
+                try w.pushU32(rctx.memOf(u.dst));
+                try w.op(.MSTORE);
+            },
+
+            // ── Comparison ────────────────────────────────────────────────
+            .eq => |a| {
+                try w.pushU32(rctx.memOf(a.lhs));
+                try w.op(.MLOAD);
+                try w.pushU32(rctx.memOf(a.rhs));
+                try w.op(.MLOAD);
+                try w.op(.EQ);
+                try w.pushU32(rctx.memOf(a.dst));
+                try w.op(.MSTORE);
+            },
+            .ne => |a| {
+                try w.pushU32(rctx.memOf(a.lhs));
+                try w.op(.MLOAD);
+                try w.pushU32(rctx.memOf(a.rhs));
+                try w.op(.MLOAD);
+                try w.op(.EQ);
+                try w.op(.ISZERO);
+                try w.pushU32(rctx.memOf(a.dst));
+                try w.op(.MSTORE);
+            },
+            .lt => |a| {
+                try w.pushU32(rctx.memOf(a.rhs));
+                try w.op(.MLOAD);
+                try w.pushU32(rctx.memOf(a.lhs));
+                try w.op(.MLOAD);
+                try w.op(.LT);
+                try w.pushU32(rctx.memOf(a.dst));
+                try w.op(.MSTORE);
+            },
+            .gt => |a| {
+                try w.pushU32(rctx.memOf(a.rhs));
+                try w.op(.MLOAD);
+                try w.pushU32(rctx.memOf(a.lhs));
+                try w.op(.MLOAD);
+                try w.op(.GT);
+                try w.pushU32(rctx.memOf(a.dst));
+                try w.op(.MSTORE);
+            },
+            .le => |a| {
+                try w.pushU32(rctx.memOf(a.rhs));
+                try w.op(.MLOAD);
+                try w.pushU32(rctx.memOf(a.lhs));
+                try w.op(.MLOAD);
+                try w.op(.GT);
+                try w.op(.ISZERO);
+                try w.pushU32(rctx.memOf(a.dst));
+                try w.op(.MSTORE);
+            },
+            .ge => |a| {
+                try w.pushU32(rctx.memOf(a.rhs));
+                try w.op(.MLOAD);
+                try w.pushU32(rctx.memOf(a.lhs));
+                try w.op(.MLOAD);
+                try w.op(.LT);
+                try w.op(.ISZERO);
+                try w.pushU32(rctx.memOf(a.dst));
+                try w.op(.MSTORE);
+            },
+
+            // ── Logic ─────────────────────────────────────────────────────
+            .bool_and => |a| {
+                try w.pushU32(rctx.memOf(a.lhs));
+                try w.op(.MLOAD);
+                try w.pushU32(rctx.memOf(a.rhs));
+                try w.op(.MLOAD);
+                try w.op(.AND);
+                try w.pushU32(rctx.memOf(a.dst));
+                try w.op(.MSTORE);
+            },
+            .bool_or => |a| {
+                try w.pushU32(rctx.memOf(a.lhs));
+                try w.op(.MLOAD);
+                try w.pushU32(rctx.memOf(a.rhs));
+                try w.op(.MLOAD);
+                try w.op(.OR);
+                try w.pushU32(rctx.memOf(a.dst));
+                try w.op(.MSTORE);
+            },
+            .bool_not => |u| {
+                try w.pushU32(rctx.memOf(u.operand));
+                try w.op(.MLOAD);
+                try w.op(.ISZERO);
+                try w.pushU32(rctx.memOf(u.dst));
+                try w.op(.MSTORE);
+            },
+
+            // ── Move ──────────────────────────────────────────────────────
+            .mov => |m| {
+                try w.pushU32(rctx.memOf(m.src));
+                try w.op(.MLOAD);
+                try w.pushU32(rctx.memOf(m.dst));
+                try w.op(.MSTORE);
+            },
+
+            // ── Control flow ──────────────────────────────────────────────
+            .label => |l| {
+                const off = w.offset();
+                try label_offsets.put(l.id, off);
+                try w.op(.JUMPDEST);
+                // Backpatch any forward refs to this label.
+                if (label_patches.getPtr(l.id)) |patches| {
+                    for (patches.items) |p| {
+                        w.patchU16(p, off);
+                    }
+                    patches.clearRetainingCapacity();
+                }
+            },
+            .jump => |j| {
+                if (label_offsets.get(j.target)) |target_off| {
+                    try w.push2(@intCast(target_off));
+                } else {
+                    const p = try w.push2Placeholder();
+                    const entry = try label_patches.getOrPut(j.target);
+                    if (!entry.found_existing) {
+                        entry.value_ptr.* = .{};
+                    }
+                    try entry.value_ptr.append(self.allocator, p);
+                }
+                try w.op(.JUMP);
+            },
+            .branch => |b| {
+                try w.pushU32(rctx.memOf(b.cond));
+                try w.op(.MLOAD);
+                // Jump to then_ if condition is true.
+                if (label_offsets.get(b.then_)) |target_off| {
+                    try w.push2(@intCast(target_off));
+                } else {
+                    const p = try w.push2Placeholder();
+                    const entry = try label_patches.getOrPut(b.then_);
+                    if (!entry.found_existing) {
+                        entry.value_ptr.* = .{};
+                    }
+                    try entry.value_ptr.append(self.allocator, p);
+                }
+                try w.op(.JUMPI);
+                // Fall through = else_ path; emit jump to else_ label.
+                if (label_offsets.get(b.else_)) |target_off| {
+                    try w.push2(@intCast(target_off));
+                } else {
+                    const p = try w.push2Placeholder();
+                    const entry = try label_patches.getOrPut(b.else_);
+                    if (!entry.found_existing) {
+                        entry.value_ptr.* = .{};
+                    }
+                    try entry.value_ptr.append(self.allocator, p);
+                }
+                try w.op(.JUMP);
+            },
+
+            // ── Return ────────────────────────────────────────────────────
+            .ret => |r| {
+                if (r.value) |val| {
+                    try w.pushU32(rctx.memOf(val));
+                    try w.op(.MLOAD);
+                    try w.push1(0x00);
+                    try w.op(.MSTORE);
+                    try w.push1(32);
+                    try w.push0();
+                    try w.op(.RETURN);
+                } else {
+                    try w.op(.STOP);
+                }
+            },
+
+            // ── State access ──────────────────────────────────────────────
+            .state_read => |sr| {
+                if (sr.key) |key_reg| {
+                    // Map access: slot = keccak256(key ++ base_slot)
+                    try w.pushU32(rctx.memOf(key_reg));
+                    try w.op(.MLOAD);
+                    try w.push1(0x00);
+                    try w.op(.MSTORE);
+                    try w.pushU64(@intCast(sr.field_id));
+                    try w.push1(0x20);
+                    try w.op(.MSTORE);
+                    try w.push1(0x40);
+                    try w.push0();
+                    try w.op(.KECCAK256);
+                } else {
+                    try w.pushU64(@intCast(sr.field_id));
+                }
+                try w.op(.SLOAD);
+                try w.pushU32(rctx.memOf(sr.dst));
+                try w.op(.MSTORE);
+            },
+            .state_write => |sw| {
+                try w.pushU32(rctx.memOf(sw.value));
+                try w.op(.MLOAD);
+                if (sw.key) |key_reg| {
+                    try w.pushU32(rctx.memOf(key_reg));
+                    try w.op(.MLOAD);
+                    try w.push1(0x00);
+                    try w.op(.MSTORE);
+                    try w.pushU64(@intCast(sw.field_id));
+                    try w.push1(0x20);
+                    try w.op(.MSTORE);
+                    try w.push1(0x40);
+                    try w.push0();
+                    try w.op(.KECCAK256);
+                } else {
+                    try w.pushU64(@intCast(sw.field_id));
+                }
+                try w.op(.SSTORE);
+            },
+            .state_delete => |sd| {
+                try w.push0(); // value = 0 to delete
+                try w.pushU32(rctx.memOf(sd.key));
+                try w.op(.MLOAD);
+                try w.push1(0x00);
+                try w.op(.MSTORE);
+                try w.pushU64(@intCast(sd.field_id));
+                try w.push1(0x20);
+                try w.op(.MSTORE);
+                try w.push1(0x40);
+                try w.push0();
+                try w.op(.KECCAK256);
+                try w.op(.SSTORE);
+            },
+
+            // ── Events ────────────────────────────────────────────────────
+            .emit_event => |ev| {
+                // Find event descriptor for correct LOG opcode.
+                var indexed_count: u32 = 0;
+                var event_fields: []const mir_mod.EventFieldDesc = &.{};
+                for (self.mir_events) |edesc| {
+                    if (edesc.event_id == ev.event_id) {
+                        event_fields = edesc.fields;
+                        for (edesc.fields) |f| {
+                            if (f.indexed) indexed_count += 1;
+                        }
+                        break;
+                    }
+                }
+                // topic[0] = keccak256(event signature)
+                // Store non-indexed args in memory, push indexed as topics.
+                var mem_off: u32 = 0;
+                var topic_regs = std.ArrayListUnmanaged(mir_mod.Reg){};
+                defer topic_regs.deinit(self.allocator);
+
+                for (event_fields, 0..) |f, fi| {
+                    if (fi < ev.args.len) {
+                        if (f.indexed) {
+                            try topic_regs.append(self.allocator, ev.args[fi]);
+                        } else {
+                            try w.pushU32(rctx.memOf(ev.args[fi]));
+                            try w.op(.MLOAD);
+                            try w.pushU32(mem_off);
+                            try w.op(.MSTORE);
+                            mem_off += 32;
+                        }
+                    }
+                }
+
+                // Push data size and offset.
+                try w.pushU32(mem_off); // data size
+                try w.push0();          // data offset
+
+                // Push indexed topics (reverse order for EVM stack).
+                var ti = topic_regs.items.len;
+                while (ti > 0) {
+                    ti -= 1;
+                    try w.pushU32(rctx.memOf(topic_regs.items[ti]));
+                    try w.op(.MLOAD);
+                }
+
+                // topic[0] = event signature hash (always present).
+                // Build event sig from name + fields.
+                if (self.findEventName(ev.event_id)) |ename| {
+                    const sig_hash = self.buildMirEventSig(ename, event_fields);
+                    try w.pushU256BE(sig_hash);
+                } else {
+                    try w.push0();
+                }
+
+                // LOGn where n = 1 + indexed_count.
+                const log_n = 1 + indexed_count;
+                switch (log_n) {
+                    1 => try w.op(.LOG1),
+                    2 => try w.op(.LOG2),
+                    3 => try w.op(.LOG3),
+                    4 => try w.op(.LOG4),
+                    else => try w.op(.LOG1),
+                }
+            },
+
+            // ── Assertions ────────────────────────────────────────────────
+            .need => |n| {
+                // REQUIRE pattern: if cond == 0, revert with message.
+                try w.pushU32(rctx.memOf(n.cond));
+                try w.op(.MLOAD);
+                const ok_patch = try w.push2Placeholder();
+                try w.op(.JUMPI);
+                // Revert path: store message in memory and revert.
+                try self.mirEmitRevert(w, n.msg_offset, n.msg_len);
+                // OK path:
+                const ok_dest = w.offset();
+                w.patchU16(ok_patch, ok_dest);
+                try w.op(.JUMPDEST);
+            },
+            .ensure => |e| {
+                // Same as need for EVM.
+                try w.pushU32(rctx.memOf(e.cond));
+                try w.op(.MLOAD);
+                const ok_patch = try w.push2Placeholder();
+                try w.op(.JUMPI);
+                try self.mirEmitRevert(w, e.msg_offset, e.msg_len);
+                const ok_dest = w.offset();
+                w.patchU16(ok_patch, ok_dest);
+                try w.op(.JUMPDEST);
+            },
+            .panic => |p| {
+                try self.mirEmitRevert(w, p.msg_offset, p.msg_len);
+            },
+
+            // ── Native transfer ───────────────────────────────────────────
+            .pay => |p| {
+                // CALL(gas, to, value, inOff, inLen, outOff, outLen)
+                try w.op(.GAS);                           // gas
+                try w.pushU32(rctx.memOf(p.recipient));   // to
+                try w.op(.MLOAD);
+                try w.pushU32(rctx.memOf(p.amount));      // value
+                try w.op(.MLOAD);
+                try w.push0();                            // inOff
+                try w.push0();                            // inLen
+                try w.push0();                            // outOff
+                try w.push0();                            // outLen
+                try w.op(.CALL);
+                try w.op(.POP);                           // pop success
+            },
+
+            // ── Caller / context builtins ─────────────────────────────────
+            .get_caller => |gc| {
+                try w.op(.CALLER);
+                try w.pushU32(rctx.memOf(gc.dst));
+                try w.op(.MSTORE);
+            },
+            .get_value => |gv| {
+                try w.op(.CALLVALUE);
+                try w.pushU32(rctx.memOf(gv.dst));
+                try w.op(.MSTORE);
+            },
+            .get_timestamp => |gt| {
+                try w.op(.TIMESTAMP);
+                try w.pushU32(rctx.memOf(gt.dst));
+                try w.op(.MSTORE);
+            },
+            .get_block => |gb| {
+                try w.op(.NUMBER);
+                try w.pushU32(rctx.memOf(gb.dst));
+                try w.op(.MSTORE);
+            },
+            .get_gas => |gg| {
+                try w.op(.GAS);
+                try w.pushU32(rctx.memOf(gg.dst));
+                try w.op(.MSTORE);
+            },
+            .get_this => |gt| {
+                try w.op(.ADDRESS);
+                try w.pushU32(rctx.memOf(gt.dst));
+                try w.op(.MSTORE);
+            },
+            .get_deployer => |gd| {
+                try w.pushU256BE(keccak256("__deployer__"));
+                try w.op(.SLOAD);
+                try w.pushU32(rctx.memOf(gd.dst));
+                try w.op(.MSTORE);
+            },
+            .get_zero_addr => |gz| {
+                try w.push0();
+                try w.pushU32(rctx.memOf(gz.dst));
+                try w.op(.MSTORE);
+            },
+
+            // ── Authority checks ──────────────────────────────────────────
+            .auth_check => |ac| {
+                // Load stored authority address, compare with CALLER.
+                const name = self.getMirDataSlice(ac.name_offset, ac.name_len);
+                try w.pushU256BE(keccak256(name));
+                try w.op(.SLOAD);
+                try w.op(.CALLER);
+                try w.op(.EQ);
+                const ok_patch = try w.push2Placeholder();
+                try w.op(.JUMPI);
+                try w.push0();
+                try w.push0();
+                try w.op(.REVERT);
+                const ok_dest = w.offset();
+                w.patchU16(ok_patch, ok_dest);
+                try w.op(.JUMPDEST);
+            },
+            .auth_gate_begin => |ag| {
+                const name = self.getMirDataSlice(ag.name_offset, ag.name_len);
+                try w.pushU256BE(keccak256(name));
+                try w.op(.SLOAD);
+                try w.op(.CALLER);
+                try w.op(.EQ);
+                const ok_patch = try w.push2Placeholder();
+                try w.op(.JUMPI);
+                try w.push0();
+                try w.push0();
+                try w.op(.REVERT);
+                const ok_dest = w.offset();
+                w.patchU16(ok_patch, ok_dest);
+                try w.op(.JUMPDEST);
+            },
+            .auth_gate_end => {},
+
+            // ── Error throwing ─────────────────────────────────────────────
+            .throw_error => |te| {
+                // ABI-encode error and revert.
+                for (te.args, 0..) |arg, i| {
+                    try w.pushU32(rctx.memOf(arg));
+                    try w.op(.MLOAD);
+                    try w.pushU32(@intCast(4 + i * 32));
+                    try w.op(.MSTORE);
+                }
+                const total: u32 = 4 + @as(u32, @intCast(te.args.len)) * 32;
+                try w.pushU32(total);
+                try w.push0();
+                try w.op(.REVERT);
+            },
+
+            // ── Try/catch ─────────────────────────────────────────────────
+            .attempt_begin => {},
+            .attempt_end => {},
+
+            // ── ZK ────────────────────────────────────────────────────────
+            .zk_verify => {}, // No-op on EVM (ZK done off-chain).
+
+            // ── Asset operations (ERC-20 interop — placeholder) ───────────
+            .asset_send => {},
+            .asset_mint => {},
+            .asset_burn => {},
+            .asset_split => {},
+            .asset_merge => {},
+            .asset_wrap => {},
+            .asset_unwrap => {},
+
+            // ── Account lifecycle (no-op on EVM) ──────────────────────────
+            .expand_account => {},
+            .close_account => {},
+            .freeze_account => {},
+            .unfreeze_account => {},
+            .transfer_ownership => {},
+
+            // ── Scheduling (no-op on EVM, requires keeper) ────────────────
+            .schedule_call => {},
+
+            // ── VM-specific extended (no-op/placeholder on EVM) ───────────
+            .oracle_read => {},
+            .vrf_random => {},
+            .delegate_gas => {},
+            .has_check => {},
+
+            // ── const_i64 ─────────────────────────────────────────────────
+            .const_i64 => |c| {
+                var be: [32]u8 = [_]u8{0} ** 32;
+                if (c.value >= 0) {
+                    std.mem.writeInt(u64, be[24..32], @intCast(c.value), .big);
+                } else {
+                    // Sign-extend negative values to 256-bit.
+                    be = [_]u8{0xFF} ** 32;
+                    std.mem.writeInt(i64, @ptrCast(be[24..32]), c.value, .big);
+                }
+                try w.pushU256BE(be);
+                try w.pushU32(rctx.memOf(c.dst));
+                try w.op(.MSTORE);
+            },
+
+            // ── No-op / internal call ──────────────────────────────────────
+            .nop => {},
+            .call_internal => {},
+            .call_external => {},
+        }
+    }
+
+    /// Emit a REVERT with an Error(string) ABI-encoded reason.
+    fn mirEmitRevert(self: *EVMCodeGen, w: *EVMWriter, msg_offset: u32, msg_len: u32) anyerror!void {
+        // Error(string) selector = 0x08c379a0
+        const err_sel: u32 = 0x08c379a0;
+        try w.push4(err_sel);
+        try w.push1(0xe0);
+        try w.op(.SHL);
+        try w.push0();
+        try w.op(.MSTORE);
+        // ABI offset to string data = 0x20
+        try w.push1(0x20);
+        try w.push1(0x04);
+        try w.op(.MSTORE);
+        // String length.
+        try w.pushU32(msg_len);
+        try w.push1(0x24);
+        try w.op(.MSTORE);
+        // String data (from MIR data section).
+        if (msg_len > 0 and self.mir_data != null) {
+            const data = self.mir_data.?;
+            if (msg_offset + msg_len <= data.len) {
+                var bytes32: [32]u8 = [_]u8{0} ** 32;
+                const copy_len = @min(msg_len, 32);
+                @memcpy(bytes32[0..copy_len], data[msg_offset..][0..copy_len]);
+                try w.pushU256BE(bytes32);
+                try w.push1(0x44);
+                try w.op(.MSTORE);
+            }
+        }
+        // Total revert data = 4 + 32 + 32 + padded_msg
+        const padded = ((msg_len + 31) / 32) * 32;
+        const total_len = 4 + 32 + 32 + padded;
+        try w.pushU32(total_len);
+        try w.push0();
+        try w.op(.REVERT);
+    }
+
+    /// Find event name by ID.
+    fn findEventName(self: *EVMCodeGen, event_id: u32) ?[]const u8 {
+        for (self.mir_events) |ev| {
+            if (ev.event_id == event_id) return ev.name;
+        }
+        return null;
+    }
+
+    /// Build keccak256 hash of event signature for topic[0].
+    fn buildMirEventSig(self: *EVMCodeGen, name: []const u8, fields: []const mir_mod.EventFieldDesc) [32]u8 {
+        var buf = std.ArrayListUnmanaged(u8){};
+        defer buf.deinit(self.allocator);
+        buf.appendSlice(self.allocator, name) catch return [_]u8{0} ** 32;
+        buf.append(self.allocator, '(') catch return [_]u8{0} ** 32;
+        for (fields, 0..) |f, i| {
+            if (i > 0) buf.append(self.allocator, ',') catch {};
+            buf.appendSlice(self.allocator, evmAbiType(f.resolved)) catch {};
+        }
+        buf.append(self.allocator, ')') catch return [_]u8{0} ** 32;
+        return keccak256(buf.items);
+    }
+
+    /// Get a slice from the MIR data section.
+    fn getMirDataSlice(self: *EVMCodeGen, offset: u32, len: u32) []const u8 {
+        if (self.mir_data) |data| {
+            if (offset + len <= data.len) {
+                return data[offset..][0..len];
+            }
+        }
+        return "";
     }
 };
 
