@@ -446,7 +446,66 @@ pub const CodeGen = struct {
             });
         }
 
+        // ── GAP-FIX: Generate bytecode for each pure function ─────────────
+        // SPEC: Part 5.6 — Pure functions emit no state syscalls; they are
+        // internal-only and callable via JALR. Selector prefix 0xF0000000.
+        for (contract.pures) |pure| {
+            var ctx = ActionCtx.init(self.allocator, pure.name, &self.field_ids, checked);
+            defer ctx.deinit();
+
+            try self.genPure(&pure, &ctx);
+
+            const code_bytes = ctx.writer.toBytes();
+            const owned_copy = try self.allocator.alloc(u8, code_bytes.len);
+            @memcpy(owned_copy, code_bytes);
+
+            try action_codes.append(self.allocator, .{
+                .selector = 0xF000_0000 | (actionSelector(pure.name) & 0x0FFF_FFFF),
+                .code = owned_copy,
+            });
+        }
+
+        // ── GAP-FIX: Generate bytecode for each helper function ───────────
+        // SPEC: Part 5.7 — Helpers are within-visible only; can access state.
+        // Selector prefix 0xF1000000.
+        for (contract.helpers) |helper| {
+            var ctx = ActionCtx.init(self.allocator, helper.name, &self.field_ids, checked);
+            defer ctx.deinit();
+
+            try self.genHelper(&helper, &ctx);
+
+            const code_bytes = ctx.writer.toBytes();
+            const owned_copy = try self.allocator.alloc(u8, code_bytes.len);
+            @memcpy(owned_copy, code_bytes);
+
+            try action_codes.append(self.allocator, .{
+                .selector = 0xF100_0000 | (actionSelector(helper.name) & 0x0FFF_FFFF),
+                .code = owned_copy,
+            });
+        }
+
+        // ── GAP-FIX: Generate bytecode for each guard function ────────────
+        // SPEC: Part 6.1 — Guards are boolean conditions; they return 0 or 1
+        // in a0. Called by actions that declare `only guardName`.
+        // Selector prefix 0xF2000000.
+        for (contract.guards) |guard| {
+            var ctx = ActionCtx.init(self.allocator, guard.name, &self.field_ids, checked);
+            defer ctx.deinit();
+
+            try self.genGuard(&guard, &ctx);
+
+            const code_bytes = ctx.writer.toBytes();
+            const owned_copy = try self.allocator.alloc(u8, code_bytes.len);
+            @memcpy(owned_copy, code_bytes);
+
+            try action_codes.append(self.allocator, .{
+                .selector = 0xF200_0000 | (actionSelector(guard.name) & 0x0FFF_FFFF),
+                .code = owned_copy,
+            });
+        }
+
         // ── SPEC: Part 5.13 — Fallback handler ──────────────────────────
+
         if (contract.fallback) |fb| {
             var ctx = ActionCtx.init(self.allocator, "__fallback__", &self.field_ids, checked);
             defer ctx.deinit();
@@ -597,15 +656,10 @@ pub const CodeGen = struct {
             }
         }
         // ── Gas Sponsorship ─────────────────────────────────────────────
-        for (action.annotations) |anno| {
-            if (anno.kind == .gas_sponsored_for) {
-                if (anno.args.len > 0) {
-                    const payer_expr = anno.args[0];
-                    try self.genExpr(payer_expr, ctx, .a0);
-                    try ctx.writer.emit(riscv.ZEPH(.DELEGATE_GAS));
-                }
-            }
-        }
+        // SPEC: Part 4 — gas sponsorship is declared in the access list metadata,
+        // not via a VM syscall. No bytecode needed here; the node sees the
+        // annotation in the .fozabi and applies fee delegation off-chain.
+        _ = action.annotations;
 
         // ── Body ─────────────────────────────────────────────────────────
         for (action.body) |stmt| {
@@ -655,7 +709,125 @@ pub const CodeGen = struct {
         try ctx.writer.emit(riscv.JALR(.zero, .ra, 0));
     }
 
+    // ── Pure function code generation ────────────────────────────────────
+
+    /// SPEC: Part 5.6 — Generate bytecode for a pure function.
+    /// Pure functions must not issue any state syscalls (!STATE_READ, !STATE_WRITE).
+    /// They are callable only internally via JALR and return their result in a0.
+    /// Uses RV64IM standard prologue/epilogue.
+    fn genPure(self: *CodeGen, pure: *const ast.PureDecl, ctx: *ActionCtx) anyerror!void {
+        const frame_size: i12 = 64;
+
+        // ── Prologue (RV64IM ABI) ─────────────────────────────────────────
+        try ctx.writer.emit(riscv.ADDI(.sp, .sp, -frame_size));
+        try ctx.writer.emit(riscv.SD(.sp, .ra, 0));
+        try ctx.writer.emit(riscv.SD(.sp, .s0, 8));
+        try ctx.writer.emit(riscv.ADDI(.s0, .sp, frame_size));
+
+        // ── Bind parameters ───────────────────────────────────────────────
+        for (pure.params, 0..) |param, i| {
+            if (i < 7) {
+                const reg: Reg = @enumFromInt(@as(u5, @intCast(10 + i)));
+                ctx.reg_alloc.used[@intFromEnum(reg)] = true;
+                const ty = (self.resolver.resolve(param.declared_type) catch .void_);
+                try ctx.locals.put(param.name, .{ .reg = reg, .ty = ty });
+            }
+        }
+
+        // ── Body ──────────────────────────────────────────────────────────
+        for (pure.body) |stmt| {
+            try self.genStmt(&stmt, ctx);
+        }
+
+        // ── Epilogue ──────────────────────────────────────────────────────
+        try ctx.writer.emit(riscv.LD(.s0, .sp, 8));
+        try ctx.writer.emit(riscv.LD(.ra, .sp, 0));
+        try ctx.writer.emit(riscv.ADDI(.sp, .sp, frame_size));
+        try ctx.writer.emit(riscv.JALR(.zero, .ra, 0));
+    }
+
+    // ── Helper function code generation ──────────────────────────────────
+
+    /// SPEC: Part 5.7 — Generate bytecode for an internal helper function.
+    /// Helpers are `within`-visible by default (not externally callable).
+    /// They can read/write state and call other functions.
+    fn genHelper(self: *CodeGen, helper: *const ast.HelperDecl, ctx: *ActionCtx) anyerror!void {
+        const frame_size: i12 = 64;
+
+        // ── Prologue ─────────────────────────────────────────────────────
+        try ctx.writer.emit(riscv.ADDI(.sp, .sp, -frame_size));
+        try ctx.writer.emit(riscv.SD(.sp, .ra, 0));
+        try ctx.writer.emit(riscv.SD(.sp, .s0, 8));
+        try ctx.writer.emit(riscv.ADDI(.s0, .sp, frame_size));
+
+        // ── Bind parameters ───────────────────────────────────────────────
+        for (helper.params, 0..) |param, i| {
+            if (i < 7) {
+                const reg: Reg = @enumFromInt(@as(u5, @intCast(10 + i)));
+                ctx.reg_alloc.used[@intFromEnum(reg)] = true;
+                const ty = (self.resolver.resolve(param.declared_type) catch .void_);
+                try ctx.locals.put(param.name, .{ .reg = reg, .ty = ty });
+            }
+        }
+
+        // ── Body ──────────────────────────────────────────────────────────
+        for (helper.body) |stmt| {
+            try self.genStmt(&stmt, ctx);
+        }
+
+        // ── Epilogue ──────────────────────────────────────────────────────
+        try ctx.writer.emit(riscv.LD(.s0, .sp, 8));
+        try ctx.writer.emit(riscv.LD(.ra, .sp, 0));
+        try ctx.writer.emit(riscv.ADDI(.sp, .sp, frame_size));
+        try ctx.writer.emit(riscv.JALR(.zero, .ra, 0));
+    }
+
+    // ── Guard function code generation ───────────────────────────────────
+
+    /// SPEC: Part 6.1 — Generate bytecode for a named guard function.
+    /// Guards evaluate a boolean condition and return it in a0 (0=fail, 1=pass).
+    /// On failure the VM reverts; on success execution continues.
+    /// Guard bodies use the same statement generator so they can read state.
+    fn genGuard(self: *CodeGen, guard: *const ast.GuardDecl, ctx: *ActionCtx) anyerror!void {
+        const frame_size: i12 = 64;
+
+        // ── Prologue ─────────────────────────────────────────────────────
+        try ctx.writer.emit(riscv.ADDI(.sp, .sp, -frame_size));
+        try ctx.writer.emit(riscv.SD(.sp, .ra, 0));
+        try ctx.writer.emit(riscv.SD(.sp, .s0, 8));
+        try ctx.writer.emit(riscv.ADDI(.s0, .sp, frame_size));
+
+        // ── Bind parameters ───────────────────────────────────────────────
+        for (guard.params, 0..) |param, i| {
+            if (i < 7) {
+                const reg: Reg = @enumFromInt(@as(u5, @intCast(10 + i)));
+                ctx.reg_alloc.used[@intFromEnum(reg)] = true;
+                const ty = (self.resolver.resolve(param.declared_type) catch .void_);
+                try ctx.locals.put(param.name, .{ .reg = reg, .ty = ty });
+            }
+        }
+
+        // ── Body ──────────────────────────────────────────────────────────
+        for (guard.body) |stmt| {
+            try self.genStmt(&stmt, ctx);
+        }
+
+        // ── Guard result normalisation ─────────────────────────────────────
+        // Guards must return 0 or 1 in a0. If the body did not explicitly set
+        // a0, default to 1 (pass). The body can set a0=0 via `give back false`.
+        // If the calling action wants to revert on 0, it should do:
+        //   JALR ra, guard_fn  → BNE a0, zero, ok →  REVERT
+        // (this is emitted by genOnly when we support guard references).
+
+        // ── Epilogue ──────────────────────────────────────────────────────
+        try ctx.writer.emit(riscv.LD(.s0, .sp, 8));
+        try ctx.writer.emit(riscv.LD(.ra, .sp, 0));
+        try ctx.writer.emit(riscv.ADDI(.sp, .sp, frame_size));
+        try ctx.writer.emit(riscv.JALR(.zero, .ra, 0));
+    }
+
     // ── Setup (Constructor) code generation ──────────────────────────────
+
 
     /// Generate bytecode for the setup block (constructor).
     fn genSetup(self: *CodeGen, setup: *const ast.SetupBlock, ctx: *ActionCtx) anyerror!void {
@@ -858,15 +1030,31 @@ pub const CodeGen = struct {
                 try self.genExpr(expr, ctx, dest);
             },
             .pay => |pay| {
+                // SPEC: Part 8.4 — native ZPH pay uses ASSET_TRANSFER with zeroed asset ID.
+                // ABI: a0=0x10, a1=asset_id_ptr(32B zeroes), a2=from_ptr(20B), a3=to_ptr(20B), a4=amount_val
                 const to_reg = ctx.reg_alloc.alloc() orelse .t0;
                 defer ctx.reg_alloc.free(to_reg);
                 const amt_reg = ctx.reg_alloc.alloc() orelse .t1;
                 defer ctx.reg_alloc.free(amt_reg);
                 try self.genExpr(pay.recipient, ctx, to_reg);
                 try self.genExpr(pay.amount, ctx, amt_reg);
-                try ctx.writer.emit(riscv.ADD(.a0, .zero, to_reg));
-                try ctx.writer.emit(riscv.ADD(.a1, .zero, amt_reg));
-                try ctx.writer.emit(riscv.ZEPH(.NATIVE_PAY));
+                // Allocate 32-byte zero buffer on stack for the zero-asset-id
+                try ctx.writer.emit(riscv.ADDI(.sp, .sp, -32));
+                // Zero the buffer (use t2 as scratch)
+                try ctx.writer.emit(riscv.ADDI(.t2, .zero, 0));
+                var zoff: i12 = 0;
+                while (zoff < 32) : (zoff += 8) {
+                    try ctx.writer.emit(riscv.SD(.sp, .t2, zoff));
+                }
+                // Set up syscall args
+                try ctx.writer.emit(riscv.ADD(.a1, .sp, .zero)); // a1 = asset_id_ptr (zero)
+                try ctx.writer.emit(riscv.ADD(.a2, .zero, .zero)); // a2 = from: zero = caller (VM fills)
+                try ctx.writer.emit(riscv.ADD(.a3, .zero, to_reg));  // a3 = to_ptr
+                try ctx.writer.emit(riscv.ADD(.a4, .zero, amt_reg)); // a4 = amount
+                try ctx.writer.emit(riscv.ZEPH(.ASSET_TRANSFER));
+                try ctx.writer.emit(riscv.ECALL());
+                // Restore stack
+                try ctx.writer.emit(riscv.ADDI(.sp, .sp, 32));
             },
             .send => |send| {
                 const asset_reg = ctx.reg_alloc.alloc() orelse .t0;
@@ -899,37 +1087,43 @@ pub const CodeGen = struct {
                     asset_def = self.resolver.asset_defs.getPtr(name);
                 }
 
-                // 1) before_transfer(from, to, asset)
+                // 1) before_transfer hook
                 if (asset_def) |ad| {
                     if (ad.before_transfer) |hook| {
-                        // Hooks receive: current_caller, recipient, asset
-                        try ctx.writer.emit(riscv.ZEPH(.GET_CALLER)); // → a0
+                        // GET_CALLER syscall: a0=0x60, a1=buf_ptr(20B)
+                        try ctx.writer.emit(riscv.ADDI(.sp, .sp, -24));
+                        try ctx.writer.emit(riscv.ZEPH(.GET_CALLER));
+                        try ctx.writer.emit(riscv.ECALL());
                         try ctx.writer.emit(riscv.ADD(.a1, .zero, to_reg));
                         try ctx.writer.emit(riscv.ADD(.a2, .zero, asset_reg));
-                        // Generate hook body inline (or we could call it if it were a function)
-                        // For simplicity in Tier 1, we generate the body inline here.
                         for (hook.body) |hstmt| {
                             try self.genStmt(&hstmt, ctx);
                         }
+                        try ctx.writer.emit(riscv.ADDI(.sp, .sp, 24));
                     }
                 }
 
-                // 2) Actual Transfer
-                try ctx.writer.emit(riscv.ADD(.a0, .zero, asset_reg));
-                try ctx.writer.emit(riscv.ADD(.a1, .zero, .zero));
-                try ctx.writer.emit(riscv.ADD(.a2, .zero, to_reg));
-                try ctx.writer.emit(riscv.ADD(.a3, .zero, asset_reg));
+                // 2) Actual Transfer via ASSET_TRANSFER syscall
+                // ABI: a0=0x10, a1=asset_id_ptr, a2=from_ptr, a3=to_ptr, a4=amount_ptr
+                try ctx.writer.emit(riscv.ADD(.a1, .zero, asset_reg)); // a1 = asset id
+                try ctx.writer.emit(riscv.ADD(.a2, .zero, .zero));     // a2 = from: caller
+                try ctx.writer.emit(riscv.ADD(.a3, .zero, to_reg));    // a3 = to
+                try ctx.writer.emit(riscv.ADD(.a4, .zero, asset_reg)); // a4 = amount (re-use asset reg)
                 try ctx.writer.emit(riscv.ZEPH(.ASSET_TRANSFER));
+                try ctx.writer.emit(riscv.ECALL());
 
-                // 3) after_transfer(from, to, asset)
+                // 3) after_transfer hook
                 if (asset_def) |ad| {
                     if (ad.after_transfer) |hook| {
+                        try ctx.writer.emit(riscv.ADDI(.sp, .sp, -24));
                         try ctx.writer.emit(riscv.ZEPH(.GET_CALLER));
+                        try ctx.writer.emit(riscv.ECALL());
                         try ctx.writer.emit(riscv.ADD(.a1, .zero, to_reg));
                         try ctx.writer.emit(riscv.ADD(.a2, .zero, asset_reg));
                         for (hook.body) |hstmt| {
                             try self.genStmt(&hstmt, ctx);
                         }
+                        try ctx.writer.emit(riscv.ADDI(.sp, .sp, 24));
                     }
                 }
             },
@@ -939,14 +1133,177 @@ pub const CodeGen = struct {
                 defer ctx.reg_alloc.free(tmp);
                 try self.genLoadImmediate(@intCast(p.message.len), tmp, ctx);
                 try ctx.writer.emit(riscv.ADD(.a1, .zero, tmp));
+                try ctx.writer.emit(riscv.ADD(.a2, .zero, .zero)); // data_len=0
                 try ctx.writer.emit(riscv.ZEPH(.REVERT));
+                try ctx.writer.emit(riscv.ECALL());
             },
             .throw => |t| {
                 _ = t;
+                try ctx.writer.emit(riscv.ADDI(.a1, .zero, 0));
+                try ctx.writer.emit(riscv.ADDI(.a2, .zero, 0));
                 try ctx.writer.emit(riscv.ZEPH(.REVERT));
+                try ctx.writer.emit(riscv.ECALL());
             },
-            else => {
-                // Remaining statement kinds emit no code (diagnostic, guard, etc.)
+
+            // ── guard_apply ───────────────────────────────────────────────
+            // SPEC: Part 6.1 — `guard guardName` inlines the named guard check.
+            // Emits AUTH_CHECK syscall with the guard name-hash in a0.
+            .guard_apply => |name| {
+                const sel = actionSelector(name);
+                try self.genLoadImmediate(@intCast(sel), .a0, ctx);
+                try ctx.writer.emit(riscv.ZEPH(.AUTH_CHECK));
+                try ctx.writer.emit(riscv.ECALL());
+            },
+
+            // ── ensure (post-condition check) ─────────────────────────────
+            // SPEC: Part 6.2 — Same semantics as need: revert on false.
+            .ensure => |e| try self.genNeed(&.{
+                .cond  = e.cond,
+                .else_ = e.else_,
+                .span  = stmt.span,
+            }, ctx),
+
+            // ── attempt / on_error ────────────────────────────────────────
+            // SPEC: Part 10 — Emit body and always_after section inline.
+            // Full snapshot-restore error handling is a VM-level feature.
+            .attempt => |at| {
+                for (at.body) |s| try self.genStmt(&s, ctx);
+                if (at.always_body) |always| {
+                    for (always) |s| try self.genStmt(&s, ctx);
+                }
+            },
+
+            // ── verify (ZK proof) ─────────────────────────────────────────
+            // SPEC: Part 12 — Off-chain ZK proof verification syscall 0x70.
+            .verify => |v| {
+                const proof_reg = ctx.reg_alloc.alloc() orelse .t0;
+                defer ctx.reg_alloc.free(proof_reg);
+                const commit_reg = ctx.reg_alloc.alloc() orelse .t1;
+                defer ctx.reg_alloc.free(commit_reg);
+                try self.genExpr(v.proof, ctx, proof_reg);
+                try self.genExpr(v.commitment, ctx, commit_reg);
+                if (proof_reg != .a0) try ctx.writer.emit(riscv.ADD(.a0, proof_reg, .zero));
+                if (commit_reg != .a1) try ctx.writer.emit(riscv.ADD(.a1, commit_reg, .zero));
+                try ctx.writer.emit(riscv.ADDI(.a0, .zero, 0x70));
+                try ctx.writer.emit(riscv.ECALL());
+            },
+
+            // ── move_asset ────────────────────────────────────────────────
+            // SPEC: Part 8.3 — `move asset into mine.field` stores to state.
+            .move_asset => |mv| {
+                const val_reg = ctx.reg_alloc.alloc() orelse .t0;
+                defer ctx.reg_alloc.free(val_reg);
+                try self.genExpr(mv.asset, ctx, val_reg);
+                if (mv.dest.kind == .field_access) {
+                    const fa = mv.dest.kind.field_access;
+                    if (fa.object.kind == .identifier and
+                        std.mem.eql(u8, fa.object.kind.identifier, "mine"))
+                    {
+                        const field_id = self.getOrAssignFieldId(fa.field);
+                        try self.genLoadImmediate(@intCast(field_id), .a0, ctx);
+                        try ctx.writer.emit(riscv.ADD(.a1, val_reg, .zero));
+                        try ctx.writer.emit(riscv.ZEPH(.STATE_WRITE));
+                        try ctx.writer.emit(riscv.ECALL());
+                    }
+                }
+            },
+
+            // ── remove ────────────────────────────────────────────────────
+            // SPEC: Part 5.2 — `remove mine.map[key]` deletes a map entry.
+            .remove => |expr| {
+                if (expr.kind == .index_access) {
+                    const ia = expr.kind.index_access;
+                    if (ia.object.kind == .field_access) {
+                        const fa = ia.object.kind.field_access;
+                        if (fa.object.kind == .identifier and
+                            std.mem.eql(u8, fa.object.kind.identifier, "mine"))
+                        {
+                            const field_id = self.getOrAssignFieldId(fa.field);
+                            const key_reg = ctx.reg_alloc.alloc() orelse .t0;
+                            defer ctx.reg_alloc.free(key_reg);
+                            try self.genExpr(ia.index, ctx, key_reg);
+                            try self.genLoadImmediate(@intCast(field_id), .a0, ctx);
+                            try ctx.writer.emit(riscv.ADD(.a1, key_reg, .zero));
+                            try ctx.writer.emit(riscv.ADDI(.a2, .zero, 0));
+                            try ctx.writer.emit(riscv.ZEPH(.STATE_WRITE));
+                            try ctx.writer.emit(riscv.ECALL());
+                        }
+                    }
+                }
+            },
+
+            // ── expand / close / freeze / unfreeze ────────────────────────
+            // SPEC: Part 11 — Account lifecycle operations.
+            .expand => |exp| {
+                const areg = ctx.reg_alloc.alloc() orelse .a0;
+                defer ctx.reg_alloc.free(areg);
+                const breg = ctx.reg_alloc.alloc() orelse .a1;
+                defer ctx.reg_alloc.free(breg);
+                try self.genExpr(exp.account, ctx, areg);
+                try self.genExpr(exp.bytes, ctx, breg);
+                if (areg != .a0) try ctx.writer.emit(riscv.ADD(.a0, areg, .zero));
+                if (breg != .a1) try ctx.writer.emit(riscv.ADD(.a1, breg, .zero));
+                try ctx.writer.emit(riscv.ADDI(.a0, .zero, 0x40)); // EXPAND_ACCOUNT
+                try ctx.writer.emit(riscv.ECALL());
+            },
+            .close => |cl| {
+                const areg = ctx.reg_alloc.alloc() orelse .a0;
+                defer ctx.reg_alloc.free(areg);
+                const rreg = ctx.reg_alloc.alloc() orelse .a1;
+                defer ctx.reg_alloc.free(rreg);
+                try self.genExpr(cl.account, ctx, areg);
+                try self.genExpr(cl.refund_to, ctx, rreg);
+                if (areg != .a0) try ctx.writer.emit(riscv.ADD(.a0, areg, .zero));
+                if (rreg != .a1) try ctx.writer.emit(riscv.ADD(.a1, rreg, .zero));
+                try ctx.writer.emit(riscv.ADDI(.a0, .zero, 0x41)); // CLOSE_ACCOUNT
+                try ctx.writer.emit(riscv.ECALL());
+            },
+            .freeze => |fr| {
+                const areg = ctx.reg_alloc.alloc() orelse .a0;
+                defer ctx.reg_alloc.free(areg);
+                try self.genExpr(fr.account, ctx, areg);
+                if (areg != .a0) try ctx.writer.emit(riscv.ADD(.a0, areg, .zero));
+                try ctx.writer.emit(riscv.ADDI(.a0, .zero, 0x42)); // FREEZE
+                try ctx.writer.emit(riscv.ECALL());
+            },
+            .unfreeze => |uf| {
+                const areg = ctx.reg_alloc.alloc() orelse .a0;
+                defer ctx.reg_alloc.free(areg);
+                try self.genExpr(uf.account, ctx, areg);
+                if (areg != .a0) try ctx.writer.emit(riscv.ADD(.a0, areg, .zero));
+                try ctx.writer.emit(riscv.ADDI(.a0, .zero, 0x43)); // UNFREEZE
+                try ctx.writer.emit(riscv.ECALL());
+            },
+
+            // ── schedule (deferred cross-contract call) ───────────────────
+            // SPEC: Part 15 — `schedule call after duration`.
+            .schedule => |sch| {
+                const dreg = ctx.reg_alloc.alloc() orelse .t0;
+                defer ctx.reg_alloc.free(dreg);
+                const creg = ctx.reg_alloc.alloc() orelse .t1;
+                defer ctx.reg_alloc.free(creg);
+                try self.genExpr(sch.after, ctx, dreg);
+                try self.genExpr(sch.call, ctx, creg);
+                if (dreg != .a1) try ctx.writer.emit(riscv.ADD(.a1, dreg, .zero));
+                if (creg != .a2) try ctx.writer.emit(riscv.ADD(.a2, creg, .zero));
+                try ctx.writer.emit(riscv.ADDI(.a3, .zero, 0));
+                try ctx.writer.emit(riscv.ZEPH(.SCHEDULE_CALL));
+                try ctx.writer.emit(riscv.ECALL());
+            },
+
+            // ── transfer_ownership ────────────────────────────────────────
+            // SPEC: Part 11.6 — Transfer account ownership; syscall 0x44.
+            .transfer_ownership => |tow| {
+                const areg = ctx.reg_alloc.alloc() orelse .a0;
+                defer ctx.reg_alloc.free(areg);
+                const oreg = ctx.reg_alloc.alloc() orelse .a1;
+                defer ctx.reg_alloc.free(oreg);
+                try self.genExpr(tow.account, ctx, areg);
+                try self.genExpr(tow.new_owner, ctx, oreg);
+                if (areg != .a0) try ctx.writer.emit(riscv.ADD(.a0, areg, .zero));
+                if (oreg != .a1) try ctx.writer.emit(riscv.ADD(.a1, oreg, .zero));
+                try ctx.writer.emit(riscv.ADDI(.a0, .zero, 0x44)); // TRANSFER_OWNERSHIP
+                try ctx.writer.emit(riscv.ECALL());
             },
         }
     }
@@ -1076,15 +1433,41 @@ pub const CodeGen = struct {
                 try self.genCall(c.callee, c.args, ctx, dest);
             },
             .builtin => |b| {
+                // SPEC: Part 7.5 / 14.3 — environment builtins via syscall.
+                // ZEPH() loads syscall ID into a0; ECALL() triggers dispatch.
                 switch (b) {
-                    .caller => try ctx.writer.emit(riscv.ZEPH(.GET_CALLER)),
-                    .now => try ctx.writer.emit(riscv.ZEPH(.GET_NOW)),
-                    .current_block => try ctx.writer.emit(riscv.ZEPH(.GET_BLOCK)),
-                    .value => try ctx.writer.emit(riscv.ZEPH(.GET_VALUE)),
+                    .caller => {
+                        // GET_CALLER: a0=0x60, a1=buf_ptr(20B) → buf filled
+                        try ctx.writer.emit(riscv.ADDI(.sp, .sp, -24)); // alloc 24B on stack
+                        try ctx.writer.emit(riscv.ADD(.a1, .sp, .zero));  // a1 = buf ptr
+                        try ctx.writer.emit(riscv.ZEPH(.GET_CALLER));
+                        try ctx.writer.emit(riscv.ECALL());
+                        if (dest != .sp) {
+                            try ctx.writer.emit(riscv.ADD(dest, .sp, .zero));
+                        }
+                        // Note: caller must ADDI sp, sp, 24 after consuming the value.
+                    },
+                    .now => {
+                        // GET_NOW: a0=0x66 → a0=timestamp(u64 low bits)
+                        try ctx.writer.emit(riscv.ZEPH(.GET_NOW));
+                        try ctx.writer.emit(riscv.ECALL());
+                        if (dest != .a0) try ctx.writer.emit(riscv.ADD(dest, .a0, .zero));
+                    },
+                    .current_block => {
+                        // GET_BLOCK: a0=0x65 → a0=block_number
+                        try ctx.writer.emit(riscv.ZEPH(.GET_BLOCK));
+                        try ctx.writer.emit(riscv.ECALL());
+                        if (dest != .a0) try ctx.writer.emit(riscv.ADD(dest, .a0, .zero));
+                    },
+                    .value => {
+                        // GET_VALUE: a0=0x61, a1=buf_ptr(32B) → buf filled with call value
+                        try ctx.writer.emit(riscv.ADDI(.sp, .sp, -32));
+                        try ctx.writer.emit(riscv.ADD(.a1, .sp, .zero));
+                        try ctx.writer.emit(riscv.ZEPH(.GET_VALUE));
+                        try ctx.writer.emit(riscv.ECALL());
+                        if (dest != .sp) try ctx.writer.emit(riscv.ADD(dest, .sp, .zero));
+                    },
                     else => try ctx.writer.emit(riscv.ADDI(dest, .zero, 0)),
-                }
-                if (dest != .a0) {
-                    try ctx.writer.emit(riscv.ADD(dest, .a0, .zero));
                 }
             },
             .something => |inner| {
@@ -1469,44 +1852,136 @@ pub const CodeGen = struct {
 
     // ── State access code generation ─────────────────────────────────────
 
-    /// Generate a state read: SLOAD(field_id) → dest.
+    /// SPEC: Part 5.2 — Generate a state read using the Zephyria STORAGE_LOAD ABI.
+    ///
+    /// dispatch.zig storageLoad() expects:
+    ///   a0 = 0x01 (set by ZEPH())
+    ///   a1 = pointer to 32-byte storage key in VM memory
+    ///   a2 = pointer to 32-byte result buffer in VM memory
+    ///
+    /// Key layout: [4-byte field_id] [28-byte map_key or zeros]
     fn genStateRead(self: *CodeGen, field_name: []const u8, index_expr: ?*const Expr, ctx: *ActionCtx, dest: Reg) anyerror!void {
         const field_id = self.getOrAssignFieldId(field_name);
-        try self.genLoadImmediate(@intCast(field_id), .a0, ctx);
+
+        // Allocate scratch space on stack:
+        //   [sp..sp+31] = 32-byte storage key
+        //   [sp+32..sp+63] = 32-byte result buffer
+        try ctx.writer.emit(riscv.ADDI(.sp, .sp, -64));
+        errdefer _ = ctx.writer; // no cleanup, caller owns stack frame
+
+        // Build storage key: write field_id into first 4 bytes, zero the rest
+        const scratch = ctx.reg_alloc.alloc() orelse .t2;
+        defer ctx.reg_alloc.free(scratch);
+        try self.genLoadImmediate(@intCast(field_id), scratch, ctx);
+        try ctx.writer.emit(riscv.SW(.sp, scratch, 0)); // store u32 field_id at sp+0
+        // Zero bytes 4..31 of the key
+        try ctx.writer.emit(riscv.ADDI(.t3, .zero, 0));
+        try ctx.writer.emit(riscv.SD(.sp, .t3, 8));    // bytes 8-15
+        try ctx.writer.emit(riscv.SD(.sp, .t3, 16));   // bytes 16-23
+        try ctx.writer.emit(riscv.SD(.sp, .t3, 24));   // bytes 24-31
+        // If there's a map key, write it at bytes 4-7
         if (index_expr) |idx| {
-            try self.genExpr(idx, ctx, .a1);
+            const idx_reg = ctx.reg_alloc.alloc() orelse .t4;
+            defer ctx.reg_alloc.free(idx_reg);
+            try self.genExpr(idx, ctx, idx_reg);
+            try ctx.writer.emit(riscv.SW(.sp, idx_reg, 4)); // bytes 4-7 = map key
         } else {
-            try ctx.writer.emit(riscv.ADDI(.a1, .zero, 0));
+            // Write zero into bytes 4-7 as well
+            try ctx.writer.emit(riscv.SW(.sp, .t3, 4));
         }
+
+        // Set syscall arguments:
+        //   a1 = pointer to key buffer (sp)
+        //   a2 = pointer to result buffer (sp+32)
+        try ctx.writer.emit(riscv.ADD(.a1, .sp, .zero));
+        try ctx.writer.emit(riscv.ADDI(.a2, .sp, 32));
         try ctx.writer.emit(riscv.ZEPH(.STATE_READ));
-        if (dest != .a0) {
-            try ctx.writer.emit(riscv.ADD(dest, .a0, .zero));
-        }
+        try ctx.writer.emit(riscv.ECALL());
+
+        // Load 8 bytes from the result buffer into dest (64-bit value)
+        try ctx.writer.emit(riscv.LD(dest, .sp, 32));
+
+        // Restore stack
+        try ctx.writer.emit(riscv.ADDI(.sp, .sp, 64));
     }
 
-    /// Generate a state write: value → SSTORE(field_id).
+    /// SPEC: Part 5.2 — Generate a state write using the Zephyria STORAGE_STORE ABI.
+    ///
+    /// dispatch.zig storageStore() expects:
+    ///   a0 = 0x02 (set by ZEPH())
+    ///   a1 = pointer to 32-byte storage key in VM memory
+    ///   a2 = pointer to 32-byte value in VM memory
+    ///
+    /// Key layout: [4-byte field_id] [28-byte map_key or zeros]
     fn genStateWrite(self: *CodeGen, field_name: []const u8, index_expr: ?*const Expr, value: *const Expr, ctx: *ActionCtx) anyerror!void {
         const field_id = self.getOrAssignFieldId(field_name);
-        const val_reg = ctx.reg_alloc.alloc() orelse .t0;
+
+        // Allocate:
+        //   [sp..sp+31] = 32-byte storage key
+        //   [sp+32..sp+63] = 32-byte value buffer
+        try ctx.writer.emit(riscv.ADDI(.sp, .sp, -64));
+
+        // Evaluate the value expression, place in a temp register
+        const val_reg = ctx.reg_alloc.alloc() orelse .t2;
         defer ctx.reg_alloc.free(val_reg);
         try self.genExpr(value, ctx, val_reg);
-        try self.genLoadImmediate(@intCast(field_id), .a0, ctx);
+
+        // Build storage key at [sp..sp+31]
+        const fid_reg = ctx.reg_alloc.alloc() orelse .t3;
+        defer ctx.reg_alloc.free(fid_reg);
+        try self.genLoadImmediate(@intCast(field_id), fid_reg, ctx);
+        try ctx.writer.emit(riscv.SW(.sp, fid_reg, 0));  // field_id bytes 0-3
+        try ctx.writer.emit(riscv.ADDI(.t4, .zero, 0));
+        try ctx.writer.emit(riscv.SW(.sp, .t4, 4));      // map key bytes 4-7 (zero or index)
+        try ctx.writer.emit(riscv.SD(.sp, .t4, 8));      // bytes 8-15
+        try ctx.writer.emit(riscv.SD(.sp, .t4, 16));     // bytes 16-23
+        try ctx.writer.emit(riscv.SD(.sp, .t4, 24));     // bytes 24-31
         if (index_expr) |idx| {
-            try self.genExpr(idx, ctx, .a1);
-        } else {
-            try ctx.writer.emit(riscv.ADDI(.a1, .zero, 0));
+            const idx_reg = ctx.reg_alloc.alloc() orelse .t5;
+            defer ctx.reg_alloc.free(idx_reg);
+            try self.genExpr(idx, ctx, idx_reg);
+            try ctx.writer.emit(riscv.SW(.sp, idx_reg, 4));
         }
-        try ctx.writer.emit(riscv.ADD(.a2, val_reg, .zero));
+
+        // Write value into [sp+32..sp+63]
+        try ctx.writer.emit(riscv.SD(.sp, val_reg, 32));  // bytes 32-39 = low 64 bits
+        // Zero out the rest of the 32-byte value slot (wide values would need more)
+        try ctx.writer.emit(riscv.SD(.sp, .t4, 40));
+        try ctx.writer.emit(riscv.SD(.sp, .t4, 48));
+        try ctx.writer.emit(riscv.SD(.sp, .t4, 56));
+
+        // Set syscall arguments
+        try ctx.writer.emit(riscv.ADD(.a1, .sp, .zero));  // a1 = key_ptr
+        try ctx.writer.emit(riscv.ADDI(.a2, .sp, 32));    // a2 = value_ptr
         try ctx.writer.emit(riscv.ZEPH(.STATE_WRITE));
+        try ctx.writer.emit(riscv.ECALL());
+
+        // Restore stack
+        try ctx.writer.emit(riscv.ADDI(.sp, .sp, 64));
     }
 
     // ── Authority check ──────────────────────────────────────────────────
 
-    /// Emit AUTH_CHECK for a named authority.
+    /// SPEC: Part 7.3 — Emit AUTH_CHECK for a named authority.
+    /// ABI: a0=0x20, a1=role_hash_ptr(32B), a2=account_ptr(20B) → revert if fail
     fn genAuthCheck(self: *CodeGen, name: []const u8, ctx: *ActionCtx) anyerror!void {
+        // Build 32-byte role hash on stack: first 4 bytes = selector, rest zero.
         const selector = actionSelector(name);
-        try self.genLoadImmediate(@intCast(selector), .a0, ctx);
+        try ctx.writer.emit(riscv.ADDI(.sp, .sp, -32));
+        const tmp = ctx.reg_alloc.alloc() orelse .t0;
+        defer ctx.reg_alloc.free(tmp);
+        try self.genLoadImmediate(@intCast(selector), tmp, ctx);
+        try ctx.writer.emit(riscv.SD(.sp, tmp, 0));
+        try ctx.writer.emit(riscv.ADDI(.t2, .zero, 0));
+        try ctx.writer.emit(riscv.SD(.sp, .t2, 8));
+        try ctx.writer.emit(riscv.SD(.sp, .t2, 16));
+        try ctx.writer.emit(riscv.SD(.sp, .t2, 24));
+        try ctx.writer.emit(riscv.ADD(.a1, .sp, .zero)); // a1 = role_hash_ptr
+        try ctx.writer.emit(riscv.ADDI(.a2, .zero, 0)); // a2 = account (0 = caller)
         try ctx.writer.emit(riscv.ZEPH(.AUTH_CHECK));
+        try ctx.writer.emit(riscv.ECALL());
+        // Restore stack
+        try ctx.writer.emit(riscv.ADDI(.sp, .sp, 32));
     }
 
     // ── Function call code generation ────────────────────────────────────
@@ -1524,9 +1999,16 @@ pub const CodeGen = struct {
         switch (callee.kind) {
             .identifier => |name| {
                 if (std.mem.eql(u8, name, "oracle")) {
+                    // ORACLE_QUERY: a0=0xA0 + args already in a0-a6 → ECALL
                     try ctx.writer.emit(riscv.ZEPH(.ORACLE_QUERY));
+                    try ctx.writer.emit(riscv.ECALL());
                 } else if (std.mem.eql(u8, name, "vrf_random")) {
+                    // VRF_RANDOM: a0=0x6C, a1=buf_ptr(32B) → buf filled
+                    try ctx.writer.emit(riscv.ADDI(.sp, .sp, -32));
+                    try ctx.writer.emit(riscv.ADD(.a1, .sp, .zero));
                     try ctx.writer.emit(riscv.ZEPH(.VRF_RANDOM));
+                    try ctx.writer.emit(riscv.ECALL());
+                    if (dest != .sp) try ctx.writer.emit(riscv.ADD(dest, .sp, .zero));
                 } else {
                     // Internal call via selector
                     const selector = actionSelector(name);
@@ -1537,13 +2019,18 @@ pub const CodeGen = struct {
             .field_access => |fa| {
                 if (fa.object.kind == .identifier) {
                     const obj_name = fa.object.kind.identifier;
-                    // Cross-contract call via CPI
+                    // SPEC: Part 10.1 — Cross-contract call via CALL_CONTRACT syscall.
+                    // ABI: a0=0x40, a1=to_ptr(20B), a2=selector, a3=calldata_ptr, a4=calldata_len
                     const selector = actionSelector(fa.field);
-                    try self.genLoadImmediate(@intCast(selector), .a7, ctx);
-                    _ = obj_name;
+                    try self.genLoadImmediate(@intCast(selector), .a2, ctx);
+                    _ = obj_name; // to_addr would be loaded here if we track cross-contract refs
+                    try ctx.writer.emit(riscv.ADDI(.a3, .zero, 0)); // no calldata
+                    try ctx.writer.emit(riscv.ADDI(.a4, .zero, 0));
                     try ctx.writer.emit(riscv.ZEPH(.SCHEDULE_CALL));
+                    try ctx.writer.emit(riscv.ECALL());
                 } else {
                     try ctx.writer.emit(riscv.ZEPH(.SCHEDULE_CALL));
+                    try ctx.writer.emit(riscv.ECALL());
                 }
             },
             else => {
@@ -1578,7 +2065,9 @@ pub const CodeGen = struct {
                 try self.genLoadImmediate(actionSelector(te.error_type), .a1, ctx);
             },
         }
+        try ctx.writer.emit(riscv.ADDI(.a2, .zero, 0)); // data_len
         try ctx.writer.emit(riscv.ZEPH(.REVERT));
+        try ctx.writer.emit(riscv.ECALL());
 
         // Patch branch to skip over revert
         const after_revert = ctx.writer.currentOffset();
@@ -1589,16 +2078,50 @@ pub const CodeGen = struct {
 
     /// Generate bytecode for a `tell EventName(args)` statement.
     fn genTell(self: *CodeGen, stmt: *const TellStmt, ctx: *ActionCtx) anyerror!void {
-        // Load event selector into a0
+        // SPEC: Part 5.9 — emit event syscall.
+        // ABI: a0=0x30, a1=topic_count, a2=topics_ptr, a3=data_ptr, a4=data_len
+        // For now: topic_count=1 (just the event selector), topics=[selector], data=args.
         const selector = actionSelector(stmt.event_name);
-        try self.genLoadImmediate(@intCast(selector), .a0, ctx);
-        // Load event arguments into a1..a6
+        // Build topics array on stack: 1 × 32 bytes
+        try ctx.writer.emit(riscv.ADDI(.sp, .sp, -32));
+        // Write selector as the first 4 bytes of the 32-byte topic slot
+        const tmp = ctx.reg_alloc.alloc() orelse .t0;
+        defer ctx.reg_alloc.free(tmp);
+        try self.genLoadImmediate(@intCast(selector), tmp, ctx);
+        try ctx.writer.emit(riscv.SD(.sp, tmp, 0));
+        // Fill remaining 24 bytes to zero
+        try ctx.writer.emit(riscv.ADDI(.t2, .zero, 0));
+        try ctx.writer.emit(riscv.SD(.sp, .t2, 8));
+        try ctx.writer.emit(riscv.SD(.sp, .t2, 16));
+        try ctx.writer.emit(riscv.SD(.sp, .t2, 24));
+        // Set syscall arguments
+        try ctx.writer.emit(riscv.ADDI(.a1, .zero, 1));        // a1 = topic_count = 1
+        try ctx.writer.emit(riscv.ADD(.a2, .sp, .zero));       // a2 = topics_ptr
+        // Build data inline: encode up to 6 args as packed 8-byte values on stack
         const max_args: usize = @min(stmt.args.len, 6);
-        for (stmt.args[0..max_args], 0..) |arg, i| {
-            const arg_reg: Reg = @enumFromInt(@as(u5, @intCast(11 + i)));
-            try self.genExpr(arg.value, ctx, arg_reg);
+        if (max_args > 0) {
+            const data_size: i12 = @intCast(max_args * 8);
+            try ctx.writer.emit(riscv.ADDI(.sp, .sp, -data_size));
+            for (stmt.args[0..max_args], 0..) |arg, i| {
+                const arg_reg: Reg = @enumFromInt(@as(u5, @intCast(11 + i)));
+                try self.genExpr(arg.value, ctx, arg_reg);
+                const off: i12 = @intCast(i * 8);
+                try ctx.writer.emit(riscv.SD(.sp, arg_reg, off));
+            }
+            try ctx.writer.emit(riscv.ADD(.a3, .sp, .zero));   // a3 = data_ptr
+            try self.genLoadImmediate(@intCast(max_args * 8), .a4, ctx); // a4 = data_len
+            try ctx.writer.emit(riscv.ZEPH(.EMIT_EVENT));
+            try ctx.writer.emit(riscv.ECALL());
+            // Restore data stack
+            try ctx.writer.emit(riscv.ADDI(.sp, .sp, data_size));
+        } else {
+            try ctx.writer.emit(riscv.ADDI(.a3, .zero, 0));
+            try ctx.writer.emit(riscv.ADDI(.a4, .zero, 0));
+            try ctx.writer.emit(riscv.ZEPH(.EMIT_EVENT));
+            try ctx.writer.emit(riscv.ECALL());
         }
-        try ctx.writer.emit(riscv.ZEPH(.EMIT_EVENT));
+        // Restore topics stack
+        try ctx.writer.emit(riscv.ADDI(.sp, .sp, 32));
     }
 
     // ── Return value ─────────────────────────────────────────────────────

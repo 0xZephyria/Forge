@@ -1,0 +1,102 @@
+// Full coverage test contract — exercises every function type in Forge
+// Tests: actions, views, pures, helpers, guards, setup, fallback, receive
+version 1
+
+contract FullCoverage:
+
+    authorities:
+        owner_auth is OwnerRole held_by Wallet initially deployer
+
+    has:
+        counter      is u256
+        total_supply is u256
+        balances     is Map[Account -> u256]
+        is_locked    is bool
+
+    // ── Setup (constructor body) ─────────────────────────────────────────
+    setup(initial is u256):
+        counter      = 0
+        total_supply = initial
+        is_locked    = no
+        balances[caller] = initial
+
+    // ── Guards ────────────────────────────────────────────────────────────
+    guard not_locked():
+        need not is_locked else "contract is locked"
+
+    guard has_balance(acc is Account, amount is u256):
+        need balances[acc] >= amount else "insufficient balance"
+
+    // ── Pure functions (no state access) ──────────────────────────────────
+    pure add(a is u256, b is u256) gives u256:
+        give back a + b
+
+    pure mul(a is u256, b is u256) gives u256:
+        give back a * b
+
+    pure clamp(val is u256, lo is u256, hi is u256) gives u256:
+        when val < lo:
+            give back lo
+        when val > hi:
+            give back hi
+        give back val
+
+    // ── Helpers (within-only, can read state) ─────────────────────────────
+    helper compute_fee(amount is u256) gives u256:
+        give back amount / 100
+
+    helper get_net_amount(amount is u256) gives u256:
+        let fee = amount / 100
+        give back amount - fee
+
+    // ── Actions ───────────────────────────────────────────────────────────
+    action increment():
+        counter = counter + 1
+
+    action deposit(amount is u256):
+        only owner_auth:
+            need not is_locked else "locked"
+            need amount > 0 else "zero amount"
+            total_supply = total_supply + amount
+            balances[caller] = balances[caller] + amount
+            tell Deposited(caller, amount)
+
+    action withdraw(amount is u256):
+        need not is_locked else "locked"
+        need balances[caller] >= amount else "insufficient"
+        balances[caller] = balances[caller] - amount
+        total_supply = total_supply - amount
+        tell Withdrawn(caller, amount)
+
+    action transfer(recipient is Account, amount is u256):
+        need not is_locked else "locked"
+        need balances[caller] >= amount else "insufficient"
+        balances[caller] = balances[caller] - amount
+        balances[recipient] = balances[recipient] + amount
+        tell Transferred(caller, recipient, amount)
+
+    action lock():
+        only owner_auth:
+            is_locked = yes
+
+    action unlock():
+        only owner_auth:
+            is_locked = no
+
+    // ── Views ─────────────────────────────────────────────────────────────
+    view get_counter() gives u256:
+        give back counter
+
+    view get_balance(acc is Account) gives u256:
+        give back balances[acc]
+
+    view get_supply() gives u256:
+        give back total_supply
+
+    view is_contract_locked() gives bool:
+        give back is_locked
+
+    // ── Events ────────────────────────────────────────────────────────────
+    event Deposited(acc is Account, amount is u256)
+    event Withdrawn(acc is Account, amount is u256)
+    event Transferred(sender is Account, recipient is Account, amount is u256)

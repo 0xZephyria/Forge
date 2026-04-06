@@ -551,94 +551,21 @@ pub const LocalVar = struct {
     ty: ResolvedType,
 };
 
-pub const LocalFrame = struct {
-    slots: std.StringHashMap(LocalVar),
-    next_offset: u32,
-    alloc: std.mem.Allocator,
-
-    pub fn init(alloc: std.mem.Allocator) LocalFrame {
-        return .{
-            .slots = std.StringHashMap(LocalVar).init(alloc),
-            .next_offset = LOCAL_START,
-            .alloc = alloc,
-        };
-    }
-
-    pub fn deinit(self: *LocalFrame) void {
-        self.slots.deinit();
-    }
-
-    /// Allocate a new 32-byte memory slot for `name` and return the offset.
-    pub fn alloc_slot(self: *LocalFrame, name: []const u8, ty: ResolvedType) anyerror!u32 {
-        const result = try self.slots.getOrPut(name);
-        if (!result.found_existing) {
-            result.value_ptr.* = .{ .offset = self.next_offset, .ty = ty };
-            self.next_offset += 32;
-        }
-        return result.value_ptr.offset;
-    }
-
-    pub fn get(self: *const LocalFrame, name: []const u8) ?LocalVar {
-        return self.slots.get(name);
-    }
-};
-
-// ============================================================================
-// Section 7 — Function Code Generation Context
-// ============================================================================
-
-/// Per-function state maintained during EVM code generation.
-const FuncCtx = struct {
-    w: EVMWriter,
-    locals: LocalFrame,
-    /// Offsets of PUSH2 placeholder operands for `stop` (break) inside loops.
-    loop_breaks: std.ArrayListUnmanaged(u32),
-    /// Offsets of PUSH2 placeholder operands for `skip` (continue) inside loops.
-    loop_conts: std.ArrayListUnmanaged(u32),
-    /// Offsets of PUSH2 placeholder operands for `give back` (return) in the
-    /// middle of a function, needing to jump to the epilogue.
-    early_returns: std.ArrayListUnmanaged(u32),
-    checked: *const CheckedContract,
-    resolver: *TypeResolver,
-    alloc: std.mem.Allocator,
-
-    fn init(alloc: std.mem.Allocator, checked: *const CheckedContract, resolver: *TypeResolver) FuncCtx {
-        return .{
-            .w = EVMWriter.init(alloc),
-            .locals = LocalFrame.init(alloc),
-            .loop_breaks = .{},
-            .loop_conts = .{},
-            .early_returns = .{},
-            .checked = checked,
-            .resolver = resolver,
-            .alloc = alloc,
-        };
-    }
-
-    fn deinit(self: *FuncCtx) void {
-        self.w.deinit();
-        self.locals.deinit();
-        self.loop_breaks.deinit(self.alloc);
-        self.loop_conts.deinit(self.alloc);
-        self.early_returns.deinit(self.alloc);
-    }
-};
-
-// ============================================================================
-// Section 8 — EVM Code Generator
-// ============================================================================
-
-/// Complete EVM code generator. Converts a type-checked Forge contract into
+/// Complete EVM code generator. Converts a Mid-Level IR (MIR) module into
 /// EVM initcode (deploy + runtime combined).
+/// This is the unified backend entry point for all EVM-compatible networks.
+/// 
+/// SPEC REFERENCE: Part 5 (Contract Anatomy), Part 14 (EVM ABI compatibility)
 pub const EVMCodeGen = struct {
     allocator: std.mem.Allocator,
     diagnostics: *DiagnosticList,
     resolver: *TypeResolver,
-    slots: SlotMap,
-    /// MIR data section reference (set before generateFromMir).
+    /// MIR data section reference.
     mir_data: ?[]const u8,
-    /// MIR event descriptors (set before generateFromMir).
+    /// MIR event descriptors.
     mir_events: []const mir_mod.EventDesc,
+    /// Internal label counter for safety checks.
+    next_label: u32,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -649,2297 +576,14 @@ pub const EVMCodeGen = struct {
             .allocator = allocator,
             .diagnostics = diagnostics,
             .resolver = resolver,
-            .slots = SlotMap.init(allocator),
             .mir_data = null,
             .mir_events = &.{},
+            .next_label = 1000000,
         };
     }
 
     pub fn deinit(self: *EVMCodeGen) void {
-        self.slots.deinit();
-    }
-
-    // ── Top-level entry point ─────────────────────────────────────────────
-
-    /// Generate the complete EVM initcode for `contract`.
-    /// Returns caller-owned heap slice.
-    pub fn generate(
-        self: *EVMCodeGen,
-        contract: *const ContractDef,
-        checked: *const CheckedContract,
-    ) anyerror![]u8 {
-
-        // Pre-register all state field slots in declaration order.
-        for (contract.state) |sf| {
-            try self.slots.register(sf.name);
-        }
-
-        // ── Generate runtime bytecode ─────────────────────────────────────
-        const runtime = try self.generateRuntime(contract, checked);
-        defer self.allocator.free(runtime);
-
-        // ── Generate deploy (init) code ───────────────────────────────────
-        const deploy = try self.generateDeploy(contract, checked, runtime);
-        defer self.allocator.free(deploy);
-
-        // ── Concatenate deploy + runtime ──────────────────────────────────
-        const total = deploy.len + runtime.len;
-        const out = try self.allocator.alloc(u8, total);
-        @memcpy(out[0..deploy.len], deploy);
-        @memcpy(out[deploy.len..], runtime);
-        return out;
-    }
-
-    // ── Deploy (initcode) generation ──────────────────────────────────────
-
-    /// Produce deploy code.  After running, it copies `runtime` into memory
-    /// and returns it — this is the standard EVM constructor pattern.
-    fn generateDeploy(
-        self: *EVMCodeGen,
-        contract: *const ContractDef,
-        checked: *const CheckedContract,
-        runtime: []const u8,
-    ) anyerror![]u8 {
-        var w = EVMWriter.init(self.allocator);
-        defer w.deinit();
-
-        // ── Init free-memory pointer: memory[0x40] = 0x80 ─────────────────
-        try w.push1(0x80);
-        try w.push1(0x40);
-        try w.op(.MSTORE);
-
-        // ── Constructor body & Initialization ─────────────────────────────
-        var ctx = FuncCtx.init(self.allocator, checked, self.resolver);
-        defer ctx.deinit();
-
-        // 1) Store EVM CALLER to __deployer__ slot so `deployer` builtin works.
-        try w.op(.CALLER);
-        try w.pushU256BE(keccak256("__deployer__"));
-        try w.op(.SSTORE);
-
-        // 2) Initialize all authorities with their `initially` assignments.
-        for (contract.authorities) |auth| {
-            if (auth.initial_holder) |expr| {
-                try self.genExpr(expr, &ctx, &w);
-                try w.pushU256BE(self.authSlot(auth.name));
-                try w.op(.SSTORE);
-            }
-        }
-
-        if (contract.setup) |setup| {
-            // ABI-decode constructor parameters from calldata (no selector).
-            for (setup.params, 0..) |param, i| {
-                const cd_offset: u32 = @intCast(i * 32);
-                try w.pushU32(cd_offset);
-                try w.op(.CALLDATALOAD);
-                const ty = try self.resolver.resolve(param.declared_type);
-                const mem_slot = try ctx.locals.alloc_slot(param.name, ty);
-                try w.pushU32(mem_slot);
-                try w.op(.MSTORE);
-            }
-
-            for (setup.body) |stmt| {
-                try self.genStmt(&stmt, &ctx, &w);
-            }
-        }
-
-        // ── CODECOPY runtime into memory[0x00] and RETURN it ──────────────
-        // We need the runtime length and the offset of runtime within the
-        // final binary (= deploy code length).
-        // Since we don't know deploy_code length yet, we use placeholders
-        // and emit at end.
-
-        // First, compute deploy code length *without* the CODECOPY/RETURN
-        // preamble to know the offset.  We'll hard-code the 3-instruction
-        // CODECOPY/RETURN sequence and add its own size.
-        //
-        // CODECOPY: PUSH2 <rt_len> PUSH2 <deploy_len> PUSH0 CODECOPY
-        //           = 3 + 3 + 1 + 1 = 8 bytes
-        // RETURN:   PUSH2 <rt_len> PUSH0 RETURN
-        //           = 3 + 1 + 1 = 5 bytes
-        // Total appendix = 13 bytes.
-        const appendix_size: u32 = 13;
-        const deploy_code_len: u32 = w.offset() + appendix_size;
-        const runtime_len: u16 = @intCast(runtime.len);
-
-        // PUSH2 <runtime_len>  (size to copy)
-        try w.push2(runtime_len);
-        // PUSH2 <deploy_code_len>  (source offset = where runtime starts in binary)
-        try w.push2(@intCast(deploy_code_len));
-        // PUSH0  (destination in memory = 0)
-        try w.push0();
-        // CODECOPY pops dest(top), src(second), size(third)
-        try w.op(.CODECOPY);
-
-        // RETURN pops offset(top), size(second)  →  return memory[0..runtime_len]
-        try w.push2(runtime_len);
-        try w.push0();
-        try w.op(.RETURN);
-
-        return w.toOwnedSlice();
-    }
-
-    // ── Runtime generation ────────────────────────────────────────────────
-
-    /// Produce the runtime bytecode: dispatcher + all function handlers.
-    fn generateRuntime(
-        self: *EVMCodeGen,
-        contract: *const ContractDef,
-        checked: *const CheckedContract,
-    ) anyerror![]u8 {
-        var w = EVMWriter.init(self.allocator);
-        defer w.deinit();
-
-        // ── Init free-memory pointer ──────────────────────────────────────
-        try w.push1(0x80);
-        try w.push1(0x40);
-        try w.op(.MSTORE);
-
-        // ── Selector extraction ───────────────────────────────────────────
-        // Calldata >= 4 check (if sizes < 4, go to fallback)
-        try w.push1(4);
-        try w.op(.CALLDATASIZE);
-        try w.op(.LT);
-        const fallback_patch = try w.push2Placeholder();
-        try w.op(.JUMPI);
-
-        // Extract selector: calldata[0..3] as uint256
-        // PUSH0 CALLDATALOAD → first 32 bytes of calldata
-        // PUSH1 0xe0 SHR     → right-align top 4 bytes = selector
-        try w.push0();
-        try w.op(.CALLDATALOAD);
-        try w.push1(0xe0);
-        try w.op(.SHR);
-        // Selector is now on top of stack.
-
-        // ── Dispatch table ────────────────────────────────────────────────
-        // For each action/view, emit: DUP1 PUSH4 <sel> EQ PUSH2 <handler> JUMPI
-        const ActionEntry = struct {
-            selector: u32,
-            patch: u32,  // offset of PUSH2 operand for handler address
-        };
-        var entries = std.ArrayListUnmanaged(ActionEntry){};
-        defer entries.deinit(self.allocator);
-
-        for (contract.actions) |action| {
-            const sel = try buildSelector(action.name, action.params, self.resolver, self.allocator);
-            try w.op(.DUP1);
-            try w.push4(sel);
-            try w.op(.EQ);
-            const patch = try w.push2Placeholder();
-            try w.op(.JUMPI);
-            try entries.append(self.allocator, .{ .selector = sel, .patch = patch });
-        }
-
-        for (contract.views) |view| {
-            const sel = try buildSelector(view.name, view.params, self.resolver, self.allocator);
-            try w.op(.DUP1);
-            try w.push4(sel);
-            try w.op(.EQ);
-            const patch = try w.push2Placeholder();
-            try w.op(.JUMPI);
-            try entries.append(self.allocator, .{ .selector = sel, .patch = patch });
-        }
-
-        for (contract.pures) |pure| {
-            const sel = try buildSelector(pure.name, pure.params, self.resolver, self.allocator);
-            try w.op(.DUP1);
-            try w.push4(sel);
-            try w.op(.EQ);
-            const patch = try w.push2Placeholder();
-            try w.op(.JUMPI);
-            try entries.append(self.allocator, .{ .selector = sel, .patch = patch });
-        }
-
-        // ── Tier 1 Robustness — Migration Entry Point ──────────────────
-        if (contract.upgrade != null) {
-            const sel: u32 = 0xDEAD0001;
-            try w.op(.DUP1);
-            try w.push4(sel);
-            try w.op(.EQ);
-            const patch = try w.push2Placeholder();
-            try w.op(.JUMPI);
-            try entries.append(self.allocator, .{ .selector = sel, .patch = patch });
-        }
-
-        // ── Fallback / Receive handlers (Spec Part 5.13) ────────────────
-        // Patch the < 4 bytes jump to here.
-        const fallback_dest = w.offset();
-        w.patchU16(fallback_patch, fallback_dest);
-        try w.op(.JUMPDEST);
-
-        // If calldatasize == 0 and contract has receive handler, use it.
-        // Otherwise fall through to fallback or REVERT.
-        if (contract.receive_) |receive_handler| {
-            // Check CALLVALUE > 0 for receive path
-            try w.op(.CALLVALUE);
-            const receive_patch = try w.push2Placeholder();
-            try w.op(.JUMPI);
-            // No value sent — fall through to fallback/revert below
-            if (contract.fallback) |fb_handler| {
-                try self.genFallbackBody(&fb_handler, checked, &w);
-            } else {
-                try w.push0();
-                try w.push0();
-                try w.op(.REVERT);
-            }
-            // Receive handler destination
-            const receive_dest = w.offset();
-            w.patchU16(receive_patch, receive_dest);
-            try w.op(.JUMPDEST);
-            try self.genFallbackBody(&receive_handler, checked, &w);
-        } else if (contract.fallback) |fb_handler| {
-            try self.genFallbackBody(&fb_handler, checked, &w);
-        } else {
-            try w.push0();
-            try w.push0();
-            try w.op(.REVERT);
-        }
-
-        // Also handle dispatch exhaustion (selector on stack, no match):
-        const no_match_dest = w.offset();
-        try w.op(.JUMPDEST);
-        try w.op(.POP);  // pop selector
-        if (contract.fallback) |fb_handler| {
-            try self.genFallbackBody(&fb_handler, checked, &w);
-        } else {
-            try w.push0();
-            try w.push0();
-            try w.op(.REVERT);
-        }
-
-        // Patch all dispatch JUMPI that fall through (no match) to no_match_dest.
-        // Actually: rewrite dispatch to jump to no_match when no match found.
-        // The current dispatch already falls through to fallback which handles
-        // both cases. Patch entry table to no_match_dest for exhaustion.
-        // We'll just emit function bodies now; we already patched fallback above.
-        // The "exhaustion" path (all JUMPIs failed) falls through to
-        // fallback_dest area. Let's add an unconditional jump to no_match
-        // before the first JUMPDEST.
-        // Actually, the dispatch fallthrough goes to the fallback_dest (which
-        // has REVERT) only if selector >= 4; the JUMPI there only fires for
-        // calldatasize < 4. So there's a subtle bug: when all DUP1/PUSH4/EQ
-        // dispatches fail, we fall through to the JUMPDEST fallback label.
-        // Since fallback_dest has JUMPDEST then REVERT, this works correctly!
-
-        // ── Function handlers ─────────────────────────────────────────────
-        var entry_idx: usize = 0;
-
-        for (contract.actions) |action| {
-            const handler_dest = w.offset();
-            w.patchU16(entries.items[entry_idx].patch, handler_dest);
-            entry_idx += 1;
-            try w.op(.JUMPDEST);
-            try w.op(.POP);  // pop selector
-            try self.genAction(&action, checked, &w);
-        }
-
-        for (contract.views) |view| {
-            const handler_dest = w.offset();
-            w.patchU16(entries.items[entry_idx].patch, handler_dest);
-            entry_idx += 1;
-            try w.op(.JUMPDEST);
-            try w.op(.POP);
-            try self.genView(&view, checked, &w);
-        }
-
-        for (contract.pures) |pure| {
-            const handler_dest = w.offset();
-            w.patchU16(entries.items[entry_idx].patch, handler_dest);
-            entry_idx += 1;
-            try w.op(.JUMPDEST);
-            try w.op(.POP);
-            try self.genPure(&pure, checked, &w);
-        }
-
-        if (contract.upgrade) |up| {
-            const handler_dest = w.offset();
-            w.patchU16(entries.items[entry_idx].patch, handler_dest);
-            entry_idx += 1;
-            try w.op(.JUMPDEST);
-            try w.op(.POP);
-            
-            if (up.migrate_fn) |fn_name| {
-                for (contract.actions) |act| {
-                    if (std.mem.eql(u8, act.name, fn_name)) {
-                        try self.genAction(&act, checked, &w);
-                        break;
-                    }
-                }
-            } else {
-                try w.op(.STOP);
-            }
-        }
-
-        _ = no_match_dest;
-
-        return w.toOwnedSlice();
-    }
-
-    // ── Action / View / Pure generation ──────────────────────────────────
-
-    /// Generate EVM bytecode for one action function.
-    fn genAction(self: *EVMCodeGen, action: *const ActionDecl, checked: *const CheckedContract, w: *EVMWriter) anyerror!void {
-        var ctx = FuncCtx.init(self.allocator, checked, self.resolver);
-        defer ctx.deinit();
-
-        // ── Gas Sponsorship Delegation ──────────────────────────────────
-        for (action.annotations) |ann| {
-            if (ann.kind == .gas_sponsored_for) {
-                if (ann.args.len > 0) {
-                    try self.genExpr(ann.args[0], &ctx, w);
-                    // Emit DELEGATE_GAS pseudo-op or log
-                }
-            }
-        }
-
-        // ABI-decode calldata parameters into local memory slots.
-        try self.genDecodeParams(action.params, &ctx, w);
-
-        // Body statements.
-        for (action.body) |stmt| {
-            try self.genStmt(&stmt, &ctx, w);
-        }
-
-        // Epilogue: patch early-return jumps to here, then STOP.
-        const epilogue_dest = w.offset();
-        for (ctx.early_returns.items) |patch_off| {
-            w.patchU16(patch_off, epilogue_dest);
-        }
-        try w.op(.STOP);
-    }
-
-    /// Generate EVM bytecode for one view function (read-only, must RETURN).
-    fn genView(self: *EVMCodeGen, view: *const ViewDecl, checked: *const CheckedContract, w: *EVMWriter) anyerror!void {
-        var ctx = FuncCtx.init(self.allocator, checked, self.resolver);
-        defer ctx.deinit();
-
-        try self.genDecodeParams(view.params, &ctx, w);
-
-        for (view.body) |stmt| {
-            try self.genStmt(&stmt, &ctx, w);
-        }
-
-        // Epilogue: if no explicit give_back was emitted, return 0.
-        const epilogue_dest = w.offset();
-        for (ctx.early_returns.items) |patch_off| {
-            w.patchU16(patch_off, epilogue_dest);
-        }
-        // Default return: return 0 (32 bytes).
-        try w.push0();
-        try w.push1(0x00);
-        try w.op(.MSTORE);
-        try w.push1(32);
-        try w.push0();
-        try w.op(.RETURN);
-    }
-
-    /// Generate EVM bytecode for one pure function.
-    fn genPure(self: *EVMCodeGen, pure: *const ast.PureDecl, checked: *const CheckedContract, w: *EVMWriter) anyerror!void {
-        var ctx = FuncCtx.init(self.allocator, checked, self.resolver);
-        defer ctx.deinit();
-
-        try self.genDecodeParams(pure.params, &ctx, w);
-
-        for (pure.body) |stmt| {
-            try self.genStmt(&stmt, &ctx, w);
-        }
-
-        const epilogue_dest = w.offset();
-        for (ctx.early_returns.items) |patch_off| {
-            w.patchU16(patch_off, epilogue_dest);
-        }
-        // Default: RETURN 0
-        try w.push0();
-        try w.push1(0x00);
-        try w.op(.MSTORE);
-        try w.push1(32);
-        try w.push0();
-        try w.op(.RETURN);
-    }
-
-    /// SPEC: Part 5.13 — Generate EVM bytecode for fallback/receive handler.
-    /// These handlers have no calldata parameters; they just execute their body.
-    fn genFallbackBody(self: *EVMCodeGen, handler: *const ActionDecl, checked: *const CheckedContract, w: *EVMWriter) anyerror!void {
-        var ctx = FuncCtx.init(self.allocator, checked, self.resolver);
-        defer ctx.deinit();
-
-        for (handler.body) |stmt| {
-            try self.genStmt(&stmt, &ctx, w);
-        }
-
-        const epilogue_dest = w.offset();
-        for (ctx.early_returns.items) |patch_off| {
-            w.patchU16(patch_off, epilogue_dest);
-        }
-        try w.op(.STOP);
-    }
-
-    // ── Parameter ABI decoding ────────────────────────────────────────────
-
-    /// Decode static (32-byte) calldata parameters into local memory slots.
-    /// Calldata layout: [selector 4 bytes][param0 32 bytes][param1 32 bytes]…
-    fn genDecodeParams(
-        self: *EVMCodeGen,
-        params: []const ast.Param,
-        ctx: *FuncCtx,
-        w: *EVMWriter,
-    ) anyerror!void {
-        for (params, 0..) |param, i| {
-            const cd_offset: u32 = 4 + @as(u32, @intCast(i)) * 32;
-            try w.pushU32(cd_offset);
-            try w.op(.CALLDATALOAD);
-            const ty = try self.resolver.resolve(param.declared_type);
-            const mem_slot = try ctx.locals.alloc_slot(param.name, ty);
-            try w.pushU32(mem_slot);
-            try w.op(.MSTORE);
-        }
-    }
-
-    // ── Access control (`only`) ───────────────────────────────────────────
-
-    /// Emit `only authority` checks: CALLER must match the stored authority.
-    fn genOnly(
-        self: *EVMCodeGen,
-        only: *const ast.OnlyStmt,
-        ctx: *FuncCtx,
-        w: *EVMWriter,
-    ) anyerror!void {
-        switch (only.requirement) {
-            .authority => |name| {
-                try self.genAuthCheck(name, w);
-            },
-            .either => |pair| {
-                // Caller must match left OR right authority.
-                try self.genAuthCheckOr(pair.left, pair.right, w);
-            },
-            .address_list => |names| {
-                // Caller must match any of the listed authorities (this is an OR check).
-                // Note: current address_list implementation in genAuthCheck might need refinement
-                // if it's meant to be OR instead of AND. 
-                // In EVM we can just do a loop of checks if they are AND, 
-                // but usually address_list means "any of these".
-                for (names, 0..) |name, i| {
-                    if (i > 0) {
-                        // This is currently an AND check if it's just a loop of genAuthCheck.
-                        // Forge spec says "any of these" usually.
-                        // I'll keep it as is for now for the single admin case.
-                        try self.genAuthCheck(name, w);
-                    } else {
-                        try self.genAuthCheck(name, w);
-                    }
-                }
-            },
-            else => {},
-        }
-
-        // Execute body statements AFTER successful auth check.
-        for (only.body) |s| {
-            try self.genStmt(&s, ctx, w);
-        }
-    }
-
-    /// Check CALLER == authority_slot value; REVERT if not.
-    fn genAuthCheck(self: *EVMCodeGen, auth_name: []const u8, w: *EVMWriter) anyerror!void {
-        // Authority address is stored at slot = keccak256("auth:" ++ auth_name).
-        const slot = self.authSlot(auth_name);
-        try w.pushU256BE(slot);
-        try w.op(.SLOAD);     // stack: [stored_authority]
-        try w.op(.CALLER);    // stack: [stored_authority, caller]
-        try w.op(.EQ);        // stack: [caller == authority ? 1 : 0]
-        // If equal, skip revert.
-        const ok_patch = try w.push2Placeholder();
-        try w.op(.JUMPI);
-        // Revert with "not authorized".
-        try self.emitRevertString("not authorized", w);
-        // Ok label.
-        const ok_dest = w.offset();
-        w.patchU16(ok_patch, ok_dest);
-        try w.op(.JUMPDEST);
-    }
-
-    /// Check CALLER == auth_left OR CALLER == auth_right; REVERT if neither.
-    fn genAuthCheckOr(
-        self: *EVMCodeGen,
-        left: []const u8,
-        right: []const u8,
-        w: *EVMWriter,
-    ) anyerror!void {
-        const slot_l = self.authSlot(left);
-        const slot_r = self.authSlot(right);
-
-        try w.op(.CALLER);          // stack: [caller]
-        try w.op(.DUP1);            // stack: [caller, caller]
-        try w.pushU256BE(slot_l);
-        try w.op(.SLOAD);           // stack: [caller, caller, auth_l]
-        try w.op(.EQ);              // stack: [caller, (caller==auth_l)]
-        try w.op(.SWAP1);           // stack: [(caller==auth_l), caller]
-        try w.pushU256BE(slot_r);
-        try w.op(.SLOAD);           // stack: [(caller==auth_l), caller, auth_r]
-        try w.op(.EQ);              // stack: [(caller==auth_l), (caller==auth_r)]
-        try w.op(.OR);              // stack: [(either match)]
-        const ok_patch = try w.push2Placeholder();
-        try w.op(.JUMPI);
-        try self.emitRevertString("not authorized", w);
-        const ok_dest = w.offset();
-        w.patchU16(ok_patch, ok_dest);
-        try w.op(.JUMPDEST);
-    }
-
-    /// Compute the storage slot for an authority by hashing `"auth:" ++ name`.
-    fn authSlot(_: *EVMCodeGen, name: []const u8) [32]u8 {
-        var buf: [64]u8 = undefined;
-        const prefix = "auth:";
-        @memcpy(buf[0..prefix.len], prefix);
-        const name_len = @min(name.len, 59);
-        @memcpy(buf[prefix.len..prefix.len + name_len], name[0..name_len]);
-        return keccak256(buf[0..prefix.len + name_len]);
-    }
-
-    fn genStmt(self: *EVMCodeGen, stmt: *const Stmt, ctx: *FuncCtx, w: *EVMWriter) anyerror!void {
-        switch (stmt.kind) {
-            .verify => |v| {
-                _ = v;
-                // Currently mock verifying proofs natively on EVM via standard 1 result. 
-                // Full staticcall hooks required for deep Groth16.
-            },
-            .let_bind => |lb| {
-                try self.genExpr(lb.init, ctx, w);
-                const ty = (self.resolver.inferExpr(lb.init, &ctx.checked.scope) catch .void_);
-                const mem_slot = try ctx.locals.alloc_slot(lb.name, ty);
-                try w.pushU32(mem_slot);
-                try w.op(.MSTORE);
-            },
-
-            // ── target = value ───────────────────────────────────────────────
-            .assign => |asg| {
-                try self.genAssign(asg.target, asg.value, ctx, w);
-            },
-
-            // ── target op= value ─────────────────────────────────────────────
-            .aug_assign => |aug| {
-                try self.genAugAssign(aug.target, aug.op, aug.value, ctx, w);
-            },
-
-            // ── when/otherwise ───────────────────────────────────────────────
-            .when => |*wh| try self.genWhen(wh, ctx, w),
-
-            // ── match ────────────────────────────────────────────────────────
-            .match => |*m| try self.genMatch(m, ctx, w),
-
-            // ── each ─────────────────────────────────────────────────────────
-            .each => |*e| try self.genEach(e, ctx, w),
-
-            // ── repeat N times ───────────────────────────────────────────────
-            .repeat => |*r| try self.genRepeat(r, ctx, w),
-
-            // ── while ────────────────────────────────────────────────────────
-            .while_ => |*wl| try self.genWhile(wl, ctx, w),
-
-            // ── need cond else msg ───────────────────────────────────────────
-            .need => |*n| try self.genNeed(n, ctx, w),
-
-            // ── ensure cond else msg ─────────────────────────────────────────
-            .ensure => |*e| try self.genEnsure(e, ctx, w),
-
-            // ── panic "msg" ──────────────────────────────────────────────────
-            .panic => |p| {
-                try self.emitRevertString(p.message, w);
-            },
-
-            // ── give back expr ───────────────────────────────────────────────
-            .give_back => |expr| {
-                try self.genGiveBack(expr, ctx, w);
-            },
-
-            // ── stop (break) ─────────────────────────────────────────────────
-            .stop => {
-                const patch = try w.push2Placeholder();
-                try w.op(.JUMP);
-                try ctx.loop_breaks.append(ctx.alloc, patch);
-            },
-
-            // ── skip (continue) ──────────────────────────────────────────────
-            .skip => {
-                const patch = try w.push2Placeholder();
-                try w.op(.JUMP);
-                try ctx.loop_conts.append(ctx.alloc, patch);
-            },
-
-            // ── tell EventName(args) ─────────────────────────────────────────
-            .tell => |*t| try self.genTell(t, ctx, w),
-
-            // ── throw ErrorType(args) ────────────────────────────────────────
-            .throw => |th| {
-                // Emit Error(selector) revert data (EIP-838 custom error).
-                const selector = evmSelector(th.error_call.error_type);
-                try self.emitCustomError(selector, th.error_call.args, ctx, w);
-            },
-
-            // ── attempt … on_error … ─────────────────────────────────────────
-            .attempt => |*at| try self.genAttempt(at, ctx, w),
-
-            // ── bare call stmt ───────────────────────────────────────────────
-            .call_stmt => |expr| {
-                try self.genExpr(expr, ctx, w);
-                try w.op(.POP);  // discard return value
-            },
-
-            // ── remove mine.map[key] ─────────────────────────────────────────
-            .remove => |expr| {
-                try self.genRemove(expr, ctx, w);
-            },
-
-            // ── pay recipient amount ─────────────────────────────────────────
-            .pay => |*pay| {
-                try self.genPay(pay, ctx, w);
-            },
-
-            // ── send asset to account ─────────────────────────────────────────
-            .send => |*send| {
-                try self.genSend(send, ctx, w);
-            },
-
-            // ── move asset into mine.field ───────────────────────────────────
-            .move_asset => |*mv| {
-                try self.genExpr(mv.asset, ctx, w);   // stack: [asset_value]
-                try self.genStateWriteExpr(mv.dest, w);
-            },
-
-            // ── schedule call ────────────────────────────────────────────────
-            .schedule => |*sc| {
-                // Schedules are ZVM-native; on EVM we emit an external CALL.
-                try self.genSchedule(sc, ctx, w);
-            },
-
-            // ── only (handled in prologue) ───────────────────────────────────
-            .only => |*o| try self.genOnly(o, ctx, w),
-
-            // ── guard_apply ──────────────────────────────────────────────────
-            .guard_apply => |gname| {
-                // Emit a CALL to the guard's internal logic.
-                // Guards are stored as internal jump labels; for EVM,
-                // we emit an auth check pattern using the guard's name.
-                try self.genAuthCheck(gname, w);
-            },
-
-            // ── transfer_ownership ───────────────────────────────────────────
-            .transfer_ownership => |*to| {
-                const auth_name = to.account.kind.identifier;
-                const slot = self.authSlot(auth_name);
-                try self.genExpr(to.new_owner, ctx, w);  // stack: [new_owner]
-                try w.pushU256BE(slot);                  // stack: [new_owner, slot]
-                try w.op(.SSTORE);
-            },
-
-            // ── account lifecycle (no direct EVM equivalent — no-op) ─────────
-            .expand, .close, .freeze, .unfreeze => {},
-        }
-    }
-
-    // ── Assignment helpers ────────────────────────────────────────────────
-
-    /// Emit code for `target = value`.
-    fn genAssign(
-        self: *EVMCodeGen,
-        target: *const Expr,
-        value: *const Expr,
-        ctx: *FuncCtx,
-        w: *EVMWriter,
-    ) anyerror!void {
-        switch (target.kind) {
-            // mine.field = value
-            .field_access => |fa| {
-                if (fa.object.kind == .identifier and
-                    std.mem.eql(u8, fa.object.kind.identifier, "mine"))
-                {
-                    if (self.slots.getSlot(fa.field)) |slot| {
-                        try self.genExpr(value, ctx, w);  // stack: [value]
-                        try w.pushU256BE(u256ToBE(slot)); // stack: [value, slot]
-                        try w.op(.SSTORE);
-                        return;
-                    }
-                }
-                // Struct field: evaluate target address, then store.
-                try self.genExpr(value, ctx, w);
-                try w.op(.POP);  // fallback: discard
-            },
-            // mine.map[key] = value or map[key] = value
-            .index_access => |ia| {
-                var opt_slot: ?u256 = null;
-                if (ia.object.kind == .field_access) {
-                    const outer = ia.object.kind.field_access;
-                    if (outer.object.kind == .identifier and
-                        std.mem.eql(u8, outer.object.kind.identifier, "mine"))
-                    {
-                        opt_slot = self.slots.getSlot(outer.field);
-                    }
-                } else if (ia.object.kind == .identifier) {
-                    opt_slot = self.slots.getSlot(ia.object.kind.identifier);
-                }
-                if (opt_slot) |slot| {
-                    // slot = keccak256(key ++ base_slot)
-                    try self.genExpr(ia.index, ctx, w); // stack: [key]
-                    try w.push0();                       // stack: [key, 0]
-                    try w.op(.MSTORE);                   // memory[0] = key
-
-                    try w.pushU256BE(u256ToBE(slot));    // stack: [base_slot]
-                    try w.push1(0x20);                   // stack: [base_slot, 0x20]
-                    try w.op(.MSTORE);                   // memory[32] = base_slot
-
-                    try w.push1(0x40);  // size=64
-                    try w.push0();       // offset=0
-                    try w.op(.KECCAK256); // stack: [map_slot]
-
-                    try self.genExpr(value, ctx, w); // stack: [map_slot, value]
-                    try w.op(.SWAP1);                 // stack: [value, map_slot]
-                    try w.op(.SSTORE);
-                    return;
-                }
-                try self.genExpr(value, ctx, w);
-                try w.op(.POP);
-            },
-            // local or state = value
-            .identifier => |name| {
-                if (ctx.locals.get(name)) |loc| {
-                    try self.genExpr(value, ctx, w);  // stack: [value]
-                    try w.pushU32(loc.offset);        // stack: [value, offset]
-                    try w.op(.MSTORE);
-                    return;
-                }
-                if (self.slots.getSlot(name)) |slot| {
-                    try self.genExpr(value, ctx, w);  // stack: [value]
-                    try w.pushU256BE(u256ToBE(slot)); // stack: [value, slot]
-                    try w.op(.SSTORE);
-                    return;
-                }
-                // Unknown identifier: evaluate and discard.
-                try self.genExpr(value, ctx, w);
-                try w.op(.POP);
-            },
-            else => {
-                try self.genExpr(value, ctx, w);
-                try w.op(.POP);
-            },
-        }
-    }
-
-    /// Write value (already on stack) to the storage slot indicated by expr.
-    fn genStateWriteExpr(self: *EVMCodeGen, dest: *const Expr, w: *EVMWriter) anyerror!void {
-        switch (dest.kind) {
-            .field_access => |fa| {
-                if (fa.object.kind == .identifier and
-                    std.mem.eql(u8, fa.object.kind.identifier, "mine"))
-                {
-                    if (self.slots.getSlot(fa.field)) |slot| {
-                        try w.pushU256BE(u256ToBE(slot)); // stack: [value, slot]
-                        try w.op(.SSTORE);
-                        return;
-                    }
-                }
-            },
-            .identifier => |name| {
-                if (self.slots.getSlot(name)) |slot| {
-                    try w.pushU256BE(u256ToBE(slot)); // stack: [value, slot]
-                    try w.op(.SSTORE);
-                    return;
-                }
-            },
-            else => {},
-        }
-        try w.op(.POP);  // discard if we can't identify the target
-    }
-
-    /// Emit augmented assignment: `target op= value`.
-    fn genAugAssign(
-        self: *EVMCodeGen,
-        target: *const Expr,
-        aug_op: ast.AugOp,
-        value: *const Expr,
-        ctx: *FuncCtx,
-        w: *EVMWriter,
-    ) anyerror!void {
-        const evm_op: Op = switch (aug_op) {
-            .add => .ADD,
-            .sub => .SUB,
-            .mul => .MUL,
-            .div => .DIV,
-            .mod => .MOD,
-        };
-
-        switch (target.kind) {
-            // mine.field op= value
-            .field_access => |fa| {
-                if (fa.object.kind == .identifier and
-                    std.mem.eql(u8, fa.object.kind.identifier, "mine"))
-                {
-                    if (self.slots.getSlot(fa.field)) |slot| {
-                        // Load current value.
-                        try w.pushU256BE(u256ToBE(slot));
-                        try w.op(.SLOAD);          // stack: [current]
-                        try self.genExpr(value, ctx, w); // stack: [current, rhs]
-                        if (aug_op == .sub or aug_op == .div or aug_op == .mod) {
-                            try w.op(.SWAP1);      // stack: [rhs, current] → current op rhs
-                        }
-                        try w.op(evm_op);          // stack: [result]
-                        try w.pushU256BE(u256ToBE(slot)); // stack: [result, slot]
-                        try w.op(.SSTORE);
-                        return;
-                    }
-                }
-            },
-            // mine.map[key] op= value or map[key] op= value
-            .index_access => |ia| {
-                var opt_slot: ?u256 = null;
-                if (ia.object.kind == .field_access) {
-                    const outer = ia.object.kind.field_access;
-                    if (outer.object.kind == .identifier and
-                        std.mem.eql(u8, outer.object.kind.identifier, "mine"))
-                    {
-                        opt_slot = self.slots.getSlot(outer.field);
-                    }
-                } else if (ia.object.kind == .identifier) {
-                    opt_slot = self.slots.getSlot(ia.object.kind.identifier);
-                }
-                if (opt_slot) |slot| {
-                    // Compute map slot and save it.
-                    try self.genExpr(ia.index, ctx, w);
-                    try w.push0();
-                    try w.op(.MSTORE);
-                    try w.pushU256BE(u256ToBE(slot));
-                    try w.push1(0x20);
-                    try w.op(.MSTORE);
-                    try w.push1(0x40);
-                    try w.push0();
-                    try w.op(.KECCAK256);      // stack: [map_slot]
-                    try w.op(.DUP1);           // stack: [map_slot, map_slot]
-                    try w.op(.SLOAD);          // stack: [map_slot, current]
-                    try self.genExpr(value, ctx, w); // stack: [map_slot, current, rhs]
-                    if (aug_op == .sub or aug_op == .div or aug_op == .mod) {
-                        try w.op(.SWAP1);
-                    }
-                    try w.op(evm_op);          // stack: [map_slot, result]
-                    try w.op(.SWAP1);          // stack: [result, map_slot]
-                    try w.op(.SSTORE);
-                    return;
-                }
-            },
-            // local or state op= value
-            .identifier => |name| {
-                if (ctx.locals.get(name)) |loc| {
-                    try w.pushU32(loc.offset);
-                    try w.op(.MLOAD);              // stack: [current]
-                    try self.genExpr(value, ctx, w); // stack: [current, rhs]
-                    if (aug_op == .sub or aug_op == .div or aug_op == .mod) {
-                        try w.op(.SWAP1);
-                    }
-                    try w.op(evm_op);
-                    try w.pushU32(loc.offset);
-                    try w.op(.MSTORE);
-                    return;
-                } else if (self.slots.getSlot(name)) |slot| {
-                    try w.pushU256BE(u256ToBE(slot));
-                    try w.op(.SLOAD);          // stack: [current]
-                    try self.genExpr(value, ctx, w); // stack: [current, rhs]
-                    if (aug_op == .sub or aug_op == .div or aug_op == .mod) {
-                        try w.op(.SWAP1);      // stack: [rhs, current] → current op rhs
-                    }
-                    try w.op(evm_op);          // stack: [result]
-                    try w.pushU256BE(u256ToBE(slot)); // stack: [result, slot]
-                    try w.op(.SSTORE);
-                    return;
-                }
-            },
-            else => {},
-        }
-    }
-
-    // ── Expression code generation ────────────────────────────────────────
-
-    /// Generate EVM code for an expression. Leaves exactly one value on stack.
-    pub fn genExpr(
-        self: *EVMCodeGen,
-        expr: *const Expr,
-        ctx: *FuncCtx,
-        w: *EVMWriter,
-    ) anyerror!void {
-        switch (expr.kind) {
-
-            // ── Integer literal ──────────────────────────────────────────────
-            .int_lit => |lit| {
-                try self.genIntLit(lit, w);
-            },
-
-            // ── Float / fixed-point literal ──────────────────────────────────
-            .float_lit => |lit| {
-                const scaled = scaleFixedPoint(lit, 18);
-                try w.pushU256BE(scaled.toBytes32Be());
-            },
-
-            // ── Boolean literal ──────────────────────────────────────────────
-            .bool_lit => |b| {
-                if (b) try w.push1(1) else try w.push0();
-            },
-
-            // ── String literal ───────────────────────────────────────────────
-            .string_lit => |s| {
-                // Strip surrounding quotes.
-                const content = if (s.len >= 2) s[1..s.len - 1] else s;
-                // Push keccak256 of the string as a bytes32 representation.
-                // For EVM, strings are usually passed as calldata or memory pointers.
-                // We push the keccak256 hash as a static representation.
-                const h = keccak256(content);
-                try w.pushU256BE(h);
-            },
-
-            // ── `nothing` ────────────────────────────────────────────────────
-            .nothing => {
-                try w.push0();
-            },
-
-            // ── `something(expr)` ────────────────────────────────────────────
-            .something => |inner| {
-                try self.genExpr(inner, ctx, w);
-                // In EVM, optionals are represented as: (is_present=1, value).
-                // Here we just pass the value through.
-            },
-
-            // Identifier ───────────────────────────────────────────────────
-            .identifier => |name| {
-                if (ctx.locals.get(name)) |loc| {
-                    try w.pushU32(loc.offset);
-                    try w.op(.MLOAD);
-                } else if (self.slots.getSlot(name)) |slot| {
-                    try w.pushU256BE(u256ToBE(slot));
-                    try w.op(.SLOAD);
-                } else {
-                    try w.push0();
-                }
-            },
-
-            // ── Field access ──────────────────────────────────────────────────
-            .field_access => |fa| {
-                if (fa.object.kind == .identifier and
-                    std.mem.eql(u8, fa.object.kind.identifier, "mine"))
-                {
-                    // mine.field → SLOAD
-                    if (self.slots.getSlot(fa.field)) |slot| {
-                        try w.pushU256BE(u256ToBE(slot));
-                        try w.op(.SLOAD);
-                        return;
-                    }
-                }
-                // Other field access: evaluate object, push 0 (simplified).
-                try self.genExpr(fa.object, ctx, w);
-                try w.op(.POP);
-                try w.push0();
-            },
-
-            // ── Index access ──────────────────────────────────────────────────
-            .index_access => |ia| {
-                var opt_slot: ?u256 = null;
-                if (ia.object.kind == .field_access) {
-                    const outer = ia.object.kind.field_access;
-                    if (outer.object.kind == .identifier and
-                        std.mem.eql(u8, outer.object.kind.identifier, "mine"))
-                    {
-                        opt_slot = self.slots.getSlot(outer.field);
-                    }
-                } else if (ia.object.kind == .identifier) {
-                    opt_slot = self.slots.getSlot(ia.object.kind.identifier);
-                }
-                if (opt_slot) |slot| {
-                    // Map read: keccak256(key ++ base_slot) → SLOAD
-                    try self.genExpr(ia.index, ctx, w); // stack: [key]
-                    try w.push0();    // stack: [key, 0]
-                    try w.op(.MSTORE); // memory[0] = key
-                    try w.pushU256BE(u256ToBE(slot)); // stack: [base_slot]
-                    try w.push1(0x20); // stack: [base_slot, 0x20]
-                    try w.op(.MSTORE); // memory[32] = base_slot
-                    try w.push1(0x40);
-                    try w.push0();
-                    try w.op(.KECCAK256); // stack: [map_slot]
-                    try w.op(.SLOAD);     // stack: [value]
-                    return;
-                }
-                // Fallback.
-                try self.genExpr(ia.object, ctx, w);
-                try w.op(.POP);
-                try w.push0();
-            },
-
-            // ── Binary operation ──────────────────────────────────────────────
-            .bin_op => |op| {
-                try self.genBinOp(op.op, op.left, op.right, ctx, w);
-            },
-
-            // ── Unary operation ───────────────────────────────────────────────
-            .unary_op => |op| {
-                try self.genExpr(op.operand, ctx, w);
-                switch (op.op) {
-                    .not_   => try w.op(.ISZERO),
-                    .negate => {
-                        // 0 - value: push 0, SWAP1, SUB  →  0 - value = -value
-                        try w.push0();
-                        try w.op(.SUB);
-                    },
-                }
-            },
-
-            // ── Call expression ───────────────────────────────────────────────
-            .call => |c| {
-                try self.genCall(c.callee, c.args, ctx, w);
-            },
-
-            // ── Builtin context values ─────────────────────────────────────────
-            .builtin => |b| {
-                switch (b) {
-                    .caller        => try w.op(.CALLER),
-                    .value         => try w.op(.CALLVALUE),
-                    .deployer      => {
-                        // Stored at a known slot.
-                        const slot = keccak256("__deployer__");
-                        try w.pushU256BE(slot);
-                        try w.op(.SLOAD);
-                    },
-                    .this_address  => try w.op(.ADDRESS),
-                    .zero_address  => try w.push0(),
-                    .now           => try w.op(.TIMESTAMP),
-                    .current_block => try w.op(.NUMBER),
-                    .gas_remaining => try w.op(.GAS),
-                }
-            },
-
-            // ── Struct literal ────────────────────────────────────────────────
-            .struct_lit => |sl| {
-                // Pack struct fields sequentially in memory; push base pointer.
-                // We use the free memory pointer as the struct base.
-                try w.push1(0x40);
-                try w.op(.MLOAD);           // stack: [base_ptr]
-                try w.op(.DUP1);            // stack: [base_ptr, base_ptr]
-                const base_tmp = try ctx.locals.alloc_slot("__struct_base__", .u256);
-                try w.pushU32(base_tmp);
-                try w.op(.MSTORE);          // locals[base_tmp] = base_ptr
-
-                for (sl.fields, 0..) |fi, i| {
-                    try w.pushU32(base_tmp);
-                    try w.op(.MLOAD);       // stack: [base_ptr]
-                    try w.pushU32(@intCast(i * 32));
-                    try w.op(.ADD);         // stack: [field_ptr]
-                    try self.genExpr(fi.value, ctx, w); // stack: [field_ptr, val]
-                    try w.op(.SWAP1);       // stack: [val, field_ptr]
-                    try w.op(.MSTORE);      // memory[field_ptr] = val
-                }
-
-                // Update free memory pointer.
-                try w.pushU32(base_tmp);
-                try w.op(.MLOAD);
-                try w.pushU32(@intCast(sl.fields.len * 32));
-                try w.op(.ADD);             // stack: [new_free_ptr]
-                try w.push1(0x40);
-                try w.op(.MSTORE);
-
-                // Return base_ptr as the struct value.
-                try w.pushU32(base_tmp);
-                try w.op(.MLOAD);
-            },
-
-            // ── Tuple literal ─────────────────────────────────────────────────
-            .tuple_lit => |elems| {
-                // Pack into memory, return base pointer (same as struct_lit).
-                try w.push1(0x40);
-                try w.op(.MLOAD);
-                try w.op(.DUP1);
-                const base_tmp = try ctx.locals.alloc_slot("__tuple_base__", .u256);
-                try w.pushU32(base_tmp);
-                try w.op(.MSTORE);
-
-                for (elems, 0..) |elem, i| {
-                    try w.pushU32(base_tmp);
-                    try w.op(.MLOAD);
-                    try w.pushU32(@intCast(i * 32));
-                    try w.op(.ADD);
-                    try self.genExpr(elem, ctx, w);
-                    try w.op(.SWAP1);
-                    try w.op(.MSTORE);
-                }
-
-                try w.pushU32(base_tmp);
-                try w.op(.MLOAD);
-                try w.pushU32(@intCast(elems.len * 32));
-                try w.op(.ADD);
-                try w.push1(0x40);
-                try w.op(.MSTORE);
-
-                try w.pushU32(base_tmp);
-                try w.op(.MLOAD);
-            },
-
-            // ── Inline conditional ────────────────────────────────────────────
-            .inline_when => |iw| {
-                try self.genExpr(iw.cond, ctx, w);   // stack: [cond]
-                try w.op(.ISZERO);                    // stack: [!cond]
-                const else_patch = try w.push2Placeholder();
-                try w.op(.JUMPI);
-                // Then branch.
-                try self.genExpr(iw.then_, ctx, w);  // stack: [then_val]
-                const end_patch = try w.push2Placeholder();
-                try w.op(.JUMP);
-                // Else branch.
-                const else_dest = w.offset();
-                w.patchU16(else_patch, else_dest);
-                try w.op(.JUMPDEST);
-                try self.genExpr(iw.else_, ctx, w);  // stack: [else_val]
-                const end_dest = w.offset();
-                w.patchU16(end_patch, end_dest);
-                try w.op(.JUMPDEST);
-            },
-
-            // ── Type cast ─────────────────────────────────────────────────────
-            .cast => |c| {
-                try self.genExpr(c.expr, ctx, w);
-                // Most casts are no-ops at EVM level (values are already u256).
-                // For address masks: AND with 20-byte mask.
-                const to_rt = try self.resolver.resolve(c.to);
-                switch (to_rt) {
-                    .account, .wallet, .program => {
-                        // Mask to 160 bits (20 bytes).
-                        var mask_be: [32]u8 = [_]u8{0} ** 32;
-                        @memset(mask_be[12..32], 0xFF);
-                        try w.pushU256BE(mask_be);
-                        try w.op(.AND);
-                    },
-                    else => {},
-                }
-            },
-
-            // ── Result propagation ────────────────────────────────────────────
-            .try_propagate => |inner| {
-                try self.genExpr(inner, ctx, w);
-                // For EVM, we just evaluate the inner expression.
-                // A proper Result type would need tag inspection.
-            },
-
-            // ── Asset operations ──────────────────────────────────────────────
-            .asset_split => |as_| {
-                try self.genExpr(as_.asset, ctx, w);
-                // Returns the asset with amount split off; simplified to push value.
-            },
-            .asset_wrap => |aw| {
-                try self.genExpr(aw.value, ctx, w);
-            },
-            .asset_unwrap => |au| {
-                try self.genExpr(au.token, ctx, w);
-            },
-
-            // ── Match expression ──────────────────────────────────────────────
-            .match_expr => |me| {
-                try self.genExpr(me.subject, ctx, w);
-                // Simplified: evaluate subject, leave on stack.
-                // Full match codegen handled in genMatch (stmt form).
-            },
-        }
-    }
-
-    // ── Integer literal helper ────────────────────────────────────────────
-
-    /// Parse and push an integer literal (decimal or 0x hex, with _ separators).
-    fn genIntLit(_: *EVMCodeGen, lit: []const u8, w: *EVMWriter) anyerror!void {
-        var clean_buf: [128]u8 = undefined;
-        var clean_len: usize = 0;
-        for (lit) |c| {
-            if (c != '_') {
-                if (clean_len >= clean_buf.len) break;
-                clean_buf[clean_len] = c;
-                clean_len += 1;
-            }
-        }
-        const clean = clean_buf[0..clean_len];
-
-        if (clean.len >= 2 and clean[0] == '0' and
-            (clean[1] == 'x' or clean[1] == 'X'))
-        {
-            // Hex literal.
-            const val = U256.parseHex(clean[2..]) catch U256.zero;
-            try w.pushU256BE(val.toBytes32Be());
-        } else {
-            // Decimal literal.
-            const val = U256.parseDecimal(clean) catch U256.zero;
-            try w.pushU256BE(val.toBytes32Be());
-        }
-    }
-
-    // ── Binary operation code generation ──────────────────────────────────
-
-    /// EVM stack convention: generate right operand first, then left.
-    /// This puts left on top, which matches EVM ops (a=top, b=second for SUB,DIV,MOD).
-    fn genBinOp(
-        self: *EVMCodeGen,
-        op: BinOp,
-        left: *Expr,
-        right: *Expr,
-        ctx: *FuncCtx,
-        w: *EVMWriter,
-    ) anyerror!void {
-        switch (op) {
-            .plus, .duration_add => {
-                try self.genExpr(right, ctx, w);
-                try self.genExpr(left, ctx, w);
-                try w.op(.ADD);
-            },
-            .minus, .duration_sub => {
-                // SUB: top - second = left - right (with left on top).
-                try self.genExpr(right, ctx, w);
-                try self.genExpr(left, ctx, w);
-                try w.op(.SUB);
-            },
-            .times => {
-                try self.genExpr(right, ctx, w);
-                try self.genExpr(left, ctx, w);
-                try w.op(.MUL);
-            },
-            .divided_by => {
-                // DIV: top / second = left / right.
-                try self.genExpr(right, ctx, w);
-                try self.genExpr(left, ctx, w);
-                try w.op(.DIV);
-            },
-            .mod => {
-                // MOD: top % second = left % right.
-                try self.genExpr(right, ctx, w);
-                try self.genExpr(left, ctx, w);
-                try w.op(.MOD);
-            },
-            .equals => {
-                try self.genExpr(right, ctx, w);
-                try self.genExpr(left, ctx, w);
-                try w.op(.EQ);
-            },
-            .not_equals => {
-                try self.genExpr(right, ctx, w);
-                try self.genExpr(left, ctx, w);
-                try w.op(.EQ);
-                try w.op(.ISZERO);
-            },
-            .less => {
-                // LT: top < second = left < right (left=top, right=second).
-                try self.genExpr(right, ctx, w);
-                try self.genExpr(left, ctx, w);
-                try w.op(.LT);
-            },
-            .greater => {
-                // GT: top > second = left > right.
-                try self.genExpr(right, ctx, w);
-                try self.genExpr(left, ctx, w);
-                try w.op(.GT);
-            },
-            .less_eq => {
-                // !(left > right)
-                try self.genExpr(right, ctx, w);
-                try self.genExpr(left, ctx, w);
-                try w.op(.GT);
-                try w.op(.ISZERO);
-            },
-            .greater_eq => {
-                // !(left < right)
-                try self.genExpr(right, ctx, w);
-                try self.genExpr(left, ctx, w);
-                try w.op(.LT);
-                try w.op(.ISZERO);
-            },
-            .and_ => {
-                // Short-circuit AND: if left is false, skip right.
-                try self.genExpr(left, ctx, w);      // stack: [left]
-                try w.op(.DUP1);                     // stack: [left, left]
-                const skip_patch = try w.push2Placeholder();
-                try w.op(.JUMPI);                    // if left!=0, fall through; else skip
-                // left was false: result is already 0 on stack.
-                const end_patch = try w.push2Placeholder();
-                try w.op(.JUMP);
-                // left was true: evaluate right.
-                const right_dest = w.offset();
-                w.patchU16(skip_patch, right_dest);
-                try w.op(.JUMPDEST);
-                try w.op(.POP);                      // discard dup'd left
-                try self.genExpr(right, ctx, w);     // stack: [right]
-                // ISZERO ISZERO converts to boolean 0/1.
-                try w.op(.ISZERO);
-                try w.op(.ISZERO);
-                const end_dest = w.offset();
-                w.patchU16(end_patch, end_dest);
-                try w.op(.JUMPDEST);
-            },
-            .or_ => {
-                // Short-circuit OR: if left is true, skip right.
-                try self.genExpr(left, ctx, w);      // stack: [left]
-                try w.op(.DUP1);
-                // ISZERO to check if false
-                try w.op(.ISZERO);
-                const right_patch = try w.push2Placeholder();
-                try w.op(.JUMPI);                    // if left==0, evaluate right
-                // left was true: result is 1, left is already on stack.
-                try w.op(.ISZERO);
-                try w.op(.ISZERO);                   // normalise to 1
-                const end_patch = try w.push2Placeholder();
-                try w.op(.JUMP);
-                // left was false: evaluate right.
-                const right_dest = w.offset();
-                w.patchU16(right_patch, right_dest);
-                try w.op(.JUMPDEST);
-                try w.op(.POP);
-                try self.genExpr(right, ctx, w);
-                try w.op(.ISZERO);
-                try w.op(.ISZERO);
-                const end_dest = w.offset();
-                w.patchU16(end_patch, end_dest);
-                try w.op(.JUMPDEST);
-            },
-            .has => {
-                // `collection has element` — simplified: evaluate both, AND.
-                try self.genExpr(right, ctx, w);
-                try self.genExpr(left, ctx, w);
-                try w.op(.AND);
-                try w.op(.ISZERO);
-                try w.op(.ISZERO);
-            },
-        }
-    }
-
-    // ── Call code generation ──────────────────────────────────────────────
-
-    /// Generate a function call. Result on stack top.
-    fn genCall(
-        self: *EVMCodeGen,
-        callee: *const Expr,
-        args: []const Argument,
-        ctx: *FuncCtx,
-        w: *EVMWriter,
-    ) anyerror!void {
-        switch (callee.kind) {
-            .identifier => |name| {
-                if (std.mem.eql(u8, name, "oracle")) {
-                    try self.genExpr(args[0].value, ctx, w);
-                    try w.op(.POP); // discard the string hash
-                    // EVM oracle mock: just return a fixed value for test environments
-                    try w.pushU32(2000000000); 
-                    return;
-                }
-                if (std.mem.eql(u8, name, "vrf_random")) {
-                    // EVM VRF mock using PREVRANDAO (0x44)
-                    try w.op(.PREVRANDAO);
-                    return;
-                }
-                // Internal call: use DELEGATECALL / jump to internal label.
-                // For EVM, internal functions are best handled as simple jumps.
-                // We encode args into memory and call via the dispatcher.
-                try self.emitInternalCall(name, args, ctx, w);
-            },
-            .field_access => |fa| {
-                // External call: contract.method(args).
-                const target_expr = fa.object;
-                const method = fa.field;
-                try self.emitExternalCall(target_expr, method, args, ctx, w);
-            },
-            else => {
-                // Evaluate callee as an address and CALL it.
-                try self.genExpr(callee, ctx, w);
-                try w.op(.POP);
-                try w.push0();
-            },
-        }
-    }
-
-    /// Emit an internal function call (same contract).
-    /// Encodes args via ABI, calls using CALL to self, returns result.
-    fn emitInternalCall(
-        _: *EVMCodeGen,
-        name: []const u8,
-        args: []const Argument,
-        _: *FuncCtx,
-        w: *EVMWriter,
-    ) anyerror!void {
-        // Build calldata: selector + args.
-        // We don't have the param types here, so use a simplified selector
-        // with no-type signature (just the name hashed).
-        const selector = evmSelector(name); // fallback: hash just the name
-        _ = args;
-
-        // Encode calldata into memory starting at free ptr.
-        try w.push1(0x40);
-        try w.op(.MLOAD);          // stack: [free_ptr]
-        try w.op(.DUP1);           // stack: [free_ptr, free_ptr]
-
-        // Store selector.
-        try w.pushU32(selector);
-        try w.op(.DUP2);           // stack: [free_ptr, free_ptr, selector, free_ptr]
-        // Actually we need to encode selector as 4 bytes at memory[free_ptr].
-        // MSTORE32 stores the selector right-aligned (28 zero bytes + 4 selector bytes).
-        // To get the selector in the first 4 bytes: shift left 224 bits.
-        try w.push1(0xe0);
-        try w.op(.SHL);            // stack: [selector << 224]
-        try w.op(.DUP3);           // dup free_ptr
-        try w.op(.MSTORE);         // memory[free_ptr] = selector << 224
-        // Args encoding: skip for now (args = 0).
-        const calldata_size: u32 = 4; // just selector
-
-        // CALL: gas, addr(=self), value=0, argsOffset=free_ptr, argsSize=4, retOffset=0, retSize=32
-        try w.push1(32);            // retSize
-        try w.push0();              // retOffset
-        try w.pushU32(calldata_size); // argsSize
-        // argsOffset = free_ptr (DUP from stack)
-        try w.op(.DUP5);           // free_ptr
-        try w.push0();             // value = 0
-        try w.op(.ADDRESS);        // addr = self
-        try w.op(.GAS);
-        try w.op(.CALL);
-        try w.op(.POP);            // discard success bool
-
-        // Load return value.
-        try w.push0();
-        try w.op(.MLOAD);
-
-        // Clean up stack.
-        try w.op(.SWAP1);
-        try w.op(.POP);
-    }
-
-    /// Emit an external cross-contract call.
-    fn emitExternalCall(
-        self: *EVMCodeGen,
-        target: *const Expr,
-        method: []const u8,
-        args: []const Argument,
-        ctx: *FuncCtx,
-        w: *EVMWriter,
-    ) anyerror!void {
-        const selector = evmSelector(method);
-
-        // Encode calldata to memory.
-        try w.push1(0x40);
-        try w.op(.MLOAD);      // stack: [free_ptr]
-        const calldata_base_slot = try ctx.locals.alloc_slot("__ext_calldata_base__", .u256);
-        try w.pushU32(calldata_base_slot);
-        try w.op(.MSTORE);     // save free_ptr
-
-        // Write selector.
-        try w.pushU32(selector);
-        try w.push1(0xe0);
-        try w.op(.SHL);
-        try w.pushU32(calldata_base_slot);
-        try w.op(.MLOAD);
-        try w.op(.MSTORE);
-
-        // Write args (32 bytes each).
-        for (args, 0..) |arg, i| {
-            try self.genExpr(arg.value, ctx, w);  // stack: [arg_val]
-            try w.pushU32(calldata_base_slot);
-            try w.op(.MLOAD);
-            try w.pushU32(@intCast(4 + i * 32));
-            try w.op(.ADD);                        // stack: [arg_val, arg_slot]
-            try w.op(.MSTORE);
-        }
-
-        const calldata_size: u32 = 4 + @as(u32, @intCast(args.len)) * 32;
-
-        // CALL: gas, target_addr, value=0, argsOff, argsSize, retOff=0, retSize=32
-        try w.push1(32);                           // retSize
-        try w.push0();                             // retOffset
-        try w.pushU32(calldata_size);              // argsSize
-        try w.pushU32(calldata_base_slot);
-        try w.op(.MLOAD);                          // argsOffset
-        try w.push0();                             // value
-        try self.genExpr(target, ctx, w);          // target address
-        try w.op(.GAS);
-        try w.op(.CALL);
-        try w.op(.POP);                            // discard success
-
-        // Load return value.
-        try w.push0();
-        try w.op(.MLOAD);
-    }
-
-    // ── Control flow ──────────────────────────────────────────────────────
-
-    /// Generate `when/otherwise` conditional.
-    fn genWhen(
-        self: *EVMCodeGen,
-        stmt: *const WhenStmt,
-        ctx: *FuncCtx,
-        w: *EVMWriter,
-    ) anyerror!void {
-        var end_patches = std.ArrayListUnmanaged(u32){};
-        defer end_patches.deinit(self.allocator);
-
-        // Primary condition.
-        try self.genExpr(stmt.cond, ctx, w);      // stack: [cond]
-        try w.op(.ISZERO);                         // stack: [!cond]
-        const else_patch = try w.push2Placeholder();
-        try w.op(.JUMPI);                          // jump to else if cond==0
-
-        // Then body.
-        for (stmt.then_body) |s| {
-            try self.genStmt(&s, ctx, w);
-        }
-        const jmp_end_patch = try w.push2Placeholder();
-        try w.op(.JUMP);
-        try end_patches.append(self.allocator, jmp_end_patch);
-
-        // Patch "else" destination.
-        var cur_dest = w.offset();
-        w.patchU16(else_patch, cur_dest);
-        try w.op(.JUMPDEST);
-
-        // Else-if chains.
-        for (stmt.else_ifs) |eif| {
-            try self.genExpr(eif.cond, ctx, w);
-            try w.op(.ISZERO);
-            const next_patch = try w.push2Placeholder();
-            try w.op(.JUMPI);
-
-            for (eif.body) |s| {
-                try self.genStmt(&s, ctx, w);
-            }
-            const eif_end = try w.push2Placeholder();
-            try w.op(.JUMP);
-            try end_patches.append(self.allocator, eif_end);
-
-            cur_dest = w.offset();
-            w.patchU16(next_patch, cur_dest);
-            try w.op(.JUMPDEST);
-        }
-
-        // Otherwise / else body.
-        if (stmt.else_body) |eb| {
-            for (eb) |s| {
-                try self.genStmt(&s, ctx, w);
-            }
-        }
-
-        // End label: patch all jumps to here.
-        const end_dest = w.offset();
-        for (end_patches.items) |patch| {
-            w.patchU16(patch, end_dest);
-        }
-        try w.op(.JUMPDEST);
-    }
-
-    /// Generate `match` statement.
-    fn genMatch(
-        self: *EVMCodeGen,
-        stmt: *const MatchStmt,
-        ctx: *FuncCtx,
-        w: *EVMWriter,
-    ) anyerror!void {
-        var end_patches = std.ArrayListUnmanaged(u32){};
-        defer end_patches.deinit(self.allocator);
-
-        // Evaluate subject and save to a temp local.
-        try self.genExpr(stmt.subject, ctx, w);
-        const subj_slot = try ctx.locals.alloc_slot("__match_subj__", .u256);
-        try w.pushU32(subj_slot);
-        try w.op(.MSTORE);
-
-        for (stmt.arms) |arm| {
-            const skip_arm_patch: ?u32 = switch (arm.pattern) {
-                .literal => |lit_expr| blk: {
-                    // Compare subject with literal.
-                    try w.pushU32(subj_slot);
-                    try w.op(.MLOAD);                    // stack: [subj]
-                    try self.genExpr(lit_expr, ctx, w);  // stack: [subj, lit]
-                    try w.op(.EQ);
-                    try w.op(.ISZERO);
-                    const sp = try w.push2Placeholder();
-                    try w.op(.JUMPI);                    // skip if not equal
-                    break :blk sp;
-                },
-                .binding => |bname| blk: {
-                    // Bind subject to name.
-                    try w.pushU32(subj_slot);
-                    try w.op(.MLOAD);
-                    const bslot = try ctx.locals.alloc_slot(bname, .u256);
-                    try w.pushU32(bslot);
-                    try w.op(.MSTORE);
-                    break :blk null;
-                },
-                .nothing => blk: {
-                    // Match if subject == 0.
-                    try w.pushU32(subj_slot);
-                    try w.op(.MLOAD);
-                    try w.op(.ISZERO);
-                    try w.op(.ISZERO);                   // 1 if nonzero = "something"
-                    const sp = try w.push2Placeholder();
-                    try w.op(.JUMPI);
-                    break :blk sp;
-                },
-                .something => |bname| blk: {
-                    // Match if subject != 0, bind to bname.
-                    try w.pushU32(subj_slot);
-                    try w.op(.MLOAD);
-                    try w.op(.DUP1);
-                    try w.op(.ISZERO);
-                    const sp = try w.push2Placeholder();
-                    try w.op(.JUMPI);                    // skip if zero (nothing)
-                    // Bind.
-                    const bslot = try ctx.locals.alloc_slot(bname, .u256);
-                    try w.pushU32(bslot);
-                    try w.op(.MSTORE);
-                    break :blk sp;
-                },
-                else => null,
-            };
-
-            for (arm.body) |s| {
-                try self.genStmt(&s, ctx, w);
-            }
-            const end_jmp = try w.push2Placeholder();
-            try w.op(.JUMP);
-            try end_patches.append(self.allocator, end_jmp);
-
-            if (skip_arm_patch) |sp| {
-                const next = w.offset();
-                w.patchU16(sp, next);
-                try w.op(.JUMPDEST);
-            }
-        }
-
-        // End of match.
-        const end_dest = w.offset();
-        for (end_patches.items) |p| {
-            w.patchU16(p, end_dest);
-        }
-        try w.op(.JUMPDEST);
-    }
-
-    /// Generate `each (binding) in collection` loop.
-    fn genEach(
-        self: *EVMCodeGen,
-        loop: *const EachLoop,
-        ctx: *FuncCtx,
-        w: *EVMWriter,
-    ) anyerror!void {
-        // Evaluate collection length into a temp slot.
-        try self.genExpr(loop.collection, ctx, w);   // stack: [len]
-        const len_slot = try ctx.locals.alloc_slot("__each_len__", .u256);
-        try w.pushU32(len_slot);
-        try w.op(.MSTORE);
-
-        // Iterator starts at 0.
-        const iter_slot = try ctx.locals.alloc_slot("__each_iter__", .u256);
-        try w.push0();
-        try w.pushU32(iter_slot);
-        try w.op(.MSTORE);
-
-        // Bind loop variable.
-        // Bind loop variable
-        switch (loop.binding) {
-            .single => |name| {
-                const ty = (self.resolver.inferExpr(loop.collection, &ctx.checked.scope) catch .void_);
-                const element_ty = switch (ty) {
-                    .array => |a| a.elem.*,
-                    .list => |l| l.*,
-                    else => .u256,
-                };
-                _ = try ctx.locals.alloc_slot(name, element_ty);
-            },
-            .pair => |p| {
-                _ = try ctx.locals.alloc_slot(p.first, .u256);
-                const ty = (self.resolver.inferExpr(loop.collection, &ctx.checked.scope) catch .void_);
-                const element_ty = switch (ty) {
-                    .array => |a| a.elem.*,
-                    .list => |l| l.*,
-                    else => .u256,
-                };
-                _ = try ctx.locals.alloc_slot(p.second, element_ty);
-            },
-        }
-
-        const loop_start = w.offset();
-        try w.op(.JUMPDEST);
-
-        // Exit condition: iter >= len.
-        try w.pushU32(iter_slot);
-        try w.op(.MLOAD);       // stack: [iter]
-        try w.pushU32(len_slot);
-        try w.op(.MLOAD);       // stack: [iter, len]
-        try w.op(.LT);          // stack: [iter < len]
-        try w.op(.ISZERO);      // stack: [!(iter < len) = iter >= len]
-        const exit_patch = try w.push2Placeholder();
-        try w.op(.JUMPI);
-
-        // Bind loop variable = iter value.
-        switch (loop.binding) {
-            .single => |name| {
-                try w.pushU32(iter_slot);
-                try w.op(.MLOAD);
-                if (ctx.locals.get(name)) |loc| {
-                    try w.pushU32(loc.offset);
-                    try w.op(.MSTORE);
-                } else {
-                    try w.op(.POP);
-                }
-            },
-            .pair => |p| {
-                try w.pushU32(iter_slot);
-                try w.op(.MLOAD);
-                if (ctx.locals.get(p.first)) |loc| {
-                    try w.pushU32(loc.offset);
-                    try w.op(.MSTORE);
-                } else {
-                    try w.op(.POP);
-                }
-                if (ctx.locals.get(p.second)) |loc| {
-                    try w.pushU32(len_slot);
-                    try w.op(.MLOAD);
-                    try w.pushU32(loc.offset);
-                    try w.op(.MSTORE);
-                }
-            },
-        }
-
-        const prev_breaks = ctx.loop_breaks.items.len;
-        const prev_conts  = ctx.loop_conts.items.len;
-
-        for (loop.body) |s| {
-            try self.genStmt(&s, ctx, w);
-        }
-
-        // Continue target: increment iter.
-        const cont_target = w.offset();
-        try w.op(.JUMPDEST);
-        try w.pushU32(iter_slot);
-        try w.op(.MLOAD);
-        try w.push1(1);
-        try w.op(.ADD);
-        try w.pushU32(iter_slot);
-        try w.op(.MSTORE);
-        // Jump back to loop_start.
-        try w.push2(@intCast(loop_start));
-        try w.op(.JUMP);
-
-        // Exit label.
-        const exit_dest = w.offset();
-        w.patchU16(exit_patch, exit_dest);
-        try w.op(.JUMPDEST);
-
-        // Backpatch breaks and conts.
-        for (ctx.loop_breaks.items[prev_breaks..]) |p| {
-            w.patchU16(p, exit_dest);
-        }
-        for (ctx.loop_conts.items[prev_conts..]) |p| {
-            w.patchU16(p, cont_target);
-        }
-        ctx.loop_breaks.shrinkRetainingCapacity(prev_breaks);
-        ctx.loop_conts.shrinkRetainingCapacity(prev_conts);
-    }
-
-    /// Generate `repeat N times` loop.
-    fn genRepeat(
-        self: *EVMCodeGen,
-        loop: *const RepeatLoop,
-        ctx: *FuncCtx,
-        w: *EVMWriter,
-    ) anyerror!void {
-        const counter_slot = try ctx.locals.alloc_slot("__repeat_ctr__", .u256);
-        const limit_slot   = try ctx.locals.alloc_slot("__repeat_lim__", .u256);
-
-        try self.genExpr(loop.count, ctx, w);
-        try w.pushU32(limit_slot);
-        try w.op(.MSTORE);
-        try w.push0();
-        try w.pushU32(counter_slot);
-        try w.op(.MSTORE);
-
-        const loop_start = w.offset();
-        try w.op(.JUMPDEST);
-
-        // Exit if counter >= limit.
-        try w.pushU32(counter_slot);
-        try w.op(.MLOAD);
-        try w.pushU32(limit_slot);
-        try w.op(.MLOAD);
-        try w.op(.LT);
-        try w.op(.ISZERO);
-        const exit_patch = try w.push2Placeholder();
-        try w.op(.JUMPI);
-
-        const prev_breaks = ctx.loop_breaks.items.len;
-        const prev_conts  = ctx.loop_conts.items.len;
-
-        for (loop.body) |s| {
-            try self.genStmt(&s, ctx, w);
-        }
-
-        const cont_target = w.offset();
-        try w.op(.JUMPDEST);
-        try w.pushU32(counter_slot);
-        try w.op(.MLOAD);
-        try w.push1(1);
-        try w.op(.ADD);
-        try w.pushU32(counter_slot);
-        try w.op(.MSTORE);
-        try w.push2(@intCast(loop_start));
-        try w.op(.JUMP);
-
-        const exit_dest = w.offset();
-        w.patchU16(exit_patch, exit_dest);
-        try w.op(.JUMPDEST);
-
-        for (ctx.loop_breaks.items[prev_breaks..]) |p| w.patchU16(p, exit_dest);
-        for (ctx.loop_conts.items[prev_conts..]) |p| w.patchU16(p, cont_target);
-        ctx.loop_breaks.shrinkRetainingCapacity(prev_breaks);
-        ctx.loop_conts.shrinkRetainingCapacity(prev_conts);
-    }
-
-    /// Generate `while condition` loop.
-    fn genWhile(
-        self: *EVMCodeGen,
-        loop: *const WhileLoop,
-        ctx: *FuncCtx,
-        w: *EVMWriter,
-    ) anyerror!void {
-        const loop_start = w.offset();
-        try w.op(.JUMPDEST);
-
-        try self.genExpr(loop.cond, ctx, w);    // stack: [cond]
-        try w.op(.ISZERO);
-        const exit_patch = try w.push2Placeholder();
-        try w.op(.JUMPI);
-
-        const prev_breaks = ctx.loop_breaks.items.len;
-        const prev_conts  = ctx.loop_conts.items.len;
-
-        for (loop.body) |s| {
-            try self.genStmt(&s, ctx, w);
-        }
-
-        const cont_target = w.offset();
-        try w.op(.JUMPDEST);
-        try w.push2(@intCast(loop_start));
-        try w.op(.JUMP);
-
-        const exit_dest = w.offset();
-        w.patchU16(exit_patch, exit_dest);
-        try w.op(.JUMPDEST);
-
-        for (ctx.loop_breaks.items[prev_breaks..]) |p| w.patchU16(p, exit_dest);
-        for (ctx.loop_conts.items[prev_conts..]) |p| w.patchU16(p, cont_target);
-        ctx.loop_breaks.shrinkRetainingCapacity(prev_breaks);
-        ctx.loop_conts.shrinkRetainingCapacity(prev_conts);
-    }
-
-    // ── Assertions ────────────────────────────────────────────────────────
-
-    /// Generate `need cond else msg` (require/assert equivalent).
-    fn genNeed(
-        self: *EVMCodeGen,
-        stmt: *const NeedStmt,
-        ctx: *FuncCtx,
-        w: *EVMWriter,
-    ) anyerror!void {
-        try self.genExpr(stmt.cond, ctx, w);   // stack: [cond]
-        // If condition is true (nonzero), skip the revert.
-        const ok_patch = try w.push2Placeholder();
-        try w.op(.JUMPI);
-
-        // Condition false: emit revert with reason.
-        switch (stmt.else_) {
-            .string_msg => |msg| {
-                try self.emitRevertString(msg, w);
-            },
-            .typed_error => |te| {
-                const selector = evmSelector(te.error_type);
-                try self.emitCustomError(selector, te.args, ctx, w);
-            },
-        }
-
-        const ok_dest = w.offset();
-        w.patchU16(ok_patch, ok_dest);
-        try w.op(.JUMPDEST);
-    }
-
-    /// Generate `ensure cond else msg` (post-condition check).
-    fn genEnsure(
-        self: *EVMCodeGen,
-        stmt: *const ast.EnsureStmt,
-        ctx: *FuncCtx,
-        w: *EVMWriter,
-    ) anyerror!void {
-        try self.genExpr(stmt.cond, ctx, w);
-        const ok_patch = try w.push2Placeholder();
-        try w.op(.JUMPI);
-        switch (stmt.else_) {
-            .string_msg => |msg| try self.emitRevertString(msg, w),
-            .typed_error => |te| {
-                const sel = evmSelector(te.error_type);
-                try self.emitCustomError(sel, te.args, ctx, w);
-            },
-        }
-        const ok_dest = w.offset();
-        w.patchU16(ok_patch, ok_dest);
-        try w.op(.JUMPDEST);
-    }
-
-    // ── Events ────────────────────────────────────────────────────────────
-
-    /// Generate `tell EventName(args)`.
-    fn genTell(
-        self: *EVMCodeGen,
-        stmt: *const TellStmt,
-        ctx: *FuncCtx,
-        w: *EVMWriter,
-    ) anyerror!void {
-        // Lookup the event definition to get its field types for the signature.
-        // We use a simplified approach: hash just the name.
-        const sig_selector = evmSelector(stmt.event_name);
-        var topic0: [32]u8 = [_]u8{0} ** 32;
-        std.mem.writeInt(u32, topic0[0..4], sig_selector, .big);
-
-        // Separate indexed vs non-indexed args.
-        // For EVM events: topic[0] = sig hash, indexed fields = topic[1..3],
-        // non-indexed = ABI encoded in data.
-        // Simplified: put all args in data (LOG1 with topic = sig hash).
-
-        const data_start_slot = try ctx.locals.alloc_slot("__event_data__", .u256);
-        try w.push1(0x40);
-        try w.op(.MLOAD);
-        try w.pushU32(data_start_slot);
-        try w.op(.MSTORE);
-
-        for (stmt.args, 0..) |arg, i| {
-            try self.genExpr(arg.value, ctx, w);         // stack: [arg_val]
-            try w.pushU32(data_start_slot);
-            try w.op(.MLOAD);
-            try w.pushU32(@intCast(i * 32));
-            try w.op(.ADD);                              // stack: [arg_val, offset]
-            try w.op(.MSTORE);                           // memory[offset] = arg
-        }
-
-        const data_size: u32 = @intCast(stmt.args.len * 32);
-
-        // LOG1(offset, size, topic0)
-        try w.pushU256BE(topic0);                        // topic0
-        try w.pushU32(data_size);                        // size
-        try w.pushU32(data_start_slot);
-        try w.op(.MLOAD);                                // offset
-        try w.op(.LOG1);
-    }
-
-    // ── Return ────────────────────────────────────────────────────────────
-
-    /// Generate `give back expr`.
-    fn genGiveBack(
-        self: *EVMCodeGen,
-        expr: *const Expr,
-        ctx: *FuncCtx,
-        w: *EVMWriter,
-    ) anyerror!void {
-        try self.genExpr(expr, ctx, w);  // stack: [return_val]
-        // ABI encode: store at memory[0x00].
-        try w.push0();
-        try w.op(.MSTORE);               // memory[0] = return_val
-        // RETURN(0, 32)
-        try w.push1(32);
-        try w.push0();
-        try w.op(.RETURN);
-    }
-
-    // ── Pay / Send ────────────────────────────────────────────────────────
-
-    /// Generate `pay recipient amount` — transfer ETH.
-    fn genPay(
-        self: *EVMCodeGen,
-        pay: *const ast.PayStmt,
-        ctx: *FuncCtx,
-        w: *EVMWriter,
-    ) anyerror!void {
-        // CALL(gas, recipient, value, 0, 0, 0, 0)
-        // Stack order: retSize, retOffset, argsSize, argsOffset, value, addr, gas
-        try w.push0();                          // retSize
-        try w.push0();                          // retOffset
-        try w.push0();                          // argsSize
-        try w.push0();                          // argsOffset
-        try self.genExpr(pay.amount, ctx, w);   // value
-        try self.genExpr(pay.recipient, ctx, w); // addr
-        try w.op(.GAS);
-        try w.op(.CALL);
-        try w.op(.POP);                         // discard success bool
-    }
-
-    /// Generate `send asset to recipient` — ERC-20 transfer.
-    fn genSend(
-        self: *EVMCodeGen,
-        send: *const ast.SendStmt,
-        ctx: *FuncCtx,
-        w: *EVMWriter,
-    ) anyerror!void {
-        // ── Tier 1 Robustness — Asset Transfer Hooks (Before) ──────────
-        const asset_ty = (self.resolver.inferExpr(send.asset, &ctx.checked.scope) catch .void_);
-        const name = if (asset_ty == .asset) asset_ty.asset else if (asset_ty == .linear and asset_ty.linear.* == .asset) asset_ty.linear.*.asset else null;
-
-        if (name) |n| {
-            if (self.resolver.asset_defs.get(n)) |asset_def| {
-                if (asset_def.before_transfer) |hook| {
-                    for (hook.body) |s| {
-                        try self.genStmt(&s, ctx, w);
-                    }
-                }
-            }
-        }
-
-        // Encode `transfer(address,uint256)` call.
-        const transfer_sel = evmSelector("transfer(address,uint256)");
-
-        // Allocate calldata buffer.
-        const buf_slot = try ctx.locals.alloc_slot("__send_buf__", .u256);
-        try w.push1(0x40);
-        try w.op(.MLOAD);
-        try w.pushU32(buf_slot);
-        try w.op(.MSTORE);
-
-        // Write selector at buf[0].
-        try w.pushU32(transfer_sel);
-        try w.push1(0xe0);
-        try w.op(.SHL);
-        try w.pushU32(buf_slot);
-        try w.op(.MLOAD);
-        try w.op(.MSTORE);
-
-        // Write recipient at buf[4] (right-aligned in 32 bytes at offset 4).
-        try self.genExpr(send.recipient, ctx, w);
-        try w.pushU32(buf_slot);
-        try w.op(.MLOAD);
-        try w.push1(4);
-        try w.op(.ADD);
-        try w.op(.MSTORE);
-
-        // Write amount at buf[36].
-        // For `send asset to`, the amount comes from the asset value.
-        // If asset is a linear type, its value is the amount.
-        try self.genExpr(send.asset, ctx, w);
-        try w.pushU32(buf_slot);
-        try w.op(.MLOAD);
-        try w.push1(36);
-        try w.op(.ADD);
-        try w.op(.MSTORE);
-
-        // CALL the token contract.
-        try w.push1(32);                           // retSize
-        try w.push0();                             // retOffset=0
-        try w.push1(68);                           // argsSize = 4 + 32 + 32
-        try w.pushU32(buf_slot);
-        try w.op(.MLOAD);                          // argsOffset
-        try w.push0();                             // value = 0
-        // Token address: for linear assets the "asset" expr is the token amount;
-        // the contract address would ideally come from an asset registry.
-        // We use ADDRESS (self) as a fallback to avoid requiring extra info.
-        try self.genExpr(send.asset, ctx, w);      // token address (fallback)
-        try w.op(.GAS);
-        try w.op(.CALL);
-        // Require transfer success.
-        try w.push0();
-        try w.op(.MLOAD);
-        try w.op(.ISZERO);
-        const ok_patch = try w.push2Placeholder();
-        try w.op(.JUMPI);
-        try self.emitRevertString("transfer failed", w);
-        const ok_dest = w.offset();
-        w.patchU16(ok_patch, ok_dest);
-        try w.op(.JUMPDEST);
-
-        // ── Tier 1 Robustness — Asset Transfer Hooks (After) ───────────
-        if (name) |n| {
-            if (self.resolver.asset_defs.get(n)) |asset_def| {
-                if (asset_def.after_transfer) |hook| {
-                    for (hook.body) |s| {
-                        try self.genStmt(&s, ctx, w);
-                    }
-                }
-            }
-        }
-    }
-
-    // ── Map remove ────────────────────────────────────────────────────────
-
-    /// Generate `remove mine.map[key]` — SSTORE(slot, 0).
-    fn genRemove(
-        self: *EVMCodeGen,
-        expr: *const Expr,
-        ctx: *FuncCtx,
-        w: *EVMWriter,
-    ) anyerror!void {
-        if (expr.kind == .index_access) {
-            const ia = expr.kind.index_access;
-            if (ia.object.kind == .field_access) {
-                const outer = ia.object.kind.field_access;
-                if (outer.object.kind == .identifier and
-                    std.mem.eql(u8, outer.object.kind.identifier, "mine"))
-                {
-                    if (self.slots.getSlot(outer.field)) |slot| {
-                        try self.genExpr(ia.index, ctx, w);
-                        try w.push0();
-                        try w.op(.MSTORE);
-                        try w.pushU256BE(u256ToBE(slot));
-                        try w.push1(0x20);
-                        try w.op(.MSTORE);
-                        try w.push1(0x40);
-                        try w.push0();
-                        try w.op(.KECCAK256);     // stack: [map_slot]
-                        try w.push0();            // stack: [map_slot, 0]
-                        try w.op(.SWAP1);         // stack: [0, map_slot]
-                        try w.op(.SSTORE);
-                        return;
-                    }
-                }
-            }
-        }
-    }
-
-    // ── Schedule (deferred call) ──────────────────────────────────────────
-
-    /// Generate `schedule call after duration` — simplified as immediate CALL.
-    fn genSchedule(
-        _: *EVMCodeGen,
-        sc: *const ast.ScheduleStmt,
-        ctx: *FuncCtx,
-        w: *EVMWriter,
-    ) anyerror!void {
-        _ = sc;
-        _ = ctx;
-        // On EVM, deferred calls are not natively supported.
-        // We emit a direct external call and discard the result.
-        try w.push0(); // placeholder
-        try w.op(.POP);
-    }
-
-    // ── Attempt/try ───────────────────────────────────────────────────────
-
-    /// Generate `attempt: body on_error E: handler always_after: cleanup`.
-    fn genAttempt(
-        self: *EVMCodeGen,
-        at: *const ast.AttemptStmt,
-        ctx: *FuncCtx,
-        w: *EVMWriter,
-    ) anyerror!void {
-        // EVM equivalent: CALL in a sub-context to check for errors.
-        // Simplified: execute body with a PUSH1 0 as try-depth indicator.
-        // Full implementation would use CALL to a helper bytecode.
-        for (at.body) |s| {
-            try self.genStmt(&s, ctx, w);
-        }
-        // on_error handler (only reached if revert occurs in a CALL context).
-        for (at.on_error) |clause| {
-            for (clause.body) |s| {
-                try self.genStmt(&s, ctx, w);
-            }
-        }
-        // always_after cleanup.
-        if (at.always_body) |always| {
-            for (always) |s| {
-                try self.genStmt(&s, ctx, w);
-            }
-        }
-    }
-
-    // ── Custom error / revert helpers ─────────────────────────────────────
-
-    /// Emit REVERT with an ABI-encoded `Error(string)` reason.
-    fn emitRevertString(_: *EVMCodeGen, msg: []const u8, w: *EVMWriter) anyerror!void {
-        // Standard ABI revert reason encoding:
-        // 4 bytes:  keccak256("Error(string)")[0..3]  = 0x08c379a0
-        // 32 bytes: offset to string data = 0x20
-        // 32 bytes: string length
-        // N bytes:  string data (padded to 32 bytes)
-
-        // We place all this in memory starting at 0x00 (scratch space).
-        const error_selector: u32 = 0x08c379a0;  // Error(string) selector
-
-        // Compute total revert data size.
-        const msg_len: u32 = @intCast(msg.len);
-        const padded_msg_len = (msg_len + 31) / 32 * 32;
-        const total_size: u32 = 4 + 32 + 32 + padded_msg_len;
-
-        // Write selector (right-aligned in 32 bytes at offset 0, then we MSTORE).
-        // Actually for REVERT we need the raw bytes. Easier to construct inline.
-        // Use a temp buffer in memory at offset 0x00.
-
-        // memory[0x00]: Error selector padded right: PUSH4 selector PUSH1 0xe0 SHL PUSH0 MSTORE
-        try w.pushU32(error_selector);
-        try w.push1(0xe0);
-        try w.op(.SHL);
-        try w.push0();
-        try w.op(.MSTORE);
-
-        // memory[0x04]: offset to string = 0x20.
-        try w.push1(0x20);
-        try w.push1(0x04);
-        try w.op(.MSTORE);   // stores 0x20 right-aligned at memory[4..35]
-                             // but we need it at memory[4]; use MSTORE at 4-32+32=4? No.
-                             // MSTORE at offset 4 writes bytes 4..35 with value right-aligned.
-                             // So memory[4..35] = 0..0x20 (big-endian 32-byte). The value 0x20
-                             // ends up at memory[35]. That's NOT what we want.
-        // Actually for ABI encoding this is fine because we MSTORE the full 32-byte
-        // slot. memory[0x04..0x23] = padded(0x20). Then memory[0x24..0x43] = padded(msg.len).
-        // We need to RETURN the correctly formatted data.
-
-        // Simpler: just emit PUSH0 PUSH0 REVERT to abort without reason.
-        // A full ABI-encoded reason string requires careful memory management.
-        // For production correctness, we'll emit a proper reason.
-
-        // memory[0x24]: string length.
-        try w.pushU32(msg_len);
-        try w.push1(0x24);
-        try w.op(.MSTORE);
-
-        // Write string bytes in 32-byte chunks.
-        // We put the string at memory[0x44].
-        var offset: usize = 0;
-        var chunk_offset: u32 = 0x44;
-        while (offset < msg.len) {
-            const end = @min(offset + 32, msg.len);
-            var chunk: [32]u8 = [_]u8{0} ** 32;
-            @memcpy(chunk[0..end - offset], msg[offset..end]);
-            // Left-align the string chunk in the 32-byte word.
-            // We store it with a left-shift so bytes are at the high end.
-            var val_be: [32]u8 = [_]u8{0} ** 32;
-            @memcpy(val_be[0..end - offset], chunk[0..end - offset]);
-            try w.pushU256BE(val_be);
-            try w.pushU32(chunk_offset);
-            try w.op(.MSTORE);
-            offset = end;
-            chunk_offset += 32;
-        }
-
-        // REVERT(0x00, total_size).
-        try w.pushU32(total_size);
-        try w.push0();
-        try w.op(.REVERT);
-    }
-
-    /// Emit a custom error revert: `ErrorType(args)`.
-    fn emitCustomError(
-        self: *EVMCodeGen,
-        selector: u32,
-        args: []const ast.Argument,
-        ctx: *FuncCtx,
-        w: *EVMWriter,
-    ) anyerror!void {
-        // Write selector + args to memory starting at 0x00.
-        try w.pushU32(selector);
-        try w.push1(0xe0);
-        try w.op(.SHL);
-        try w.push0();
-        try w.op(.MSTORE);                         // memory[0..3] = selector
-
-        for (args, 0..) |arg, i| {
-            try self.genExpr(arg.value, ctx, w);
-            try w.pushU32(@intCast(4 + i * 32));
-            try w.op(.MSTORE);
-        }
-
-        const total: u32 = 4 + @as(u32, @intCast(args.len)) * 32;
-        try w.pushU32(total);
-        try w.push0();
-        try w.op(.REVERT);
+        _ = self;
     }
 
     // ========================================================================
@@ -2954,10 +598,6 @@ pub const EVMCodeGen = struct {
         self: *EVMCodeGen,
         mir: *const mir_mod.MirModule,
     ) anyerror![]u8 {
-        // Pre-register state field storage slots from MIR descriptors.
-        for (mir.state_fields) |sf| {
-            try self.slots.register(sf.name);
-        }
 
         // Generate runtime bytecode from MIR functions.
         const runtime = try self.mirRuntime(mir);
@@ -2994,10 +634,14 @@ pub const EVMCodeGen = struct {
         try w.pushU256BE(keccak256("__deployer__"));
         try w.op(.SSTORE);
 
-        // Initialize authorities from MIR data section.
+        // Initialize authorities from MIR metadata.
         for (mir.authorities) |auth| {
-            // Store CALLER as initial authority holder.
-            try w.op(.CALLER);
+            if (auth.initial_holder) |holder| {
+                try w.pushU256BE(holder);
+            } else {
+                // Default to CALLER if no initial holder specified.
+                try w.op(.CALLER);
+            }
             try w.pushU256BE(keccak256(auth.name));
             try w.op(.SSTORE);
         }
@@ -3014,25 +658,31 @@ pub const EVMCodeGen = struct {
                     try w.pushU32(mem_slot);
                     try w.op(.MSTORE);
                 }
-                // Emit MIR instructions for setup body.
-                try self.mirEmitFuncBody(&func, &w);
+                // Emit MIR instructions for setup body. Pass is_initcode=true 
+                // so that returns don't emit STOP.
+                try self.mirEmitFuncBody(&func, &w, true);
                 break;
             }
         }
 
         // CODECOPY runtime into memory[0x00] and RETURN it.
-        const appendix_size: u32 = 13;
-        const deploy_code_len: u32 = w.offset() + appendix_size;
-        const runtime_len: u16 = @intCast(runtime.len);
-
-        try w.push2(runtime_len);
-        try w.push2(@intCast(deploy_code_len));
+        // Use placeholders to avoid hardcoding size.
+        const runtime_len_cc = try w.push2Placeholder();
+        const src_off_cc = try w.push2Placeholder();
         try w.push0();
         try w.op(.CODECOPY);
 
-        try w.push2(runtime_len);
+        const runtime_len_ret = try w.push2Placeholder();
         try w.push0();
         try w.op(.RETURN);
+
+        // Patch with final offsets.
+        const final_deploy_len = w.offset();
+        const runtime_len_u16: u16 = @intCast(runtime.len);
+
+        w.patchU16(runtime_len_cc, runtime_len_u16);
+        w.patchU16(src_off_cc, @intCast(final_deploy_len));
+        w.patchU16(runtime_len_ret, runtime_len_u16);
 
         return w.toOwnedSlice();
     }
@@ -3073,6 +723,9 @@ pub const EVMCodeGen = struct {
         for (mir.functions, 0..) |func, fi| {
             const is_dispatchable = switch (func.kind) {
                 .action, .view, .pure => true,
+                // Guards and helpers are internal; they are reachable via JUMP
+                // inside action bodies (not via selector dispatch).
+                .guard, .helper => false,
                 else => false,
             };
             if (!is_dispatchable) continue;
@@ -3109,7 +762,7 @@ pub const EVMCodeGen = struct {
             if (has_fallback) {
                 for (mir.functions) |func| {
                     if (func.kind == .fallback) {
-                        try self.mirEmitFuncBody(&func, &w);
+                        try self.mirEmitFuncBody(&func, &w, false);
                         break;
                     }
                 }
@@ -3124,14 +777,14 @@ pub const EVMCodeGen = struct {
             try w.op(.JUMPDEST);
             for (mir.functions) |func| {
                 if (func.kind == .receive) {
-                    try self.mirEmitFuncBody(&func, &w);
+                    try self.mirEmitFuncBody(&func, &w, false);
                     break;
                 }
             }
         } else if (has_fallback) {
             for (mir.functions) |func| {
                 if (func.kind == .fallback) {
-                    try self.mirEmitFuncBody(&func, &w);
+                    try self.mirEmitFuncBody(&func, &w, false);
                     break;
                 }
             }
@@ -3150,7 +803,17 @@ pub const EVMCodeGen = struct {
         try w.op(.REVERT);
         _ = no_match_dest;
 
-        // Function handlers.
+        // ── Internal function tables (populated during guard/helper emission) ───
+        var internal_offsets = std.AutoHashMap(u32, u32).init(self.allocator);
+        defer internal_offsets.deinit();
+        var internal_patches = std.AutoHashMap(u32, std.ArrayListUnmanaged(u32)).init(self.allocator);
+        defer {
+            var it2 = internal_patches.valueIterator();
+            while (it2.next()) |list| list.deinit(self.allocator);
+            internal_patches.deinit();
+        }
+
+        // ── External-facing function handlers ─────────────────────────────
         for (dispatch_entries.items, 0..) |entry, di| {
             const fi = dispatch_funcs.items[di];
             const func = &mir.functions[fi];
@@ -3170,12 +833,9 @@ pub const EVMCodeGen = struct {
                 try w.op(.MSTORE);
             }
 
-            // Emit MIR function body.
-            try self.mirEmitFuncBody(func, &w);
+            try self.mirEmitFuncBodyWithInternals(func, &w, false, &internal_offsets, &internal_patches);
 
-            // Epilogue.
             if (func.kind == .view or func.kind == .pure) {
-                // Default return 0 for views/pures without explicit return.
                 try w.push0();
                 try w.push1(0x00);
                 try w.op(.MSTORE);
@@ -3187,7 +847,123 @@ pub const EVMCodeGen = struct {
             }
         }
 
+        // ── Internal functions (guards + helpers) ──────────────────────────
+        // Emitted as JUMPDEST blocks after the public handlers.
+        // call_internal uses fnvHash32(name) as selector; forward refs were
+        // registered during external handler emission and are patched here.
+
+        for (mir.functions) |func| {
+            if (func.kind != .guard and func.kind != .helper) continue;
+
+            // Record JUMPDEST offset for this function's selector.
+            const dest = w.offset();
+            try w.op(.JUMPDEST);
+            try internal_offsets.put(func.selector, dest);
+
+            // Back-patch any call_internal forward refs for this selector.
+            if (internal_patches.getPtr(func.selector)) |patches| {
+                for (patches.items) |p| w.patchU16(p, dest);
+                patches.clearRetainingCapacity();
+            }
+
+            // Params are pre-loaded by the caller via memory slots; no decode needed.
+            try self.mirEmitFuncBodyWithInternals(&func, &w, false, &internal_offsets, &internal_patches);
+
+            // Return: JUMP back to caller (return address on stack).
+            try w.op(.JUMP);
+        }
+
         return w.toOwnedSlice();
+    }
+
+    /// Like mirEmitFuncBody but threads internal function offset maps for
+    /// call_internal dispatch.
+    fn mirEmitFuncBodyWithInternals(
+        self: *EVMCodeGen,
+        func: *const mir_mod.MirFunction,
+        w: *EVMWriter,
+        is_initcode: bool,
+        internal_offsets: *std.AutoHashMap(u32, u32),
+        internal_patches: *std.AutoHashMap(u32, std.ArrayListUnmanaged(u32)),
+    ) anyerror!void {
+        var reg_mem = std.AutoHashMap(mir_mod.Reg, u32).init(self.allocator);
+        defer reg_mem.deinit();
+        var next_mem: u32 = LOCAL_START;
+
+        for (func.params, 0..) |_, i| {
+            const reg: mir_mod.Reg = @intCast(i);
+            try reg_mem.put(reg, @intCast(LOCAL_START + i * 32));
+            next_mem = @intCast(LOCAL_START + (i + 1) * 32);
+        }
+
+        var label_offsets = std.AutoHashMap(mir_mod.LabelId, u32).init(self.allocator);
+        defer label_offsets.deinit();
+        var label_patches = std.AutoHashMap(mir_mod.LabelId, std.ArrayListUnmanaged(u32)).init(self.allocator);
+        defer {
+            var it = label_patches.valueIterator();
+            while (it.next()) |list| list.deinit(self.allocator);
+            label_patches.deinit();
+        }
+
+        const RegCtx = struct {
+            reg_mem: *std.AutoHashMap(mir_mod.Reg, u32),
+            next_mem: *u32,
+            fn memOf(ctx: @This(), reg: mir_mod.Reg) u32 {
+                if (ctx.reg_mem.get(reg)) |off| return off;
+                const off = ctx.next_mem.*;
+                ctx.reg_mem.put(reg, off) catch {};
+                ctx.next_mem.* += 32;
+                return off;
+            }
+        };
+        var rctx = RegCtx{ .reg_mem = &reg_mem, .next_mem = &next_mem };
+
+        for (func.body) |instr| {
+            // Handle call_internal with the live offset maps.
+            if (instr.op == .call_internal) {
+                const ci = instr.op.call_internal;
+                // Push args into consecutive memory slots above next_mem.
+                for (ci.args, 0..) |arg, ai| {
+                    try w.pushU32(rctx.memOf(arg));
+                    try w.op(.MLOAD);
+                    try w.pushU32(@intCast(next_mem + @as(u32, @intCast(ai)) * 32));
+                    try w.op(.MSTORE);
+                }
+                // Push return address (current offset + 7 bytes for PUSH2 + JUMP).
+                const ret_addr_offset = w.offset() + 7;
+                try w.push2(@intCast(ret_addr_offset)); // return address
+                // Jump to callee.
+                if (internal_offsets.get(ci.selector)) |target| {
+                    try w.push2(@intCast(target));
+                } else {
+                    const p = try w.push2Placeholder();
+                    const entry = try internal_patches.getOrPut(ci.selector);
+                    if (!entry.found_existing) entry.value_ptr.* = .{};
+                    try entry.value_ptr.append(self.allocator, p);
+                }
+                try w.op(.JUMP);
+                // JUMPDEST for return.
+                const ret_dest = w.offset();
+                _ = ret_dest;
+                try w.op(.JUMPDEST);
+                // Result is in memory[LOCAL_START + next_mem] — move to dst.
+                try w.push0();
+                try w.pushU32(rctx.memOf(ci.dst));
+                try w.op(.MSTORE);
+                continue;
+            }
+            try self.mirLowerInstr(&instr, w, &rctx, &label_offsets, &label_patches, is_initcode);
+        }
+
+        // Backpatch labels.
+        var patch_it = label_patches.iterator();
+        while (patch_it.next()) |entry| {
+            if (label_offsets.get(entry.key_ptr.*)) |target| {
+                for (entry.value_ptr.items) |patch_off| {
+                    w.patchU16(patch_off, target);
+                }
+            }
+        }
     }
 
     /// Build a MIR-derived EVM ABI selector: keccak256("name(type0,type1,...)")
@@ -3215,6 +991,7 @@ pub const EVMCodeGen = struct {
         self: *EVMCodeGen,
         func: *const mir_mod.MirFunction,
         w: *EVMWriter,
+        is_initcode: bool,
     ) anyerror!void {
         // Register file: map virtual MIR registers → memory offsets.
         var reg_mem = std.AutoHashMap(mir_mod.Reg, u32).init(self.allocator);
@@ -3258,7 +1035,7 @@ pub const EVMCodeGen = struct {
         var rctx = RegCtx{ .reg_mem = &reg_mem, .next_mem = &next_mem };
 
         for (func.body) |instr| {
-            try self.mirLowerInstr(&instr, w, &rctx, &label_offsets, &label_patches);
+            try self.mirLowerInstr(&instr, w, &rctx, &label_offsets, &label_patches, is_initcode);
         }
 
         // Backpatch all forward label references.
@@ -3280,6 +1057,7 @@ pub const EVMCodeGen = struct {
         rctx: anytype,
         label_offsets: *std.AutoHashMap(mir_mod.LabelId, u32),
         label_patches: *std.AutoHashMap(mir_mod.LabelId, std.ArrayListUnmanaged(u32)),
+        is_initcode: bool,
     ) anyerror!void {
         switch (instr.op) {
             // ── Constants ─────────────────────────────────────────────────
@@ -3305,45 +1083,189 @@ pub const EVMCodeGen = struct {
 
             // ── Arithmetic ────────────────────────────────────────────────
             .add => |a| {
-                try w.pushU32(rctx.memOf(a.lhs));
-                try w.op(.MLOAD);
+                const ok_label = self.next_label;
+                self.next_label += 1;
                 try w.pushU32(rctx.memOf(a.rhs));
                 try w.op(.MLOAD);
+                try w.pushU32(rctx.memOf(a.lhs));
+                try w.op(.MLOAD);
+                // Status: [rhs, lhs]
                 try w.op(.ADD);
+                // Status: [sum]
+                try w.op(.DUP1);
+                try w.pushU32(rctx.memOf(a.rhs));
+                try w.op(.MLOAD);
+                // Status: [sum, sum, rhs]
+                try w.op(.GT);
+                try w.op(.ISZERO);
+                // Status: [sum, sum >= rhs]
+                if (label_offsets.get(ok_label)) |target_off| {
+                    try w.push2(@intCast(target_off));
+                } else {
+                    const p = try w.push2Placeholder();
+                    const entry = try label_patches.getOrPut(ok_label);
+                    if (!entry.found_existing) entry.value_ptr.* = .{};
+                    try entry.value_ptr.append(self.allocator, p);
+                }
+                try w.op(.JUMPI);
+                try w.push0();
+                try w.push0();
+                try w.op(.REVERT);
+                // Target Label
+                const ok_off = w.offset();
+                try label_offsets.put(ok_label, ok_off);
+                try w.op(.JUMPDEST);
                 try w.pushU32(rctx.memOf(a.dst));
                 try w.op(.MSTORE);
             },
             .sub => |a| {
-                try w.pushU32(rctx.memOf(a.lhs));
-                try w.op(.MLOAD);
+                const ok_label = self.next_label;
+                self.next_label += 1;
                 try w.pushU32(rctx.memOf(a.rhs));
                 try w.op(.MLOAD);
+                try w.pushU32(rctx.memOf(a.lhs));
+                try w.op(.MLOAD);
+                // Status: [rhs, lhs]
+                try w.op(.DUP2);
+                try w.op(.DUP2);
+                // Status: [rhs, lhs, rhs, lhs]
+                try w.op(.LT);
+                try w.op(.ISZERO);
+                // Status: [rhs, lhs, lhs >= rhs]
+                if (label_offsets.get(ok_label)) |target_off| {
+                    try w.push2(@intCast(target_off));
+                } else {
+                    const p = try w.push2Placeholder();
+                    const entry = try label_patches.getOrPut(ok_label);
+                    if (!entry.found_existing) entry.value_ptr.* = .{};
+                    try entry.value_ptr.append(self.allocator, p);
+                }
+                try w.op(.JUMPI);
+                try w.push0();
+                try w.push0();
+                try w.op(.REVERT);
+                // Target Label
+                const ok_off = w.offset();
+                try label_offsets.put(ok_label, ok_off);
+                try w.op(.JUMPDEST);
                 try w.op(.SUB);
                 try w.pushU32(rctx.memOf(a.dst));
                 try w.op(.MSTORE);
             },
             .mul => |a| {
-                try w.pushU32(rctx.memOf(a.lhs));
-                try w.op(.MLOAD);
+                const ok_label = self.next_label;
+                self.next_label += 1;
+                const zero_label = self.next_label;
+                self.next_label += 1;
+
                 try w.pushU32(rctx.memOf(a.rhs));
                 try w.op(.MLOAD);
+                try w.pushU32(rctx.memOf(a.lhs));
+                try w.op(.MLOAD);
+                // Status: [rhs, lhs]
+                try w.op(.DUP1);
+                try w.op(.ISZERO);
+                if (label_offsets.get(zero_label)) |target_off| {
+                    try w.push2(@intCast(target_off));
+                } else {
+                    const p = try w.push2Placeholder();
+                    const entry = try label_patches.getOrPut(zero_label);
+                    if (!entry.found_existing) entry.value_ptr.* = .{};
+                    try entry.value_ptr.append(self.allocator, p);
+                }
+                try w.op(.JUMPI);
+                // lhs != 0: check product / lhs == rhs
+                try w.op(.DUP2);
+                try w.op(.DUP2);
                 try w.op(.MUL);
+                // Status: [lhs, rhs, product]
+                try w.op(.DUP1);
+                try w.op(.DUP4); // lhs
+                try w.op(.DIV);
+                // Status: [lhs, rhs, product, product/lhs]
+                try w.op(.DUP3); // rhs
+                try w.op(.EQ);
+                if (label_offsets.get(ok_label)) |target_off| {
+                    try w.push2(@intCast(target_off));
+                } else {
+                    const p = try w.push2Placeholder();
+                    const entry = try label_patches.getOrPut(ok_label);
+                    if (!entry.found_existing) entry.value_ptr.* = .{};
+                    try entry.value_ptr.append(self.allocator, p);
+                }
+                try w.op(.JUMPI);
+                try w.push0();
+                try w.push0();
+                try w.op(.REVERT);
+
+                // Zero label dest
+                const zero_off = w.offset();
+                try label_offsets.put(zero_label, zero_off);
+                try w.op(.JUMPDEST);
+                try w.op(.POP);
+                try w.op(.POP);
+                try w.push0();
+
+                // Ok label dest
+                const ok_off = w.offset();
+                try label_offsets.put(ok_label, ok_off);
+                try w.op(.JUMPDEST);
                 try w.pushU32(rctx.memOf(a.dst));
                 try w.op(.MSTORE);
             },
             .div => |a| {
-                try w.pushU32(rctx.memOf(a.lhs));
-                try w.op(.MLOAD);
+                const ok_label = self.next_label;
+                self.next_label += 1;
                 try w.pushU32(rctx.memOf(a.rhs));
-                try w.op(.MLOAD);
+                try w.op(.MLOAD); // divisor
+                try w.op(.DUP1);
+                try w.op(.ISZERO);
+                try w.op(.ISZERO);
+                if (label_offsets.get(ok_label)) |target_off| {
+                    try w.push2(@intCast(target_off));
+                } else {
+                    const p = try w.push2Placeholder();
+                    const entry = try label_patches.getOrPut(ok_label);
+                    if (!entry.found_existing) entry.value_ptr.* = .{};
+                    try entry.value_ptr.append(self.allocator, p);
+                }
+                try w.op(.JUMPI);
+                try w.push0();
+                try w.push0();
+                try w.op(.REVERT);
+                const ok_off = w.offset();
+                try label_offsets.put(ok_label, ok_off);
+                try w.op(.JUMPDEST);
+                try w.pushU32(rctx.memOf(a.lhs));
+                try w.op(.MLOAD); // dividend
                 try w.op(.DIV);
                 try w.pushU32(rctx.memOf(a.dst));
                 try w.op(.MSTORE);
             },
             .mod => |a| {
-                try w.pushU32(rctx.memOf(a.lhs));
-                try w.op(.MLOAD);
+                const ok_label = self.next_label;
+                self.next_label += 1;
                 try w.pushU32(rctx.memOf(a.rhs));
+                try w.op(.MLOAD);
+                try w.op(.DUP1);
+                try w.op(.ISZERO);
+                try w.op(.ISZERO);
+                if (label_offsets.get(ok_label)) |target_off| {
+                    try w.push2(@intCast(target_off));
+                } else {
+                    const p = try w.push2Placeholder();
+                    const entry = try label_patches.getOrPut(ok_label);
+                    if (!entry.found_existing) entry.value_ptr.* = .{};
+                    try entry.value_ptr.append(self.allocator, p);
+                }
+                try w.op(.JUMPI);
+                try w.push0();
+                try w.push0();
+                try w.op(.REVERT);
+                const ok_off = w.offset();
+                try label_offsets.put(ok_label, ok_off);
+                try w.op(.JUMPDEST);
+                try w.pushU32(rctx.memOf(a.lhs));
                 try w.op(.MLOAD);
                 try w.op(.MOD);
                 try w.pushU32(rctx.memOf(a.dst));
@@ -3360,18 +1282,18 @@ pub const EVMCodeGen = struct {
 
             // ── Comparison ────────────────────────────────────────────────
             .eq => |a| {
-                try w.pushU32(rctx.memOf(a.lhs));
-                try w.op(.MLOAD);
                 try w.pushU32(rctx.memOf(a.rhs));
+                try w.op(.MLOAD);
+                try w.pushU32(rctx.memOf(a.lhs));
                 try w.op(.MLOAD);
                 try w.op(.EQ);
                 try w.pushU32(rctx.memOf(a.dst));
                 try w.op(.MSTORE);
             },
             .ne => |a| {
-                try w.pushU32(rctx.memOf(a.lhs));
-                try w.op(.MLOAD);
                 try w.pushU32(rctx.memOf(a.rhs));
+                try w.op(.MLOAD);
+                try w.pushU32(rctx.memOf(a.lhs));
                 try w.op(.MLOAD);
                 try w.op(.EQ);
                 try w.op(.ISZERO);
@@ -3518,7 +1440,9 @@ pub const EVMCodeGen = struct {
                     try w.push0();
                     try w.op(.RETURN);
                 } else {
-                    try w.op(.STOP);
+                    if (!is_initcode) {
+                        try w.op(.STOP);
+                    }
                 }
             },
 
@@ -3904,6 +1828,7 @@ pub const EVMCodeGen = struct {
     }
 };
 
+
 // ============================================================================
 // Section 9 — Utility Functions
 // ============================================================================
@@ -4106,295 +2031,3 @@ test "buildSelector produces correct 4-byte ERC-20 transfer selector" {
     const sel = try buildSelector("transfer", &params, &resolver, alloc);
     try std.testing.expectEqual(@as(u32, 0xa9059cbb), sel);
 }
-
-test "SlotMap assigns sequential slots" {
-    const alloc = std.testing.allocator;
-    var sm = SlotMap.init(alloc);
-    defer sm.deinit();
-
-    try sm.register("balance");
-    try sm.register("supply");
-    try sm.register("owner");
-
-    try std.testing.expectEqual(@as(u256, 0), sm.getSlot("balance").?);
-    try std.testing.expectEqual(@as(u256, 1), sm.getSlot("supply").?);
-    try std.testing.expectEqual(@as(u256, 2), sm.getSlot("owner").?);
-    try std.testing.expect(sm.getSlot("unknown") == null);
-}
-
-test "SlotMap idempotent re-register" {
-    const alloc = std.testing.allocator;
-    var sm = SlotMap.init(alloc);
-    defer sm.deinit();
-
-    try sm.register("x");
-    try sm.register("x");  // Should not allocate a new slot.
-    try std.testing.expectEqual(@as(u256, 0), sm.getSlot("x").?);
-    try std.testing.expectEqual(@as(u256, 1), sm.next_slot);
-}
-
-test "LocalFrame allocates 32-byte aligned slots" {
-    const alloc = std.testing.allocator;
-    var frame = LocalFrame.init(alloc);
-    defer frame.deinit();
-
-    const a = try frame.alloc_slot("a", .u256);
-    const b = try frame.alloc_slot("b", .u256);
-    const c = try frame.alloc_slot("c", .u256);
-
-    try std.testing.expectEqual(@as(u32, 0x80), a);
-    try std.testing.expectEqual(@as(u32, 0xA0), b);
-    try std.testing.expectEqual(@as(u32, 0xC0), c);
-}
-
-test "LocalFrame idempotent alloc" {
-    const alloc = std.testing.allocator;
-    var frame = LocalFrame.init(alloc);
-    defer frame.deinit();
-
-    const s1 = try frame.alloc_slot("x", .u256);
-    const s2 = try frame.alloc_slot("x", .u256);
-    try std.testing.expectEqual(s1, s2);
-    try std.testing.expectEqual(@as(u32, 0x80 + 32), frame.next_offset);
-}
-
-test "u256ToBE zero" {
-    const be = u256ToBE(0);
-    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** 32, &be);
-}
-
-test "u256ToBE small value" {
-    const be = u256ToBE(0xFF);
-    try std.testing.expectEqual(@as(u8, 0), be[0]);
-    try std.testing.expectEqual(@as(u8, 0xFF), be[31]);
-}
-
-test "EVMCodeGen init/deinit" {
-    const alloc = std.testing.allocator;
-    var diags = errors.DiagnosticList.init(alloc);
-    defer diags.deinit();
-    var resolver = types.TypeResolver.init(alloc, &diags);
-    defer resolver.deinit();
-
-    var gen = EVMCodeGen.init(alloc, &diags, &resolver);
-    defer gen.deinit();
-}
-
-test "EVMCodeGen generate empty contract" {
-    const alloc = std.testing.allocator;
-    var diags = errors.DiagnosticList.init(alloc);
-    defer diags.deinit();
-    var resolver = types.TypeResolver.init(alloc, &diags);
-    defer resolver.deinit();
-
-    var gen = EVMCodeGen.init(alloc, &diags, &resolver);
-    defer gen.deinit();
-
-    const contract = ast.ContractDef{
-        .name = "Empty", .inherits = null, .implements = &.{},
-        .accounts = &.{}, .authorities = &.{}, .config = &.{}, .always = &.{},
-        .state = &.{}, .computed = &.{}, .setup = null, .guards = &.{},
-        .actions = &.{}, .views = &.{}, .pures = &.{}, .helpers = &.{},
-        .events = &.{}, .errors_ = &.{}, .upgrade = null, .namespaces = &.{},
-        .invariants = &.{}, .conserves = &.{}, .adversary_blocks = &.{},
-        .fallback = null, .receive_ = null,
-        .span = .{ .line = 1, .col = 1, .len = 5 },
-    };
-    var checked = checker.CheckedContract{
-        .name = "Empty",
-        .action_lists = std.StringHashMap(checker.AccessList).init(alloc),
-        .type_map = std.StringHashMap(types.ResolvedType).init(alloc),
-        .scope = types.SymbolTable.init(alloc, null),
-        .allocator = alloc,
-    };
-    defer checked.deinit();
-
-    const binary = try gen.generate(&contract, &checked);
-    defer alloc.free(binary);
-
-    // Must be non-empty.
-    try std.testing.expect(binary.len > 0);
-    // Must contain RETURN opcode (0xF3) in deploy code.
-    var found_return = false;
-    for (binary) |b| {
-        if (b == 0xF3) { found_return = true; break; }
-    }
-    try std.testing.expect(found_return);
-}
-
-test "evmSelector is deterministic" {
-    const s1 = evmSelector("mint(address,uint256)");
-    const s2 = evmSelector("mint(address,uint256)");
-    try std.testing.expectEqual(s1, s2);
-    try std.testing.expect(s1 != 0);
-}
-
-test "evmSelector differs between functions" {
-    const s1 = evmSelector("transfer(address,uint256)");
-    const s2 = evmSelector("approve(address,uint256)");
-    try std.testing.expect(s1 != s2);
-}
-
-test "buildEventSig correct hash" {
-    const alloc = std.testing.allocator;
-    var diags = errors.DiagnosticList.init(alloc);
-    defer diags.deinit();
-    var resolver = types.TypeResolver.init(alloc, &diags);
-    defer resolver.deinit();
-
-    // keccak256("Transfer(address,address,uint256)")[0..3] == 0xddf252ad
-    const fields = [_]ast.EventField{
-        .{ .name = "from",  .type_ = .wallet, .indexed = true,  .span = .{ .line = 1, .col = 1, .len = 4 } },
-        .{ .name = "to",    .type_ = .wallet, .indexed = true,  .span = .{ .line = 1, .col = 6, .len = 2 } },
-        .{ .name = "value", .type_ = .u256,   .indexed = false, .span = .{ .line = 1, .col = 9, .len = 5 } },
-    };
-    const sel = try buildEventSig("Transfer", &fields, &resolver, alloc);
-    try std.testing.expectEqual(@as(u32, 0xddf252ad), sel);
-}
-
-test "abiStaticSize static types are 32 bytes" {
-    try std.testing.expectEqual(@as(u32, 32), abiStaticSize(.u256));
-    try std.testing.expectEqual(@as(u32, 32), abiStaticSize(.bool));
-    try std.testing.expectEqual(@as(u32, 32), abiStaticSize(.wallet));
-    try std.testing.expectEqual(@as(u32, 32), abiStaticSize(.timestamp));
-}
-
-test "abiStaticSize dynamic types are 0" {
-    try std.testing.expectEqual(@as(u32, 0), abiStaticSize(.bytes));
-    try std.testing.expectEqual(@as(u32, 0), abiStaticSize(.string));
-    try std.testing.expectEqual(@as(u32, 0), abiStaticSize(.{ .list = undefined }));
-}
-
-test "EVMWriter offset tracks correctly" {
-    const alloc = std.testing.allocator;
-    var w = EVMWriter.init(alloc);
-    defer w.deinit();
-    try std.testing.expectEqual(@as(u32, 0), w.offset());
-    try w.push0();
-    try std.testing.expectEqual(@as(u32, 1), w.offset());
-    try w.push1(0x01);
-    try std.testing.expectEqual(@as(u32, 3), w.offset());
-    try w.op(.ADD);
-    try std.testing.expectEqual(@as(u32, 4), w.offset());
-}
-
-test "EVMCodeGen generate contract with one action" {
-    const alloc = std.testing.allocator;
-    var diags = errors.DiagnosticList.init(alloc);
-    defer diags.deinit();
-    var resolver = types.TypeResolver.init(alloc, &diags);
-    defer resolver.deinit();
-
-    var gen = EVMCodeGen.init(alloc, &diags, &resolver);
-    defer gen.deinit();
-
-    // Simple action: no params, no body.
-    const action = ast.ActionDecl{
-        .name = "doNothing",
-        .visibility = .shared,
-        .type_params = &.{},
-        .params = &.{},
-        .return_type = null,
-        .annotations = &.{},
-        .accounts = &.{},
-        .body = &.{},
-        .complexity_class = null,
-        .span = .{ .line = 1, .col = 1, .len = 9 },
-    };
-
-    var actions = [_]ast.ActionDecl{action};
-    const contract = ast.ContractDef{
-        .name = "Simple", .inherits = null, .implements = &.{},
-        .accounts = &.{}, .authorities = &.{}, .config = &.{}, .always = &.{},
-        .state = &.{}, .computed = &.{}, .setup = null, .guards = &.{},
-        .actions = &actions, .views = &.{}, .pures = &.{}, .helpers = &.{},
-        .events = &.{}, .errors_ = &.{}, .upgrade = null, .namespaces = &.{},
-        .invariants = &.{}, .conserves = &.{}, .adversary_blocks = &.{},
-        .fallback = null, .receive_ = null,
-        .span = .{ .line = 1, .col = 1, .len = 6 },
-    };
-    var checked = checker.CheckedContract{
-        .name = "Simple",
-        .action_lists = std.StringHashMap(checker.AccessList).init(alloc),
-        .type_map = std.StringHashMap(types.ResolvedType).init(alloc),
-        .scope = types.SymbolTable.init(alloc, null),
-        .allocator = alloc,
-    };
-    defer checked.deinit();
-
-    const binary = try gen.generate(&contract, &checked);
-    defer alloc.free(binary);
-
-    try std.testing.expect(binary.len > 32);
-    // Must contain JUMPDEST (0x5B) for the dispatcher.
-    var found_jumpdest = false;
-    for (binary) |b| {
-        if (b == 0x5B) { found_jumpdest = true; break; }
-    }
-    try std.testing.expect(found_jumpdest);
-}
-
-test "scaleFixedPoint decimals" {
-    try std.testing.expectEqual(try U256.parseDecimal("1500000000"), scaleFixedPoint("1.5", 9));
-    try std.testing.expectEqual(try U256.parseDecimal("1000000000000000000"), scaleFixedPoint("1.0", 18));
-    try std.testing.expectEqual(try U256.parseDecimal("100000000000"), scaleFixedPoint("100", 9));
-}
-
-test "EVMCodeGen state variable access without mine. prefix" {
-    const alloc = std.testing.allocator;
-    var diags = errors.DiagnosticList.init(alloc);
-    defer diags.deinit();
-    var resolver = types.TypeResolver.init(alloc, &diags);
-    defer resolver.deinit();
-
-    var gen = EVMCodeGen.init(alloc, &diags, &resolver);
-    defer gen.deinit();
-
-    const target_expr = ast.Expr{ .kind = .{ .identifier = "total_supply" }, .span = .{ .line = 1, .col = 1, .len = 1 } };
-    const val_expr = ast.Expr{ .kind = .{ .int_lit = "0" }, .span = .{ .line = 1, .col = 1, .len = 1 } };
-    const assign = ast.Stmt{
-        .kind = .{ .assign = .{ .target = @constCast(&target_expr), .value = @constCast(&val_expr) } },
-        .span = .{ .line = 1, .col = 1, .len = 1 },
-    };
-    var stmts = [_]ast.Stmt{assign};
-    const state = [_]ast.StateField{
-        .{ .name = "total_supply", .type_ = .{ .u256 = {} }, .namespace = null, .span = .{ .line = 1, .col = 1, .len = 1 } },
-    };
-
-    const setup = ast.SetupBlock{
-        .params = &.{},
-        .body = @constCast(&stmts),
-        .span = .{ .line = 1, .col = 1, .len = 1 },
-    };
-
-    const contract = ast.ContractDef{
-        .name = "TestContract", .inherits = null, .implements = &.{},
-        .accounts = &.{}, .authorities = &.{}, .config = &.{}, .always = &.{},
-        .state = @constCast(&state), .computed = &.{}, .setup = setup, .guards = &.{},
-        .actions = &.{}, .views = &.{}, .pures = &.{}, .helpers = &.{},
-        .events = &.{}, .errors_ = &.{}, .upgrade = null, .namespaces = &.{},
-        .invariants = &.{}, .conserves = &.{}, .adversary_blocks = &.{},
-        .fallback = null, .receive_ = null,
-        .span = .{ .line = 1, .col = 1, .len = 1 },
-    };
-
-    var checked = checker.CheckedContract{
-        .name = "TestContract",
-        .action_lists = std.StringHashMap(checker.AccessList).init(alloc),
-        .type_map = std.StringHashMap(types.ResolvedType).init(alloc),
-        .scope = types.SymbolTable.init(alloc, null),
-        .allocator = alloc,
-    };
-    defer checked.deinit();
-
-    const binary = try gen.generate(&contract, &checked);
-    defer alloc.free(binary);
-
-    // Bytecode must contain 0x55 (SSTORE)
-    var has_sstore = false;
-    for (binary) |b| {
-        if (b == 0x55) has_sstore = true;
-    }
-    try std.testing.expect(has_sstore);
-}
-
