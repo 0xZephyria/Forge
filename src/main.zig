@@ -202,13 +202,21 @@ pub fn compile(
     defer resolver.deinit();
     try resolver.registerTopLevel(top_levels);
 
-    // ── Stage 4: Find the contract ───────────────────────────────────────
+    // ── Stage 4: Find components ─────────────────────────────────────────
     var contract_ptr: ?*const ast.ContractDef = null;
+    var assets = std.ArrayListUnmanaged(*const ast.AssetDef){};
+    var invariants = std.ArrayListUnmanaged(*const ast.GlobalInvariantDef){};
+
     for (top_levels) |*tl| {
         switch (tl.*) {
             .contract => |*c| {
-                contract_ptr = c;
-                break;
+                if (contract_ptr == null) contract_ptr = c;
+            },
+            .asset_def => |*a| {
+                try assets.append(temp_alloc, a);
+            },
+            .global_invariant => |*gi| {
+                try invariants.append(temp_alloc, gi);
             },
             else => {},
         }
@@ -244,11 +252,18 @@ pub fn compile(
 
     // ── Stage 6: Code generation ─────────────────────────────────────────
     var binary: []u8 = undefined;
+
+    // Helper to lower everything into a MirModule.
+    const asset_slice = try temp_alloc.alloc(ast.AssetDef, assets.items.len);
+    for (assets.items, 0..) |a, i| asset_slice[i] = a.*;
+    const invariant_slice = try temp_alloc.alloc(ast.GlobalInvariantDef, invariants.items.len);
+    for (invariants.items, 0..) |gi, i| invariant_slice[i] = gi.*;
+
     if (opts.evm_abi) {
         // ── MIR-based EVM pipeline: AST → MIR → EVM bytecode ──────────
         var lowerer = mir.MirLowerer.init(temp_alloc, &resolver, &diagnostics);
         defer lowerer.deinit();
-        const mir_module = try lowerer.lowerContract(contract, &checked);
+        const mir_module = try lowerer.lowerAll(contract, asset_slice, invariant_slice);
 
         var gen = CodeGenEVM.init(temp_alloc, &diagnostics, &resolver);
         defer gen.deinit();
@@ -260,7 +275,7 @@ pub fn compile(
         // ── MIR-based PolkaVM pipeline: AST → MIR → RISC-V bytecode ──
         var lowerer = mir.MirLowerer.init(temp_alloc, &resolver, &diagnostics);
         defer lowerer.deinit();
-        const mir_module = try lowerer.lowerContract(contract, &checked);
+        const mir_module = try lowerer.lowerAll(contract, asset_slice, invariant_slice);
 
         var gen = CodeGenPolkaVM.init(temp_alloc, &diagnostics, &resolver);
         defer gen.deinit();

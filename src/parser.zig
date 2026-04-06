@@ -361,6 +361,18 @@ pub const Parser = struct {
             .kw_record    => .{ .record_def   = try self.parseRecordDef() },
             .kw_enum      => .{ .enum_def     = try self.parseEnumDef()   },
             .kw_alias     => .{ .type_alias   = try self.parseTypeAlias() },
+            .kw_global    => blk: {
+                const start_col = self.peek().span.col;
+                _ = self.advance();
+                if (self.check(.kw_invariant)) {
+                    break :blk .{ .global_invariant = try self.parseGlobalInvariant(start_col) };
+                } else {
+                    const tok = self.peek();
+                    try self.emitErr(tok.span, error.ExpectedToken, "expected 'invariant' after 'global', found '{s}'", .{tok.text});
+                    return error.ExpectedToken;
+                }
+            },
+            .kw_global_invariant => .{ .global_invariant = try self.parseGlobalInvariant(self.peek().span.col) },
             else          => null,
         };
     }
@@ -613,6 +625,49 @@ pub const Parser = struct {
             .after_transfer     = after_transfer,
             .metadata_per_token = metadata_per_token,
             .span               = start,
+        };
+    }
+
+    fn parseGlobalInvariant(self: *Parser, start_col: u32) anyerror!ast.GlobalInvariantDef {
+        const start = self.peek().span;
+        _ = try self.expect(.kw_invariant);
+        const name = (try self.expect(.identifier)).text;
+        _ = try self.expect(.colon);
+        const parent_indent = start_col - 1;
+        const block_indent = try self.expectIndentIncrease(parent_indent);
+
+        var participants = std.ArrayListUnmanaged([]const u8){};
+        var always_conditions = std.ArrayListUnmanaged(ast.InvariantDecl){};
+        var on_violation: []ast.Stmt = &[_]ast.Stmt{};
+
+        while (!self.isBlockEnd(block_indent)) {
+            self.skipTrivia();
+            if (self.isBlockEnd(block_indent)) break;
+            const key = (try self.expect(.identifier)).text;
+            _ = try self.expect(.colon);
+            if (std.mem.eql(u8, key, "on_violation")) {
+                const inner_indent = try self.expectIndentIncrease(block_indent);
+                on_violation = try self.parseBlock(inner_indent);
+            } else if (std.mem.eql(u8, key, "participants")) {
+                _ = try self.expect(.lbracket);
+                while (!self.check(.rbracket) and self.peekKind() != .eof) {
+                    try participants.append(self.allocator, (try self.expect(.identifier)).text);
+                    _ = self.matchAny(&.{.comma});
+                }
+                _ = try self.expect(.rbracket);
+            } else {
+                const tok = self.peek();
+                try self.emitErr(tok.span, error.UnexpectedToken, "unknown invariant field '{s}'", .{key});
+                _ = self.advance();
+            }
+        }
+
+        return .{
+            .name = name,
+            .participants = try participants.toOwnedSlice(self.allocator),
+            .always_conditions = try always_conditions.toOwnedSlice(self.allocator),
+            .on_violation = on_violation,
+            .span = start,
         };
     }
 

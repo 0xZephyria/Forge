@@ -308,6 +308,11 @@ pub const FuncKind = enum {
     receive,
     guard,
     helper,
+    asset_hook,        // SPEC: Part 8.3 — before/after transfer hooks
+    computed,          // SPEC: Part 5.2 — derived field logic
+    invariant_handler, // SPEC: Novel Idea 5 — on_violation blocks
+    attack_spec,       // SPEC: Novel Idea 3 — adversary tries: blocks
+    migration_logic,   // SPEC: Part 13 — upgrade: migrate_fn logic
 };
 
 /// SPEC: Part 5 — A function parameter in MIR form.
@@ -1530,6 +1535,49 @@ pub const MirLowerer = struct {
         checked: *const CheckedContract,
     ) anyerror!MirModule {
         _ = checked;
+        return self.lowerAll(contract, &[_]ast.AssetDef{}, &[_]ast.GlobalInvariantDef{});
+    }
+
+    pub fn lowerAll(
+        self: *MirLowerer,
+        contract: *const ContractDef,
+        assets: []const ast.AssetDef,
+        invariants: []const ast.GlobalInvariantDef,
+    ) anyerror!MirModule {
+        // ── Lower Global Assets ───────────────────────────────────────────
+        for (assets) |asset| {
+            if (asset.before_transfer) |bt| {
+                try self.lowerFuncBody(
+                    try std.fmt.allocPrint(self.allocator, "{s}_before_transfer", .{asset.name}),
+                    .asset_hook,
+                    bt.params,
+                    null,
+                    bt.body,
+                );
+            }
+            if (asset.after_transfer) |at| {
+                try self.lowerFuncBody(
+                    try std.fmt.allocPrint(self.allocator, "{s}_after_transfer", .{asset.name}),
+                    .asset_hook,
+                    at.params,
+                    null,
+                    at.body,
+                );
+            }
+        }
+
+        // ── Lower Global Invariants ───────────────────────────────────────
+        for (invariants) |inv| {
+            if (inv.on_violation.len > 0) {
+                try self.lowerFuncBody(
+                    try std.fmt.allocPrint(self.allocator, "{s}_on_violation", .{inv.name}),
+                    .invariant_handler,
+                    &[_]ast.Param{},
+                    null,
+                    inv.on_violation,
+                );
+            }
+        }
 
         // Pre-register all state field IDs in declaration order.
         for (contract.state) |sf| {
@@ -1651,6 +1699,51 @@ pub const MirLowerer = struct {
                 null,
                 recv.body,
             );
+        }
+
+        // ── Lower computed fields ─────────────────────────────────────────
+        for (contract.computed) |cf| {
+            const rt = MirType.fromResolved(self.resolver.resolve(cf.type_) catch .void_);
+            const body = try self.allocator.alloc(ast.Stmt, 1);
+            body[0] = .{
+                .kind = .{ .give_back = cf.expr },
+                .span = cf.span,
+            };
+            try self.lowerFuncBody(
+                cf.name,
+                .computed,
+                &[_]ast.Param{},
+                rt,
+                body,
+            );
+        }
+
+        // ── Lower adversary blocks ────────────────────────────────────────
+        for (contract.adversary_blocks) |ab| {
+            for (ab.attacks) |as| {
+                const expr_ptr = try self.allocator.create(ast.Expr);
+                expr_ptr.* = .{
+                    .kind = .{ .identifier = "self" },
+                    .span = as.span,
+                };
+                const body = try self.allocator.alloc(ast.Stmt, 1);
+                body[0] = .{ .kind = .{ .call_stmt = expr_ptr }, .span = as.span };
+                try self.lowerFuncBody(
+                    as.name,
+                    .attack_spec,
+                    &[_]ast.Param{},
+                    null,
+                    body,
+                );
+            }
+        }
+
+        // ── Lower upgrade block ───────────────────────────────────────────
+        if (contract.upgrade) |up| {
+            if (up.migrate_fn) |fn_name| {
+                // If migration logic is defined, ensure it's lowered if internal.
+                _ = fn_name;
+            }
         }
 
         // ── Build state field descriptors ─────────────────────────────────
