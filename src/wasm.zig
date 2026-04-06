@@ -20,6 +20,7 @@ const codegen_polkavm = @import("codegen_polkavm.zig");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const abi = @import("abi.zig");
+const mir_mod = @import("mir.zig");
 
 // ── Allocator setup for Freestanding Wasm ────────────────────────────────────
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -164,13 +165,24 @@ fn compileInternal(alloc: std.mem.Allocator, source: []const u8, target_evm: boo
         if (!diagnostics.hasErrors()) {
             // Stage 5: Code Gen
             if (target_evm) {
+                // ── MIR-based EVM pipeline: AST → MIR → EVM bytecode ──────────
+                var lowerer = mir_mod.MirLowerer.init(temp_alloc, &resolver, &diagnostics);
+                defer lowerer.deinit();
+                const mir_module = try lowerer.lowerContract(contract, &checked);
+
                 var cg = codegen_evm.EVMCodeGen.init(temp_alloc, &diagnostics, &resolver);
-                binary = try cg.generate(contract, &checked);
+                defer cg.deinit();
+                cg.mir_data = mir_module.data_section;
+                cg.mir_events = mir_module.events;
+                const tmp_bin = try cg.generateFromMir(&mir_module);
+                binary = try temp_alloc.dupe(u8, tmp_bin);
             } else {
                 var cg = codegen.CodeGen.init(temp_alloc, &diagnostics, &resolver);
-                binary = try cg.generate(contract, &checked);
+                defer cg.deinit();
+                const tmp_bin = try cg.generate(contract, &checked);
+                binary = try temp_alloc.dupe(u8, tmp_bin);
             }
-            
+
             // Stage 6: ABI
             var abi_gen = abi.AbiGenerator.init(temp_alloc, &resolver);
             if (target_evm) {
@@ -180,6 +192,7 @@ fn compileInternal(alloc: std.mem.Allocator, source: []const u8, target_evm: boo
             }
         }
     }
+
 
     // Prepare JSON Response
     if (diagnostics.hasErrors()) {

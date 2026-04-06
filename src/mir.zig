@@ -354,6 +354,8 @@ pub const AuthorityDesc = struct {
     name: []const u8,
     name_offset: u32,
     name_len: u32,
+    /// Optional initial holder address (20 or 32 bytes).
+    initial_holder: ?[32]u8 = null,
 };
 
 /// SPEC: Part 5 — A single lowered function.
@@ -1436,7 +1438,12 @@ pub const MirLowerer = struct {
                     {
                         fname = outer.field;
                     }
+                } else if (ia.object.kind == .identifier) {
+                    if (self.field_ids.get(ia.object.kind.identifier)) |_| {
+                        fname = ia.object.kind.identifier;
+                    }
                 }
+
                 if (fname) |name| {
                     const fid = try self.getOrAssignFieldId(name);
                     try self.emit(.{ .state_write = .{
@@ -1610,6 +1617,20 @@ pub const MirLowerer = struct {
             );
         }
 
+        // ── Lower guards ────────────────────────────────────────────────────────────
+        // SPEC: Part 6.1 — Guards revert on condition failure and return nothing
+        // on success. They have no return type. Lowered as FuncKind.guard so
+        // backends can emit them as auth-check JUMPDEST blocks.
+        for (contract.guards) |guard| {
+            try self.lowerFuncBody(
+                guard.name,
+                .guard,
+                guard.params,
+                null,
+                guard.body,
+            );
+        }
+
         // ── Lower fallback ────────────────────────────────────────────────
         if (contract.fallback) |fb| {
             try self.lowerFuncBody(
@@ -1683,10 +1704,53 @@ pub const MirLowerer = struct {
         const auths = try self.allocator.alloc(AuthorityDesc, contract.authorities.len);
         for (contract.authorities, 0..) |auth, i| {
             const interned = try self.data.intern(auth.name);
+            var holder: ?[32]u8 = null;
+            if (auth.initial_holder) |expr| {
+                if (expr.kind == .int_lit) {
+                    const lit = expr.kind.int_lit;
+                    if (std.mem.startsWith(u8, lit, "0x")) {
+                        // Parse hex address into the bottom 20 bytes for EVM compatibility.
+                        const clean = if (std.mem.indexOf(u8, lit, "0x")) |idx| lit[idx + 2 ..] else lit;
+                        var j: usize = 0;
+                        var val: u8 = 0;
+                        var out_idx: usize = 31;
+                        // Walk backwards to fill the address.
+                        var k: usize = clean.len;
+                        while (k > 0) {
+                            k -= 1;
+                            const h = clean[k];
+                            const digit: u8 = switch (h) {
+                                '0'...'9' => h - '0',
+                                'a'...'f' => h - 'a' + 10,
+                                'A'...'F' => h - 'A' + 10,
+                                '_' => continue,
+                                else => break,
+                            };
+                            if (j % 2 == 0) {
+                                val = digit;
+                            } else {
+                                val |= digit << 4;
+                                addr_loop: {
+                                    holder = holder orelse [_]u8{0} ** 32;
+                                    holder.?[out_idx] = val;
+                                    if (out_idx == 0) break :addr_loop;
+                                    out_idx -= 1;
+                                }
+                            }
+                            j += 1;
+                        }
+                        if (j % 2 != 0) {
+                            holder = holder orelse [_]u8{0} ** 32;
+                            holder.?[out_idx] = val;
+                        }
+                    }
+                }
+            }
             auths[i] = .{
                 .name = auth.name,
                 .name_offset = interned.offset,
                 .name_len = interned.len,
+                .initial_holder = holder,
             };
         }
 

@@ -25,7 +25,7 @@ contracts/zk_basis_robust.foz
 contracts/mixed_test.foz
 contracts/zk_basis.foz
 contracts/NovelFeaturesTest.foz
-
+zephyria
 
 # Folders
 skills/
@@ -43,4 +43,6 @@ interact.html
 forge_multi_agent_abi.md
 out/
 *.zip
-*.log
+*.logmain
+
+main

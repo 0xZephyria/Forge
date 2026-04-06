@@ -1772,10 +1772,9 @@ pub const CodeGenPolkaVM = struct {
         var action_count: u16 = 0;
         for (mir.functions) |func| {
             switch (func.kind) {
-                .action, .view, .pure, .setup, .fallback, .receive => {
+                .action, .view, .pure, .setup, .fallback, .receive, .helper, .guard => {
                     action_count += 1;
                 },
-                else => {},
             }
         }
 
@@ -1793,8 +1792,7 @@ pub const CodeGenPolkaVM = struct {
 
         for (mir.functions) |func| {
             const is_emittable = switch (func.kind) {
-                .action, .view, .pure, .setup, .fallback, .receive => true,
-                else => false,
+                .action, .view, .pure, .setup, .fallback, .receive, .helper, .guard => true,
             };
             if (!is_emittable) continue;
 
@@ -1824,6 +1822,7 @@ pub const CodeGenPolkaVM = struct {
                 label_patches.deinit();
             }
 
+            // Emit MIR instructions as RISC-V.
             // Emit MIR instructions as RISC-V.
             for (func.body) |instr| {
                 try self.mirEmitRiscV(&instr, &writer, &ra, &reg_map, &label_map, &label_patches);
