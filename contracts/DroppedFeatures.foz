@@ -1,0 +1,36 @@
+version 1
+
+asset ZephToken:
+    name: "Zephyria Token"
+    symbol: "ZEPH"
+    decimals: 18
+
+    before_transfer: (src is Account, dst is Account, amount is u256):
+        need amount > 0 else "zero transfer"
+
+    after_transfer: (src is Account, dst is Account, amount is u256):
+        tell Transfer(src, dst, amount)
+
+global invariant Solvency:
+    participants: [Bank]
+    on_violation:
+        panic "Solvency violated!"
+
+contract Bank:
+    has:
+        total_deposits is u256
+    
+    computed:
+        available_liquidity is u256 = mine.total_deposits / 2
+
+    guard only_positive(amount is u256):
+        need amount > 0 else "negative deposit"
+
+    action deposit(amount is u256):
+        only_positive(amount)
+        mine.total_deposits += amount
+        
+    adversary tries:
+        attack drain:
+            deposit(0) # This will be blocked by only_positive
+            expects action_blocked

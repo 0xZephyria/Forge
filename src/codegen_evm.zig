@@ -853,7 +853,11 @@ pub const EVMCodeGen = struct {
         // registered during external handler emission and are patched here.
 
         for (mir.functions) |func| {
-            if (func.kind != .guard and func.kind != .helper) continue;
+            const is_internal = switch (func.kind) {
+                .guard, .helper, .asset_hook, .computed, .invariant_handler, .attack_spec, .migration_logic => true,
+                else => false,
+            };
+            if (!is_internal) continue;
 
             // Record JUMPDEST offset for this function's selector.
             const dest = w.offset();

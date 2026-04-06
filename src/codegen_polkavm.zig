@@ -1772,7 +1772,7 @@ pub const CodeGenPolkaVM = struct {
         var action_count: u16 = 0;
         for (mir.functions) |func| {
             switch (func.kind) {
-                .action, .view, .pure, .setup, .fallback, .receive, .helper, .guard => {
+                .action, .view, .pure, .setup, .fallback, .receive, .helper, .guard, .asset_hook, .computed, .invariant_handler, .attack_spec, .migration_logic => {
                     action_count += 1;
                 },
             }
@@ -1792,7 +1792,7 @@ pub const CodeGenPolkaVM = struct {
 
         for (mir.functions) |func| {
             const is_emittable = switch (func.kind) {
-                .action, .view, .pure, .setup, .fallback, .receive, .helper, .guard => true,
+                .action, .view, .pure, .setup, .fallback, .receive, .helper, .guard, .asset_hook, .computed, .invariant_handler, .attack_spec, .migration_logic => true,
             };
             if (!is_emittable) continue;
 
