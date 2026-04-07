@@ -44,5 +44,6 @@ forge_multi_agent_abi.md
 out/
 *.zip
 *.logmain
-
+FORGE_DOCS.md
+FORGE_DOCUMENTATION_GUIDE.md
 main
