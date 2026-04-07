@@ -594,20 +594,26 @@ pub const EVMCodeGen = struct {
     /// This is the new unified entry point that replaces direct AST walking.
     /// All backends share the same MirModule; only this lowering layer is
     /// target-specific.
+    /// SPEC: Part 5, Part 14 — Generate complete EVM initcode from a MirModule.
     pub fn generateFromMir(
         self: *EVMCodeGen,
         mir: *const mir_mod.MirModule,
     ) anyerror![]u8 {
+        var selector_base_mem = std.AutoHashMap(u32, u32).init(self.allocator);
+        defer selector_base_mem.deinit();
 
-        // Generate runtime bytecode from MIR functions.
-        const runtime = try self.mirRuntime(mir);
+        var global_next_mem: u32 = 0x80;
+        for (mir.functions) |func| {
+            try selector_base_mem.put(func.selector, global_next_mem);
+            global_next_mem += func.max_regs * 32;
+        }
+
+        const runtime = try self.mirRuntime(mir, &selector_base_mem);
         defer self.allocator.free(runtime);
 
-        // Generate deploy (initcode) from MIR setup function.
-        const deploy = try self.mirDeploy(mir, runtime);
+        const deploy = try self.mirDeploy(mir, runtime, &selector_base_mem);
         defer self.allocator.free(deploy);
 
-        // Concatenate: [deploy][runtime]
         const total = deploy.len + runtime.len;
         const out = try self.allocator.alloc(u8, total);
         @memcpy(out[0..deploy.len], deploy);
@@ -615,71 +621,61 @@ pub const EVMCodeGen = struct {
         return out;
     }
 
-    /// SPEC: Part 5.1 — Generate EVM deploy (initcode) from MIR.
     fn mirDeploy(
         self: *EVMCodeGen,
         mir: *const mir_mod.MirModule,
         runtime: []const u8,
+        selector_base_mem: *std.AutoHashMap(u32, u32),
     ) anyerror![]u8 {
         var w = EVMWriter.init(self.allocator);
         defer w.deinit();
 
-        // Init free-memory pointer: memory[0x40] = 0x80
+        // Init free memory pointer.
         try w.push1(0x80);
         try w.push1(0x40);
         try w.op(.MSTORE);
 
-        // Store deployer address.
         try w.op(.CALLER);
         try w.pushU256BE(keccak256("__deployer__"));
         try w.op(.SSTORE);
 
-        // Initialize authorities from MIR metadata.
         for (mir.authorities) |auth| {
             if (auth.initial_holder) |holder| {
                 try w.pushU256BE(holder);
             } else {
-                // Default to CALLER if no initial holder specified.
                 try w.op(.CALLER);
             }
             try w.pushU256BE(keccak256(auth.name));
             try w.op(.SSTORE);
         }
 
-        // Find and emit setup function body.
         for (mir.functions) |func| {
             if (func.kind == .setup) {
-                // ABI-decode constructor params from calldata (no selector).
-                for (func.params, 0..) |_, i| {
-                    const cd_offset: u32 = @intCast(i * 32);
-                    try w.pushU32(cd_offset);
-                    try w.op(.CALLDATALOAD);
-                    const mem_slot: u32 = @intCast(LOCAL_START + i * 32);
-                    try w.pushU32(mem_slot);
-                    try w.op(.MSTORE);
+                const base_mem = selector_base_mem.get(func.selector).?;
+                const param_bytes: u32 = @intCast(func.params.len * 32);
+                if (param_bytes > 0) {
+                    try w.pushU32(param_bytes);
+                    try w.pushU32(param_bytes);
+                    try w.op(.CODESIZE);
+                    try w.op(.SUB);
+                    try w.pushU32(base_mem);
+                    try w.op(.CODECOPY);
                 }
-                // Emit MIR instructions for setup body. Pass is_initcode=true 
-                // so that returns don't emit STOP.
-                try self.mirEmitFuncBody(&func, &w, true);
+                try self.mirEmitFuncBody(&func, &w, true, base_mem);
                 break;
             }
         }
 
-        // CODECOPY runtime into memory[0x00] and RETURN it.
-        // Use placeholders to avoid hardcoding size.
         const runtime_len_cc = try w.push2Placeholder();
         const src_off_cc = try w.push2Placeholder();
         try w.push0();
         try w.op(.CODECOPY);
-
         const runtime_len_ret = try w.push2Placeholder();
         try w.push0();
         try w.op(.RETURN);
 
-        // Patch with final offsets.
         const final_deploy_len = w.offset();
         const runtime_len_u16: u16 = @intCast(runtime.len);
-
         w.patchU16(runtime_len_cc, runtime_len_u16);
         w.patchU16(src_off_cc, @intCast(final_deploy_len));
         w.patchU16(runtime_len_ret, runtime_len_u16);
@@ -687,123 +683,91 @@ pub const EVMCodeGen = struct {
         return w.toOwnedSlice();
     }
 
-    /// SPEC: Part 5.2 — Generate EVM runtime bytecode from MIR.
     fn mirRuntime(
         self: *EVMCodeGen,
         mir: *const mir_mod.MirModule,
+        selector_base_mem: *std.AutoHashMap(u32, u32),
     ) anyerror![]u8 {
         var w = EVMWriter.init(self.allocator);
         defer w.deinit();
 
-        // Init free-memory pointer.
         try w.push1(0x80);
         try w.push1(0x40);
         try w.op(.MSTORE);
 
-        // Selector extraction: check calldatasize >= 4.
         try w.push1(4);
         try w.op(.CALLDATASIZE);
         try w.op(.LT);
-        const fallback_patch = try w.push2Placeholder();
+        const fallback_direct_patch = try w.push2Placeholder();
         try w.op(.JUMPI);
 
-        // Extract 4-byte selector.
         try w.push0();
         try w.op(.CALLDATALOAD);
         try w.push1(0xe0);
         try w.op(.SHR);
 
-        // Build dispatch table from MIR functions.
-        const DispatchEntry = struct { patch: u32 };
+        const DispatchEntry = struct { patch: u32, func: *const mir_mod.MirFunction };
         var dispatch_entries = std.ArrayListUnmanaged(DispatchEntry){};
         defer dispatch_entries.deinit(self.allocator);
-        var dispatch_funcs = std.ArrayListUnmanaged(usize){};
-        defer dispatch_funcs.deinit(self.allocator);
 
-        for (mir.functions, 0..) |func, fi| {
-            const is_dispatchable = switch (func.kind) {
+        for (mir.functions) |*func| {
+             const is_dispatchable = switch (func.kind) {
                 .action, .view, .pure => true,
-                // Guards and helpers are internal; they are reachable via JUMP
-                // inside action bodies (not via selector dispatch).
-                .guard, .helper => false,
                 else => false,
             };
             if (!is_dispatchable) continue;
 
-            // Build EVM ABI selector from MIR function metadata.
-            const sel = self.mirBuildSelector(&func);
+            const sel = self.mirBuildSelector(func);
             try w.op(.DUP1);
             try w.push4(sel);
             try w.op(.EQ);
             const patch = try w.push2Placeholder();
             try w.op(.JUMPI);
-            try dispatch_entries.append(self.allocator, .{ .patch = patch });
-            try dispatch_funcs.append(self.allocator, fi);
+            try dispatch_entries.append(self.allocator, .{ .patch = patch, .func = func });
         }
 
-        // Fallback: calldatasize < 4 or no selector match.
+        try w.op(.POP);
+        const fallback_fallback_patch = try w.push2Placeholder();
+        try w.op(.JUMP);
+
         const fallback_dest = w.offset();
-        w.patchU16(fallback_patch, fallback_dest);
+        w.patchU16(fallback_direct_patch, fallback_dest);
+        w.patchU16(fallback_fallback_patch, fallback_dest);
         try w.op(.JUMPDEST);
 
-        // Look for receive handler (value > 0).
         var has_receive = false;
         var has_fallback = false;
-        for (mir.functions) |func| {
-            if (func.kind == .receive) has_receive = true;
-            if (func.kind == .fallback) has_fallback = true;
+        var receive_func: ?*const mir_mod.MirFunction = null;
+        var fallback_func: ?*const mir_mod.MirFunction = null;
+
+        for (mir.functions) |*func| {
+            if (func.kind == .receive) { has_receive = true; receive_func = func; }
+            if (func.kind == .fallback) { has_fallback = true; fallback_func = func; }
         }
 
         if (has_receive) {
             try w.op(.CALLVALUE);
-            const receive_patch = try w.push2Placeholder();
+            try w.op(.ISZERO);
+            const bypass_receive_patch = try w.push2Placeholder();
             try w.op(.JUMPI);
-            // No value — fall through to fallback or revert.
-            if (has_fallback) {
-                for (mir.functions) |func| {
-                    if (func.kind == .fallback) {
-                        try self.mirEmitFuncBody(&func, &w, false);
-                        break;
-                    }
-                }
-            } else {
-                try w.push0();
-                try w.push0();
-                try w.op(.REVERT);
-            }
-            // Receive handler.
-            const receive_dest = w.offset();
-            w.patchU16(receive_patch, receive_dest);
+            
+            const base_mem = selector_base_mem.get(receive_func.?.selector).?;
+            try self.mirEmitFuncBody(receive_func.?, &w, false, base_mem);
+            
+            const bypass_dest = w.offset();
+            w.patchU16(bypass_receive_patch, bypass_dest);
             try w.op(.JUMPDEST);
-            for (mir.functions) |func| {
-                if (func.kind == .receive) {
-                    try self.mirEmitFuncBody(&func, &w, false);
-                    break;
-                }
-            }
-        } else if (has_fallback) {
-            for (mir.functions) |func| {
-                if (func.kind == .fallback) {
-                    try self.mirEmitFuncBody(&func, &w, false);
-                    break;
-                }
-            }
+        }
+
+        if (has_fallback) {
+            const base_mem = selector_base_mem.get(fallback_func.?.selector).?;
+            try self.mirEmitFuncBody(fallback_func.?, &w, false, base_mem);
         } else {
             try w.push0();
             try w.push0();
             try w.op(.REVERT);
         }
 
-        // No-match destination (selector dispatch exhaustion).
-        const no_match_dest = w.offset();
-        try w.op(.JUMPDEST);
-        try w.op(.POP); // pop selector
-        try w.push0();
-        try w.push0();
-        try w.op(.REVERT);
-        _ = no_match_dest;
-
-        // ── Internal function tables (populated during guard/helper emission) ───
         var internal_offsets = std.AutoHashMap(u32, u32).init(self.allocator);
         defer internal_offsets.deinit();
         var internal_patches = std.AutoHashMap(u32, std.ArrayListUnmanaged(u32)).init(self.allocator);
@@ -813,93 +777,69 @@ pub const EVMCodeGen = struct {
             internal_patches.deinit();
         }
 
-        // ── External-facing function handlers ─────────────────────────────
-        for (dispatch_entries.items, 0..) |entry, di| {
-            const fi = dispatch_funcs.items[di];
-            const func = &mir.functions[fi];
-
-            const handler_dest = w.offset();
-            w.patchU16(entry.patch, handler_dest);
+        for (dispatch_entries.items) |entry| {
+            const func = entry.func;
+            w.patchU16(entry.patch, w.offset());
             try w.op(.JUMPDEST);
-            try w.op(.POP); // pop selector
+            try w.op(.POP);
 
-            // ABI-decode calldata params into memory.
+            const base_mem = selector_base_mem.get(func.selector).?;
             for (func.params, 0..) |_, pi| {
                 const cd_off: u32 = @intCast(4 + pi * 32);
                 try w.pushU32(cd_off);
                 try w.op(.CALLDATALOAD);
-                const mem_slot: u32 = @intCast(LOCAL_START + pi * 32);
+                const mem_slot = base_mem + @as(u32, @intCast(pi)) * 32;
                 try w.pushU32(mem_slot);
                 try w.op(.MSTORE);
             }
 
-            try self.mirEmitFuncBodyWithInternals(func, &w, false, &internal_offsets, &internal_patches);
-
-            if (func.kind == .view or func.kind == .pure) {
-                try w.push0();
-                try w.push1(0x00);
-                try w.op(.MSTORE);
-                try w.push1(32);
-                try w.push0();
-                try w.op(.RETURN);
-            } else {
-                try w.op(.STOP);
-            }
+            try self.mirEmitFuncBodyWithInternals(
+                func, &w, false, false,
+                &internal_offsets, &internal_patches,
+                base_mem, selector_base_mem, mir
+            );
         }
 
-        // ── Internal functions (guards + helpers) ──────────────────────────
-        // Emitted as JUMPDEST blocks after the public handlers.
-        // call_internal uses fnvHash32(name) as selector; forward refs were
-        // registered during external handler emission and are patched here.
-
-        for (mir.functions) |func| {
+        for (mir.functions) |*func| {
             const is_internal = switch (func.kind) {
                 .guard, .helper, .asset_hook, .computed, .invariant_handler, .attack_spec, .migration_logic => true,
                 else => false,
             };
             if (!is_internal) continue;
 
-            // Record JUMPDEST offset for this function's selector.
             const dest = w.offset();
             try w.op(.JUMPDEST);
             try internal_offsets.put(func.selector, dest);
 
-            // Back-patch any call_internal forward refs for this selector.
             if (internal_patches.getPtr(func.selector)) |patches| {
                 for (patches.items) |p| w.patchU16(p, dest);
                 patches.clearRetainingCapacity();
             }
 
-            // Params are pre-loaded by the caller via memory slots; no decode needed.
-            try self.mirEmitFuncBodyWithInternals(&func, &w, false, &internal_offsets, &internal_patches);
-
-            // Return: JUMP back to caller (return address on stack).
-            try w.op(.JUMP);
+            const base_mem = selector_base_mem.get(func.selector).?;
+            try self.mirEmitFuncBodyWithInternals(
+                func, &w, false, true,
+                &internal_offsets, &internal_patches,
+                base_mem, selector_base_mem, mir
+            );
         }
 
         return w.toOwnedSlice();
     }
 
-    /// Like mirEmitFuncBody but threads internal function offset maps for
-    /// call_internal dispatch.
     fn mirEmitFuncBodyWithInternals(
         self: *EVMCodeGen,
         func: *const mir_mod.MirFunction,
         w: *EVMWriter,
         is_initcode: bool,
+        is_internal: bool,
         internal_offsets: *std.AutoHashMap(u32, u32),
         internal_patches: *std.AutoHashMap(u32, std.ArrayListUnmanaged(u32)),
+        base_mem: u32,
+        selector_base_mem: *std.AutoHashMap(u32, u32),
+        mir: *const mir_mod.MirModule,
     ) anyerror!void {
-        var reg_mem = std.AutoHashMap(mir_mod.Reg, u32).init(self.allocator);
-        defer reg_mem.deinit();
-        var next_mem: u32 = LOCAL_START;
-
-        for (func.params, 0..) |_, i| {
-            const reg: mir_mod.Reg = @intCast(i);
-            try reg_mem.put(reg, @intCast(LOCAL_START + i * 32));
-            next_mem = @intCast(LOCAL_START + (i + 1) * 32);
-        }
-
+        _ = mir;
         var label_offsets = std.AutoHashMap(mir_mod.LabelId, u32).init(self.allocator);
         defer label_offsets.deinit();
         var label_patches = std.AutoHashMap(mir_mod.LabelId, std.ArrayListUnmanaged(u32)).init(self.allocator);
@@ -910,33 +850,28 @@ pub const EVMCodeGen = struct {
         }
 
         const RegCtx = struct {
-            reg_mem: *std.AutoHashMap(mir_mod.Reg, u32),
-            next_mem: *u32,
+            base_mem: u32,
             fn memOf(ctx: @This(), reg: mir_mod.Reg) u32 {
-                if (ctx.reg_mem.get(reg)) |off| return off;
-                const off = ctx.next_mem.*;
-                ctx.reg_mem.put(reg, off) catch {};
-                ctx.next_mem.* += 32;
-                return off;
+                return ctx.base_mem + reg * 32;
             }
         };
-        var rctx = RegCtx{ .reg_mem = &reg_mem, .next_mem = &next_mem };
+        const rctx = RegCtx{ .base_mem = base_mem };
 
         for (func.body) |instr| {
-            // Handle call_internal with the live offset maps.
             if (instr.op == .call_internal) {
                 const ci = instr.op.call_internal;
-                // Push args into consecutive memory slots above next_mem.
+                const target_base_mem = selector_base_mem.get(ci.selector) orelse 0x80;
+                
                 for (ci.args, 0..) |arg, ai| {
                     try w.pushU32(rctx.memOf(arg));
                     try w.op(.MLOAD);
-                    try w.pushU32(@intCast(next_mem + @as(u32, @intCast(ai)) * 32));
+                    try w.pushU32(@intCast(target_base_mem + @as(u32, @intCast(ai)) * 32));
                     try w.op(.MSTORE);
                 }
-                // Push return address (current offset + 7 bytes for PUSH2 + JUMP).
+                
                 const ret_addr_offset = w.offset() + 7;
-                try w.push2(@intCast(ret_addr_offset)); // return address
-                // Jump to callee.
+                try w.push2(@intCast(ret_addr_offset));
+                
                 if (internal_offsets.get(ci.selector)) |target| {
                     try w.push2(@intCast(target));
                 } else {
@@ -946,31 +881,23 @@ pub const EVMCodeGen = struct {
                     try entry.value_ptr.append(self.allocator, p);
                 }
                 try w.op(.JUMP);
-                // JUMPDEST for return.
-                const ret_dest = w.offset();
-                _ = ret_dest;
                 try w.op(.JUMPDEST);
-                // Result is in memory[LOCAL_START + next_mem] — move to dst.
-                try w.push0();
+                
                 try w.pushU32(rctx.memOf(ci.dst));
                 try w.op(.MSTORE);
                 continue;
             }
-            try self.mirLowerInstr(&instr, w, &rctx, &label_offsets, &label_patches, is_initcode);
+            try self.mirLowerInstr(&instr, w, &rctx, &label_offsets, &label_patches, is_initcode, is_internal);
         }
 
-        // Backpatch labels.
         var patch_it = label_patches.iterator();
         while (patch_it.next()) |entry| {
             if (label_offsets.get(entry.key_ptr.*)) |target| {
-                for (entry.value_ptr.items) |patch_off| {
-                    w.patchU16(patch_off, target);
-                }
+                for (entry.value_ptr.items) |patch_off| w.patchU16(patch_off, target);
             }
         }
     }
 
-    /// Build a MIR-derived EVM ABI selector: keccak256("name(type0,type1,...)")
     fn mirBuildSelector(self: *EVMCodeGen, func: *const mir_mod.MirFunction) u32 {
         var buf = std.ArrayListUnmanaged(u8){};
         defer buf.deinit(self.allocator);
@@ -985,75 +912,47 @@ pub const EVMCodeGen = struct {
         return evmSelector(buf.items);
     }
 
-    /// Map a ResolvedType (carried through MIR) to EVM ABI type string.
     fn mirTypeToAbi(rt: ResolvedType) []const u8 {
         return evmAbiType(rt);
     }
 
-    /// SPEC: Part 5 — Emit EVM bytecode for one MIR function's instruction stream.
     fn mirEmitFuncBody(
         self: *EVMCodeGen,
         func: *const mir_mod.MirFunction,
         w: *EVMWriter,
         is_initcode: bool,
+        base_mem: u32,
     ) anyerror!void {
-        // Register file: map virtual MIR registers → memory offsets.
-        var reg_mem = std.AutoHashMap(mir_mod.Reg, u32).init(self.allocator);
-        defer reg_mem.deinit();
-        var next_mem: u32 = LOCAL_START;
-
-        // Allocate memory for parameters.
-        for (func.params, 0..) |_, i| {
-            const reg: mir_mod.Reg = @intCast(i);
-            try reg_mem.put(reg, @intCast(LOCAL_START + i * 32));
-            next_mem = @intCast(LOCAL_START + (i + 1) * 32);
-        }
-
-        // Label → bytecode offset map for jump resolution.
         var label_offsets = std.AutoHashMap(mir_mod.LabelId, u32).init(self.allocator);
         defer label_offsets.deinit();
 
-        // Forward-reference patches: label → list of patch offsets.
         var label_patches = std.AutoHashMap(mir_mod.LabelId, std.ArrayListUnmanaged(u32)).init(self.allocator);
         defer {
             var it = label_patches.valueIterator();
-            while (it.next()) |list| {
-                list.deinit(self.allocator);
-            }
+            while (it.next()) |list| list.deinit(self.allocator);
             label_patches.deinit();
         }
 
-        // Helper: get or allocate memory for a register.
         const RegCtx = struct {
-            reg_mem: *std.AutoHashMap(mir_mod.Reg, u32),
-            next_mem: *u32,
-
+            base_mem: u32,
             fn memOf(ctx: @This(), reg: mir_mod.Reg) u32 {
-                if (ctx.reg_mem.get(reg)) |off| return off;
-                const off = ctx.next_mem.*;
-                ctx.reg_mem.put(reg, off) catch {};
-                ctx.next_mem.* += 32;
-                return off;
+                return ctx.base_mem + reg * 32;
             }
         };
-        var rctx = RegCtx{ .reg_mem = &reg_mem, .next_mem = &next_mem };
+        const rctx = RegCtx{ .base_mem = base_mem };
 
         for (func.body) |instr| {
-            try self.mirLowerInstr(&instr, w, &rctx, &label_offsets, &label_patches, is_initcode);
+            try self.mirLowerInstr(&instr, w, &rctx, &label_offsets, &label_patches, is_initcode, false);
         }
 
-        // Backpatch all forward label references.
         var patch_it = label_patches.iterator();
         while (patch_it.next()) |entry| {
             if (label_offsets.get(entry.key_ptr.*)) |target| {
-                for (entry.value_ptr.items) |patch_off| {
-                    w.patchU16(patch_off, target);
-                }
+                for (entry.value_ptr.items) |patch_off| w.patchU16(patch_off, target);
             }
         }
     }
 
-    /// SPEC: Part 5 — Lower one MIR instruction to EVM bytecode.
     fn mirLowerInstr(
         self: *EVMCodeGen,
         instr: *const mir_mod.MirInstr,
@@ -1062,8 +961,11 @@ pub const EVMCodeGen = struct {
         label_offsets: *std.AutoHashMap(mir_mod.LabelId, u32),
         label_patches: *std.AutoHashMap(mir_mod.LabelId, std.ArrayListUnmanaged(u32)),
         is_initcode: bool,
+        is_internal: bool,
     ) anyerror!void {
+
         switch (instr.op) {
+
             // ── Constants ─────────────────────────────────────────────────
             .const_i256 => |c| {
                 try w.pushU256BE(c.bytes);
@@ -1438,13 +1340,22 @@ pub const EVMCodeGen = struct {
                 if (r.value) |val| {
                     try w.pushU32(rctx.memOf(val));
                     try w.op(.MLOAD);
-                    try w.push1(0x00);
-                    try w.op(.MSTORE);
-                    try w.push1(32);
-                    try w.push0();
-                    try w.op(.RETURN);
+                    if (is_internal) {
+                        try w.op(.SWAP1);
+                        try w.op(.JUMP);
+                    } else {
+                        try w.push1(0x00);
+                        try w.op(.MSTORE);
+                        try w.push1(32);
+                        try w.push0();
+                        try w.op(.RETURN);
+                    }
                 } else {
-                    if (!is_initcode) {
+                    if (is_internal) {
+                        try w.push0();
+                        try w.op(.SWAP1);
+                        try w.op(.JUMP);
+                    } else if (!is_initcode) {
                         try w.op(.STOP);
                     }
                 }
