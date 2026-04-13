@@ -40,7 +40,7 @@ The binary will be available in `zig-out/bin/`.
 ### Documentation
 
 For more detailed information on the language and how to use it, please refer to the:
-👉 [**FORGE_DOCUMENTATION_GUIDE.md**](FORGE_DOCUMENTATION_GUIDE.md)
+👉 [**FORGE_DOCUMENTATION.md**](FORGE_DOCUMENTATION.md)
 
 You can also check the full [FORGE_LANGUAGE_SPEC.md](FORGE_LANGUAGE_SPEC.md) for a technical reference.
 
