@@ -15,7 +15,7 @@ const errors = @import("errors.zig");
 const types = @import("types.zig");
 const checker = @import("checker.zig");
 const codegen = @import("codegen.zig");
-const codegen_polkavm = @import("codegen_polkavm.zig");
+// const codegen_polkavm = @import("codegen_polkavm.zig");
 const codegen_evm = @import("codegen_evm.zig");
 const mir = @import("mir.zig");
 const lexer = @import("lexer.zig");
@@ -28,7 +28,7 @@ const Lexer = lexer.Lexer;
 const Parser = parser.Parser;
 const Checker = checker.Checker;
 const CodeGen = codegen.CodeGen;
-const CodeGenPolkaVM = codegen_polkavm.CodeGenPolkaVM;
+// const CodeGenPolkaVM = codegen_polkavm.CodeGenPolkaVM;
 const CodeGenEVM = codegen_evm.EVMCodeGen;
 const TopLevel = ast.TopLevel;
 
@@ -134,7 +134,7 @@ fn printUsage() void {
         \\
         \\Options:
         \\  -o <file>       Specify output binary path (default: a.fozbin)
-        \\  --target <name> Target architecture (zephyria or polkavm, default: zephyria)
+        \\  --target <name> Target architecture (zephyria or evm, default: zephyria)
         \\  --evm           Generate an EVM-compatible ABI (.json) instead of Zephyria Native (.fozabi)
         \\  --check-only    Perform type checking, skip binary generation
         \\  --print-tokens  Print lexical tokens
@@ -271,20 +271,25 @@ pub fn compile(
         gen.mir_events = mir_module.events;
         const tmp_bin = try gen.generateFromMir(&mir_module);
         binary = try alloc.dupe(u8, tmp_bin);
-    } else if (std.mem.eql(u8, opts.target, "polkavm")) {
-        // ── MIR-based PolkaVM pipeline: AST → MIR → RISC-V bytecode ──
+    // } else if (std.mem.eql(u8, opts.target, "polkavm")) {
+    //     // ── MIR-based PolkaVM pipeline: AST → MIR → RISC-V bytecode ──
+    //     var lowerer = mir.MirLowerer.init(temp_alloc, &resolver, &diagnostics);
+    //     defer lowerer.deinit();
+    //     const mir_module = try lowerer.lowerAll(contract, asset_slice, invariant_slice);
+
+    //     var gen = CodeGenPolkaVM.init(temp_alloc, &diagnostics, &resolver);
+    //     defer gen.deinit();
+    //     const tmp_bin = try gen.generateFromMir(&mir_module);
+    //     binary = try alloc.dupe(u8, tmp_bin);
+    } else {
+        // ── MIR-based Zephyria pipeline: AST → MIR → RISC-V bytecode ──
         var lowerer = mir.MirLowerer.init(temp_alloc, &resolver, &diagnostics);
         defer lowerer.deinit();
         const mir_module = try lowerer.lowerAll(contract, asset_slice, invariant_slice);
 
-        var gen = CodeGenPolkaVM.init(temp_alloc, &diagnostics, &resolver);
-        defer gen.deinit();
-        const tmp_bin = try gen.generateFromMir(&mir_module);
-        binary = try alloc.dupe(u8, tmp_bin);
-    } else {
         var gen = CodeGen.init(temp_alloc, &diagnostics, &resolver);
         defer gen.deinit();
-        const tmp_bin = try gen.generate(contract, &checked);
+        const tmp_bin = try gen.generateFromMir(&mir_module, &checked);
         binary = try alloc.dupe(u8, tmp_bin);
     }
 
@@ -483,9 +488,10 @@ fn deriveOutputPath(input_path: []const u8, target: []const u8, alloc: std.mem.A
     }
 
     var ext: []const u8 = undefined;
-    if (std.mem.eql(u8, target, "polkavm")) {
-        ext = ".polkavm";
-    } else if (std.mem.eql(u8, target, "evm")) {
+    // if (std.mem.eql(u8, target, "polkavm")) {
+    //     ext = ".polkavm";
+    // } else if (std.mem.eql(u8, target, "evm")) {
+    if (std.mem.eql(u8, target, "evm")) {
         ext = ".bin"; // EVM usually uses .bin
     } else {
         ext = ".fozbin";

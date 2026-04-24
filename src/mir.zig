@@ -163,6 +163,18 @@ pub const MirOp = union(enum) {
     /// Copy src register value to dst.
     mov: struct { dst: Reg, src: Reg },
 
+    // ── Collections (Arrays/Lists/Maps) ───────────────────────────────────
+    /// Get the length of a collection.
+    collection_len: struct { dst: Reg, collection: Reg },
+    /// Get an element from a collection by index/key.
+    collection_get: struct { dst: Reg, collection: Reg, key: Reg },
+
+    // ── Pattern Matching ──────────────────────────────────────────────────
+    /// Match an enum payload tag. dst = (subject.tag == tag_id).
+    enum_match: struct { dst: Reg, subject: Reg, tag_id: u32 },
+    /// Extract the payload from an enum into dst.
+    enum_extract: struct { dst: Reg, subject: Reg },
+
     // ── Control flow ──────────────────────────────────────────────────────
     /// SPEC: Part 6 — Define a jump target.
     label: struct { id: LabelId },
@@ -455,6 +467,12 @@ const DataSection = struct {
 // Section 5 — MIR Lowerer
 // ============================================================================
 
+/// Loop context for tracking enclosing loops for `stop` and `skip`.
+pub const LoopCtx = struct {
+    cont_label: LabelId,
+    end_label: LabelId,
+};
+
 /// SPEC: All Parts — Lowers a checked Forge contract AST into a MirModule.
 /// This is the single pass that every backend consumes instead of walking
 /// the AST directly. New language features are implemented here once.
@@ -473,6 +491,9 @@ pub const MirLowerer = struct {
     next_reg: Reg,
     /// Label counter — monotonically increasing across all functions.
     next_label: LabelId,
+
+    /// Loop context stack for the current function.
+    loop_stack: std.ArrayListUnmanaged(LoopCtx),
 
     /// Maps local variable names to their assigned virtual register.
     local_regs: std.StringHashMapUnmanaged(Reg),
@@ -504,6 +525,7 @@ pub const MirLowerer = struct {
             .functions = .{},
             .next_reg = 0,
             .next_label = 0,
+            .loop_stack = .{},
             .local_regs = .{},
             .field_ids = .{},
             .next_field_id = 0,
@@ -519,6 +541,7 @@ pub const MirLowerer = struct {
         self.data.deinit();
         self.instrs.deinit(self.allocator);
         self.functions.deinit(self.allocator);
+        self.loop_stack.deinit(self.allocator);
         self.local_regs.deinit(self.allocator);
         self.field_ids.deinit(self.allocator);
         self.event_ids.deinit(self.allocator);
@@ -544,6 +567,7 @@ pub const MirLowerer = struct {
     /// SPEC: Part 5 — Reset per-function state for a new function body.
     fn resetFunctionState(self: *MirLowerer) void {
         self.next_reg = 0;
+        self.loop_stack.clearRetainingCapacity();
         self.local_regs.clearRetainingCapacity();
         self.instrs.clearRetainingCapacity();
     }
@@ -1037,6 +1061,66 @@ pub const MirLowerer = struct {
         return dst;
     }
 
+    // ── Pattern lowering ──────────────────────────────────────────────────
+
+    /// Lowers a match pattern. Emits checks against `subject`.
+    /// If the pattern matches, it falls through.
+    /// If it fails, it jumps to `fail_label`.
+    fn lowerPattern(self: *MirLowerer, pattern: *const ast.Pattern, subject: Reg, fail_label: LabelId, span: Span) anyerror!void {
+        switch (pattern.*) {
+            .wildcard => {},
+            .binding => |name| {
+                try self.bindLocal(name, subject);
+            },
+            .literal => |lit| {
+                const lit_reg = try self.lowerExpr(lit);
+                const cond = self.freshReg();
+                try self.emit(.{ .eq = .{ .dst = cond, .lhs = subject, .rhs = lit_reg } }, span);
+                const fallthrough = self.freshLabel();
+                try self.emit(.{ .branch = .{ .cond = cond, .then_ = fallthrough, .else_ = fail_label } }, span);
+                try self.emit(.{ .label = .{ .id = fallthrough } }, span);
+            },
+            .enum_variant => |ev| {
+                const interned = try self.data.intern(ev.variant_name);
+                const tag_id = interned.offset;
+                
+                const cond = self.freshReg();
+                try self.emit(.{ .enum_match = .{ .dst = cond, .subject = subject, .tag_id = tag_id } }, span);
+                const fallthrough = self.freshLabel();
+                try self.emit(.{ .branch = .{ .cond = cond, .then_ = fallthrough, .else_ = fail_label } }, span);
+                try self.emit(.{ .label = .{ .id = fallthrough } }, span);
+
+                if (ev.field_bindings.len > 0) {
+                    const payload = self.freshReg();
+                    try self.emit(.{ .enum_extract = .{ .dst = payload, .subject = subject } }, span);
+                    if (ev.field_bindings.len == 1) {
+                        try self.bindLocal(ev.field_bindings[0].binding, payload);
+                    }
+                }
+            },
+            .range => |r| {
+                const lo = try self.lowerExpr(r.lo);
+                const hi = try self.lowerExpr(r.hi);
+                
+                const gte = self.freshReg();
+                try self.emit(.{ .ge = .{ .dst = gte, .lhs = subject, .rhs = lo } }, span);
+                
+                const lte = self.freshReg();
+                try self.emit(.{ .le = .{ .dst = lte, .lhs = subject, .rhs = hi } }, span);
+                
+                const cond = self.freshReg();
+                try self.emit(.{ .bool_and = .{ .dst = cond, .lhs = gte, .rhs = lte } }, span);
+                
+                const fallthrough = self.freshLabel();
+                try self.emit(.{ .branch = .{ .cond = cond, .then_ = fallthrough, .else_ = fail_label } }, span);
+                try self.emit(.{ .label = .{ .id = fallthrough } }, span);
+            },
+            else => {
+                try self.emit(.{ .jump = .{ .target = fail_label } }, span);
+            }
+        }
+    }
+
     // ── Statement lowering ────────────────────────────────────────────────
 
     /// SPEC: Part 5–6 — Lower one AST statement to MIR instructions.
@@ -1082,26 +1166,75 @@ pub const MirLowerer = struct {
                 const subject = try self.lowerExpr(m.subject);
                 const end_label = self.freshLabel();
                 for (m.arms) |arm| {
-                    // Simplified: each arm evaluates its body.
-                    _ = subject;
+                    const fail_label = self.freshLabel();
+                    try self.lowerPattern(&arm.pattern, subject, fail_label, span);
+                    
                     for (arm.body) |body_stmt| {
                         try self.lowerStmt(&body_stmt);
                     }
                     try self.emit(.{ .jump = .{ .target = end_label } }, span);
+                    try self.emit(.{ .label = .{ .id = fail_label } }, span);
                 }
                 try self.emit(.{ .label = .{ .id = end_label } }, span);
             },
 
             // ── each loop ─────────────────────────────────────────────────
             .each => |e| {
-                _ = try self.lowerExpr(e.collection);
-                // Loop body lowering (simplified — backends handle iteration).
+                const coll = try self.lowerExpr(e.collection);
                 const loop_top = self.freshLabel();
+                const loop_body = self.freshLabel();
                 const loop_end = self.freshLabel();
+
+                // Get collection length
+                const len = self.freshReg();
+                try self.emit(.{ .collection_len = .{ .dst = len, .collection = coll } }, span);
+
+                // Initialize iterator/index to 0
+                const idx = self.freshReg();
+                try self.emit(.{ .const_i256 = .{ .dst = idx, .bytes = [_]u8{0} ** 32 } }, span);
+
+                try self.loop_stack.append(self.allocator, .{ .cont_label = loop_top, .end_label = loop_end });
+                defer _ = self.loop_stack.pop();
+
                 try self.emit(.{ .label = .{ .id = loop_top } }, span);
+
+                // Check if idx < len
+                const cond = self.freshReg();
+                try self.emit(.{ .lt = .{ .dst = cond, .lhs = idx, .rhs = len } }, span);
+                try self.emit(.{ .branch = .{
+                    .cond = cond,
+                    .then_ = loop_body,
+                    .else_ = loop_end,
+                } }, span);
+
+                try self.emit(.{ .label = .{ .id = loop_body } }, span);
+
+                // Bind variable(s) for the current iteration
+                switch (e.binding) {
+                    .single => |name| {
+                        const item = self.freshReg();
+                        try self.emit(.{ .collection_get = .{ .dst = item, .collection = coll, .key = idx } }, span);
+                        try self.bindLocal(name, item);
+                    },
+                    .pair => |p| {
+                        try self.bindLocal(p.first, idx);
+                        const item = self.freshReg();
+                        try self.emit(.{ .collection_get = .{ .dst = item, .collection = coll, .key = idx } }, span);
+                        try self.bindLocal(p.second, item);
+                    },
+                }
+
                 for (e.body) |body_stmt| {
                     try self.lowerStmt(&body_stmt);
                 }
+
+                // Increment index
+                const one = self.freshReg();
+                var one_bytes = [_]u8{0} ** 32;
+                one_bytes[31] = 1;
+                try self.emit(.{ .const_i256 = .{ .dst = one, .bytes = one_bytes } }, span);
+                try self.emit(.{ .add = .{ .dst = idx, .lhs = idx, .rhs = one } }, span);
+
                 try self.emit(.{ .jump = .{ .target = loop_top } }, span);
                 try self.emit(.{ .label = .{ .id = loop_end } }, span);
             },
@@ -1109,13 +1242,40 @@ pub const MirLowerer = struct {
             // ── repeat N times ────────────────────────────────────────────
             .repeat => |r| {
                 const count = try self.lowerExpr(r.count);
-                _ = count;
                 const loop_top = self.freshLabel();
+                const loop_body = self.freshLabel();
                 const loop_end = self.freshLabel();
+                
+                // Initialize counter to 0
+                const counter = self.freshReg();
+                try self.emit(.{ .const_i256 = .{ .dst = counter, .bytes = [_]u8{0} ** 32 } }, span);
+
+                try self.loop_stack.append(self.allocator, .{ .cont_label = loop_top, .end_label = loop_end });
+                defer _ = self.loop_stack.pop();
+
                 try self.emit(.{ .label = .{ .id = loop_top } }, span);
+                
+                // Check if counter < count
+                const cond = self.freshReg();
+                try self.emit(.{ .lt = .{ .dst = cond, .lhs = counter, .rhs = count } }, span);
+                try self.emit(.{ .branch = .{
+                    .cond = cond,
+                    .then_ = loop_body,
+                    .else_ = loop_end,
+                } }, span);
+                
+                try self.emit(.{ .label = .{ .id = loop_body } }, span);
                 for (r.body) |body_stmt| {
                     try self.lowerStmt(&body_stmt);
                 }
+                
+                // Increment counter
+                const one = self.freshReg();
+                var one_bytes = [_]u8{0} ** 32;
+                one_bytes[31] = 1;
+                try self.emit(.{ .const_i256 = .{ .dst = one, .bytes = one_bytes } }, span);
+                try self.emit(.{ .add = .{ .dst = counter, .lhs = counter, .rhs = one } }, span);
+                
                 try self.emit(.{ .jump = .{ .target = loop_top } }, span);
                 try self.emit(.{ .label = .{ .id = loop_end } }, span);
             },
@@ -1125,6 +1285,10 @@ pub const MirLowerer = struct {
                 const loop_top = self.freshLabel();
                 const loop_body = self.freshLabel();
                 const loop_end = self.freshLabel();
+                
+                try self.loop_stack.append(self.allocator, .{ .cont_label = loop_top, .end_label = loop_end });
+                defer _ = self.loop_stack.pop();
+
                 try self.emit(.{ .label = .{ .id = loop_top } }, span);
                 const cond = try self.lowerExpr(wl.cond);
                 try self.emit(.{ .branch = .{
@@ -1183,13 +1347,22 @@ pub const MirLowerer = struct {
 
             // ── stop (break) ──────────────────────────────────────────────
             .stop => {
-                // Backends should patch to enclosing loop end.
-                try self.emit(.{ .nop = {} }, span);
+                if (self.loop_stack.items.len > 0) {
+                    const ctx = self.loop_stack.items[self.loop_stack.items.len - 1];
+                    try self.emit(.{ .jump = .{ .target = ctx.end_label } }, span);
+                } else {
+                    try self.emit(.{ .nop = {} }, span);
+                }
             },
 
             // ── skip (continue) ───────────────────────────────────────────
             .skip => {
-                try self.emit(.{ .nop = {} }, span);
+                if (self.loop_stack.items.len > 0) {
+                    const ctx = self.loop_stack.items[self.loop_stack.items.len - 1];
+                    try self.emit(.{ .jump = .{ .target = ctx.cont_label } }, span);
+                } else {
+                    try self.emit(.{ .nop = {} }, span);
+                }
             },
 
             // ── tell (event) ──────────────────────────────────────────────

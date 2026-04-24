@@ -1,0 +1,120 @@
+# Phase 2: Robust MIR-Based RISC-V Backend
+
+## Summary
+
+Add a `MirBackend` struct to `codegen.zig` that **consumes a `MirModule`** and emits production-quality RISC-V bytecode, while keeping all existing AST-walking code intact. The MIR backend is wired into `CodeGen.generate()` as the **preferred path** when a `MirModule` is available; if not, the legacy path continues to function.
+
+## Key Design Decisions
+
+> [!IMPORTANT]
+> The existing AST-walking `CodeGen` is **not deleted**. `MirBackend` is added as an additive, self-contained struct alongside it. The `generate()` signature gains an optional `?*const mir.MirModule` parameter; non-null enables the new path.
+
+> [!IMPORTANT]
+> Per the analysis, the main bugs in the legacy backend are:
+> 1. **Register cliff** — `alloc()` returning `null` silently defaults to `.t0` (clobbers).
+> 2. **Stack temp leaks** — u256 literals allocate 32B on the stack without cleanup in loops.
+> 3. **No spilling** — when all 14 allocatables are live, we clobber instead of spilling.
+>
+> The `MirBackend` fixes all three with a proper **linear-scan allocator with spill slots**.
+
+## Architecture of the New `MirBackend`
+
+```
+MirModule
+    └─ MirFunction[]
+           └─ MirInstr[] (flat SSA ops with virtual regs)
+                    │
+                    ▼
+        MirRegAlloc (linear-scan + spill slots)
+                    │
+                    ▼
+        BytecodeWriter (RISC-V instructions)
+```
+
+### Linear-Scan Register Allocator with Spilling
+
+- Maps MIR virtual register (`u16`) → physical `riscv.Reg` or spill slot.
+- Spill slots are `i12` offsets from `s0` (frame pointer). Each slot is 8 bytes.
+- When no physical register is free: **evict** the virtual register with the longest remaining live interval (or LRU), write it to its spill slot, and reclaim its physical register.
+- On use of a spilled register: emit `LD phys, slot(s0)` before the instruction, `SD slot(s0), phys` after if it was written.
+
+### Frame Layout
+
+```
+[s0 - 8]   = saved ra
+[s0 - 16]  = saved s0 (caller's frame ptr)
+[s0 - 24 .. s0 - (24 + 8*N_SPILL)] = spill slots
+```
+
+Frame size is computed conservatively from `MirFunction.max_regs` before emission.
+
+## Proposed Changes
+
+### MODIFY [codegen.zig](file:///Users/karan/forge/src/codegen.zig)
+
+**Chunk 1 — MirBackend struct + linear-scan allocator (~120 lines)**
+
+Added after the existing `RegAlloc` struct. Contains:
+- `PhysMap`: maps virtual `Reg` → `PhysSlot` (either a physical `riscv.Reg` or a stack offset).
+- `MirRegAlloc`: linear-scan with eviction + spill-to-frame.
+- `MirBackend` struct with `writer`, `reg_alloc`, `frame_size`.
+
+**Chunk 2 — MirBackend.lowerFunction() + prologue/epilogue (~80 lines)**
+
+- Computes `frame_size` from `max_regs`.
+- Emits RV64 ABI prologue (save ra, s0; set s0).
+- Calls `lowerInstr` for each `MirInstr`.
+- Emits epilogue (restore ra, s0; JALR zero, ra, 0).
+
+**Chunk 3 — MirBackend.lowerInstr() for constants + arithmetic + compare + mov (~100 lines)**
+
+Handles: `const_i64`, `const_i256`, `const_bool`, `const_data`, `add`, `sub`, `mul`, `div`, `mod`, `eq`, `ne`, `lt`, `gt`, `le`, `ge`, `bool_and`, `bool_or`, `bool_not`, `negate`, `mov`.
+
+**Chunk 4 — MirBackend.lowerInstr() for control flow + state access (~100 lines)**
+
+Handles: `label`, `jump`, `branch`, `ret`, `state_read`, `state_write`, `state_delete`.
+
+Uses a label-to-offset patch table (same pattern as the existing AST backend).
+
+**Chunk 5 — MirBackend.lowerInstr() for builtins + events + assets + calls (~100 lines)**
+
+Handles: `get_caller`, `get_value`, `get_block`, `get_timestamp`, `get_gas`, `get_this`, `get_deployer`, `get_zero_addr`, `emit_event`, `need`, `ensure`, `panic`, `throw_error`, `asset_send`, `asset_mint`, `asset_burn`, `pay`, `auth_check`, `call_internal`, `call_external`, `oracle_read`, `vrf_random`, `zk_verify`.
+
+**Chunk 6 — CodeGen.generateFromMir() + wiring into generate() (~80 lines)**
+
+- New `pub fn generateFromMir(self, module: *const mir.MirModule, checked) anyerror![]u8` that:
+  1. Creates a `MirBackend` per function.
+  2. Serializes access list, header, data section.
+  3. Returns the assembled binary (same format as `generate()`).
+- `generate()` gains an optional fast path if the caller also provides a pre-built `MirModule`.
+
+**Chunk 7 — Tests (~50 lines)**
+
+- `test "MirBackend: const_i64 loads immediate"` 
+- `test "MirBackend: add two regs"`
+- `test "MirBackend: state_read emits correct syscall sequence"`
+- `test "MirBackend: branch with backpatch"`
+- `test "MirBackend: spill slot allocated when all regs live"`
+
+## Verification Plan
+
+### Automated Tests
+```bash
+cd /Users/karan/forge && zig build test
+```
+All existing tests must continue to pass. New MIR backend tests must also pass.
+
+### Manual Verification
+Inspect that a minimal `MirModule` with one `const_i64` function produces a 64-byte header + correct bytecode blob. No behavioral regression in the legacy path.
+
+## Chunk Delivery Order
+
+Since the file is 3167 lines and each edit must be ≤ 150 lines, I will deliver **7 separate edits** in sequence:
+
+1. `MirRegAlloc` struct (linear-scan allocator with spill slots)  
+2. `MirBackend` struct + `lowerFunction()`  
+3. `lowerInstr()` — constants + arithmetic + compare  
+4. `lowerInstr()` — control flow + state access  
+5. `lowerInstr()` — builtins + events + assets + auth + calls  
+6. `generateFromMir()` + wiring  
+7. Tests  

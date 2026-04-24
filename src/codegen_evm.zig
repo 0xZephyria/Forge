@@ -1670,6 +1670,15 @@ pub const EVMCodeGen = struct {
             .nop => {},
             .call_internal => {},
             .call_external => {},
+
+            // ── Enum extraction (no-op on EVM: handled at ABI layer) ──────
+            // SPEC: Part 9.1 — enum_extract: tag already integer by MIR lowering.
+            .enum_extract,
+            // SPEC: Part 11 — collection_len/get: length/index intrinsics handled above MIR.
+            .collection_len,
+            .collection_get,
+            // SPEC: Part 9.2 — enum_match: tag comparison lowered to eq by checker.
+            .enum_match => {},
         }
     }
 
