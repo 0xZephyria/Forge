@@ -283,6 +283,32 @@ pub inline fn SRA(rd: Reg, rs1: Reg, rs2: Reg) u32 {
     return encodeR(F7_SUB, rs2, rs1, F3_SRL_SRA, rd, OP_REG);
 }
 
+/// SLLI rd, rs1, shamt — Shift Left Logical Immediate (RV64I).
+/// SPEC: Part 3 — shamt is 6-bit (0..63) for RV64.
+/// Encoding: I-type with imm[5:0]=shamt, imm[11:6]=0 (funct7 upper = 0x00).
+pub inline fn SLLI(rd: Reg, rs1: Reg, shamt: u6) u32 {
+    // For RV64I SLLI the immediate field encodes shamt in bits [5:0] and
+    // bits [11:6] must be 0b000000 — exactly what encodeI gives when the
+    // signed i12 value equals shamt (which is ≤ 63, always positive).
+    return encodeI(@intCast(shamt), rs1, F3_SLLI, rd, OP_IMM);
+}
+
+/// SRLI rd, rs1, shamt — Shift Right Logical Immediate (RV64I).
+/// SPEC: Part 3 — shamt is 6-bit (0..63) for RV64.
+pub inline fn SRLI(rd: Reg, rs1: Reg, shamt: u6) u32 {
+    // funct7 upper 7 bits of imm12 = 0x00 for logical right shift.
+    return encodeI(@intCast(shamt), rs1, F3_SRLI_SRAI, rd, OP_IMM);
+}
+
+/// SRAI rd, rs1, shamt — Shift Right Arithmetic Immediate (RV64I).
+/// SPEC: Part 3 — shamt is 6-bit; distinguished from SRLI by imm[10]=1.
+pub inline fn SRAI(rd: Reg, rs1: Reg, shamt: u6) u32 {
+    // Arithmetic right-shift: imm[10] set = bit 10 of the 12-bit immediate.
+    // imm12 = 0b0100_0000_0000 | shamt = 0x400 | shamt.
+    const imm12: i12 = @bitCast(@as(u12, 0x400) | @as(u12, shamt));
+    return encodeI(imm12, rs1, F3_SRLI_SRAI, rd, OP_IMM);
+}
+
 /// LUI rd, imm20 (load upper immediate)
 pub inline fn LUI(rd: Reg, imm: u20) u32 {
     return encodeU(imm, rd, OP_LUI);
@@ -460,6 +486,20 @@ pub const ZephCustomOp = enum(u32) {
     /// SPEC: Part 14.2 — Oracle price query.
     /// a0=0xA0, a1=feed_id(u32) → a2=result_ptr(32B)
     ORACLE_QUERY         = 0xA0,
+
+    // ── Forge VM extensions (0xB0 range) ──────────────────────────────
+    /// SPEC: Part 12.2 — Verify a ZK proof against a named circuit.
+    /// a0=0xB0, a1=circuit_id(u32), a2=proof_ptr, a3=proof_len → a0=1 if valid
+    ZK_VERIFY            = 0xB0,
+    /// SPEC: Part 14.6 — Delegate gas payment to a sponsor address.
+    /// a0=0xB1, a1=payer_addr_ptr(20B)
+    DELEGATE_GAS         = 0xB1,
+    /// SPEC: Part 3.10 — Expand account storage by N bytes.
+    /// a0=0xB2, a1=account_ptr, a2=extra_bytes(u64)
+    EXPAND_ACCOUNT       = 0xB2,
+    /// SPEC: Part 3.10 — Close account, refunding lamports to recipient.
+    /// a0=0xB3, a1=account_ptr, a2=refund_to_ptr(20B)
+    CLOSE_ACCOUNT        = 0xB3,
 };
 
 /// SPEC: Part 5 — Emit a Zephyria syscall.

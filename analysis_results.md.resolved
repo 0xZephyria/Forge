@@ -1,0 +1,66 @@
+# Forge Compiler: Deep Robustness & Parity Analysis
+
+This expanded report analyzes the structural integrity, production-readiness, and feature parity across the entire Forge compiler pipeline (Lexer → Parser → AST → Semantic Checker → MIR → Codegen).
+
+## Executive Summary
+
+While the front-end (Lexer/Parser/AST) is highly expressive and strictly follows the Forge specification, the middle and back-end stages suffer from **Severe Feature Attrition**. Large portions of the parsed AST are dropped, and critical control-flow structures are entirely missing from the MIR, rendering the modern EVM backend incapable of compiling complex contracts.
+
+> [!CAUTION]
+> **Production Blocker**: The MIR infrastructure (`mir.zig`) currently does not support Loops (`while`, `each`, `repeat`), Pattern Matching (`match`), or Error Handling (`attempt`). Any contract using these features will fail to lower to MIR.
+
+---
+
+## 1. Lexer / Parser / AST vs. MIR Parity
+
+The Lexer and Parser correctly ingest the full Forge language, but the pipeline breaks down during semantic checking and MIR lowering.
+
+### Missing Core Language Constructs in MIR
+The `MirLowerer` completely omits the implementation (`lowerStmt`) for the following standard features:
+*   **Loops**: `.while_`, `.each`, and `.repeat` are unhandled. No jump graphs are generated for them.
+*   **Pattern Matching**: The AST's complex `Pattern` union (`PatternFail`, `PackedEnumVariant`, `tuple`) and `MatchStmt` are completely ignored.
+*   **Error Catching**: The `attempt / on_error` statement block is missing from MIR.
+*   **Advanced Ops**: `verify` (ZK proof evaluation) and `schedule` (cross-contract deferral) are unhandled.
+
+### The "Novel Ideas" Ghost Town
+The AST defines several advanced specification features ("Novel Ideas") that the parser successfully reads, but they are **entirely ignored** by both `checker.zig` and `mir.zig`:
+*   `conserves:` blocks (Economic Conservation Proofs).
+*   `adversary tries:` blocks (In-language attack simulation).
+*   `global invariant` declarations (Cross-contract assertions).
+*   `upgrade:` blocks (Semantic upgrade diffs).
+*   `capability` token types.
+
+---
+
+## 2. Codegen Backends: Deep Dive
+
+### Legacy RISC-V Backend (`codegen.zig`)
+As previously identified, this backend bypasses MIR entirely.
+*   **Register "Cliff"**: The linear allocator returns `null` when exhausted, and callers default to `.t0`, causing silent register clobbering and non-deterministic logic.
+*   **Stack Temp Leaks**: `u256` literals allocate 32 bytes on the stack without a centralized cleanup mechanism, causing runtime Stack Overflows in loops.
+*   **Missing Optimizations**: Because it lacks an IR, it cannot perform standard compiler optimizations like **Constant Folding**, **Dead Code Elimination (DCE)**, or **Common Subexpression Elimination (CSE)**.
+
+### Modern EVM Backend (`codegen_evm.zig`)
+The EVM backend correctly utilizes the `mir.zig` infrastructure, making its architecture vastly superior to the RISC-V backend. However, it suffers from two major issues:
+1.  **Incomplete by Inheritance**: Because MIR lacks loops and matches, the EVM codegen cannot compile contracts that use them.
+2.  **Severe Gas Inefficiency**: It currently bypasses the EVM's 16-element stack limit by mapping *every single MIR virtual register* to a memory slot (`base_mem + reg * 32`). Every `MirOp.add` requires two `MLOAD`s and one `MSTORE`.
+    *   **Optimization Required**: A **Stack-Aware Register Allocator** that attempts to keep active virtual registers on the EVM physical stack, only spilling to memory when the stack is deep.
+
+---
+
+## 3. Remaining Implementation Gaps & Roadmap
+
+To achieve full production parity and robustness, the following implementation sequence is required:
+
+**Phase 1: Complete the MIR**
+1.  Implement `lowerStmt` in `mir.zig` for `while`, `each`, `repeat`, and `match` statements by emitting the appropriate `branch` and `jump` control flow graphs.
+2.  Add MIR operations for `verify` (ZK) and `schedule`.
+
+**Phase 2: Bridge RISC-V to MIR**
+1.  Delete the AST-walking logic in `codegen.zig`.
+2.  Implement a `MirBackend` for RISC-V that consumes `MirModule` just like the EVM backend does.
+3.  Implement a Graph-Coloring Register Allocator to map virtual registers to physical RISC-V registers safely, spilling to the stack when necessary.
+
+**Phase 3: Front-to-Back Parity**
+1.  Integrate the missing "Novel Ideas" into the Semantic Checker (`checker.zig`) to ensure they are validated.
+2.  Implement EVM Stack Optimization to reduce the gas penalty of the memory-mapped virtual registers.

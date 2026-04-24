@@ -5,6 +5,8 @@
 // Targets:
 //   zig build             -- build the forgec compiler binary
 //   zig build test        -- run all unit tests across all source files
+//   zig build vmtest      -- compile + run every .foz contract through ForgeVM
+//   zig build vmtest -- contracts/Foo.foz -- run one specific contract
 //   zig build check       -- semantic-only check on contracts/ directory
 //   zig build run -- <args> -- build and run forgec with given arguments
 //
@@ -94,11 +96,19 @@ pub fn build(b: *std.Build) void {
         "src/checker.zig",
         "src/riscv.zig",
         "src/codegen.zig",
-        "src/codegen_polkavm.zig",
+        // "src/codegen_polkavm.zig",
         "src/codegen_evm.zig",
         "src/u256.zig",
         "src/main.zig",
         "src/wasm.zig",
+        // Zephyria VM unit tests
+        "zephyria/vm/vm.zig",
+        "zephyria/vm/loader/zephbin_loader.zig",
+        "zephyria/vm/core/decoder.zig",
+        "zephyria/vm/core/executor.zig",
+        "zephyria/vm/gas/meter.zig",
+        "zephyria/vm/memory/sandbox.zig",
+        "zephyria/vm/syscall/dispatch.zig",
     };
 
     // Build test filter array from the option
@@ -123,6 +133,48 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_t.step);
     }
 
+    // ── VM Test step ──────────────────────────────────────────────────────
+    // Compiles all .foz contracts and runs them through the Zephyria VM.
+    // This is the end-to-end integration test suite (like `evm-test` for EVM).
+    //
+    // IMPORTANT: vm.zig uses bare relative @imports for all its sub-files.
+    // In Zig 0.15, every source file must belong to exactly ONE module.
+    // Therefore we register vm.zig as a single 'zephyria_vm' module and let
+    // it resolve its children itself — we must NOT declare separate modules
+    // for executor.zig, sandbox.zig etc. because vm.zig already owns them.
+    const zvm_vm = b.createModule(.{
+        .root_source_file = b.path("zephyria/vm/vm.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const vmtest_mod = b.createModule(.{
+        .root_source_file = b.path("src/vmrun.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // zephyria_vm is the single entry point; zephbin_loader and syscall_dispatch
+    // are accessed through vm_mod.zephbin_loader / vm_mod.syscall_dispatch re-exports.
+    vmtest_mod.addImport("zephyria_vm", zvm_vm);
+
+
+    const vmtest_exe = b.addExecutable(.{
+        .name = "forge-vmtest",
+        .root_module = vmtest_mod,
+    });
+    b.installArtifact(vmtest_exe);
+
+    const vmtest_run = b.addRunArtifact(vmtest_exe);
+    vmtest_run.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        vmtest_run.addArgs(args);
+    }
+    const vmtest_step = b.step(
+        "vmtest",
+        "Compile .foz contracts and run them through the Zephyria VM",
+    );
+    vmtest_step.dependOn(&vmtest_run.step);
+
     // ── Check step ───────────────────────────────────────────────────────
     // Runs forgec --check-only on all .foz files in contracts/ if present.
     const check_step = b.step("check", "Type-check .foz files in contracts/");
@@ -143,3 +195,4 @@ pub fn build(b: *std.Build) void {
         // contracts/ directory doesn't exist — check step is a no-op
     }
 }
+

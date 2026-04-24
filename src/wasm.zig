@@ -16,7 +16,7 @@ const types = @import("types.zig");
 const checker = @import("checker.zig");
 const codegen = @import("codegen.zig");
 const codegen_evm = @import("codegen_evm.zig");
-const codegen_polkavm = @import("codegen_polkavm.zig");
+// const codegen_polkavm = @import("codegen_polkavm.zig");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const abi = @import("abi.zig");
@@ -177,9 +177,13 @@ fn compileInternal(alloc: std.mem.Allocator, source: []const u8, target_evm: boo
                 const tmp_bin = try cg.generateFromMir(&mir_module);
                 binary = try temp_alloc.dupe(u8, tmp_bin);
             } else {
+                var lowerer = mir_mod.MirLowerer.init(temp_alloc, &resolver, &diagnostics);
+                defer lowerer.deinit();
+                const mir_module = try lowerer.lowerContract(contract, &checked);
+
                 var cg = codegen.CodeGen.init(temp_alloc, &diagnostics, &resolver);
                 defer cg.deinit();
-                const tmp_bin = try cg.generate(contract, &checked);
+                const tmp_bin = try cg.generateFromMir(&mir_module, &checked);
                 binary = try temp_alloc.dupe(u8, tmp_bin);
             }
 

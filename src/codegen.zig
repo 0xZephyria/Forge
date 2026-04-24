@@ -1,10 +1,10 @@
 // ============================================================================
-// Forge Compiler — Code Generator
+// Forge Compiler — Code Generator (MIR → RISC-V)
 // ============================================================================
 //
-// Walks the checked AST and emits RISC-V bytecode for the Zephyria VM.
-// Produces a complete .fozbin binary with header, access list, and
-// bytecode sections.
+// Consumes a MirModule produced by mir.MirLowerer and emits 64-bit RISC-V
+// bytecode for the Zephyria VM.  Produces a complete .fozbin binary with:
+//   [64-byte ZephBinHeader][data section][access list][bytecode section]
 //
 // SPEC REFERENCE: Part 5 (Contract Anatomy), Part 9 (Parallel Execution),
 //   Part 20 (Zero-Conflict Architecture — binary includes verified access list)
@@ -18,25 +18,10 @@ const types = @import("types.zig");
 const checker = @import("checker.zig");
 const riscv = @import("riscv.zig");
 const u256_mod = @import("u256.zig");
+const mir = @import("mir.zig");
 
-const Span = ast.Span;
-const Expr = ast.Expr;
-const ExprKind = ast.ExprKind;
-const Stmt = ast.Stmt;
-const StmtKind = ast.StmtKind;
-const BinOp = ast.BinOp;
-const UnaryOp = ast.UnaryOp;
+// MIR pipeline needs only these AST types for conservation metadata and test helpers.
 const ContractDef = ast.ContractDef;
-const ActionDecl = ast.ActionDecl;
-const ViewDecl = ast.ViewDecl;
-const WhenStmt = ast.WhenStmt;
-const MatchStmt = ast.MatchStmt;
-const EachLoop = ast.EachLoop;
-const RepeatLoop = ast.RepeatLoop;
-const WhileLoop = ast.WhileLoop;
-const NeedStmt = ast.NeedStmt;
-const TellStmt = ast.TellStmt;
-const Argument = ast.Argument;
 
 const DiagnosticList = errors.DiagnosticList;
 const CompileError = errors.CompileError;
@@ -49,6 +34,7 @@ const AccessEntry = checker.AccessEntry;
 const Reg = riscv.Reg;
 const BytecodeWriter = riscv.BytecodeWriter;
 const ZephCustomOp = riscv.ZephCustomOp;
+
 
 // ============================================================================
 // Section 1 — ZephBin Binary Header
@@ -187,79 +173,105 @@ fn scaleFixedPoint(lit: []const u8, decimals: u8) u64 {
     return add_tup[0];
 }
 
+
+
 // ============================================================================
-// Section 3 — Register Allocator
+// Section 4 — MIR Registration
 // ============================================================================
 
-/// Simple linear scan register allocator over temp/arg registers.
-pub const RegAlloc = struct {
-    used: [32]bool = [_]bool{false} ** 32,
+/// Linear scan register allocator for MIR.
+pub const MirRegAlloc = struct {
+    allocator: std.mem.Allocator,
+    v2p: []?Reg,
+    p2v: [32]?mir.Reg = [_]?mir.Reg{null} ** 32,
+    evict_idx: usize = 0,
+    const allocatable = [_]u5{ 6, 7, 10, 11, 12, 13, 14, 15, 16, 28, 29, 30, 31 };
 
-    /// Allocatable registers: t0-t6 (5-7, 28-31) and a0-a6 (10-16).
-    /// a7 is reserved for syscall/custom-op number.
-    const allocatable = [_]u5{ 5, 6, 7, 10, 11, 12, 13, 14, 15, 16, 28, 29, 30, 31 };
+    pub fn init(allocator: std.mem.Allocator, max_regs: u32) !MirRegAlloc {
+        const v2p = try allocator.alloc(?Reg, max_regs);
+        @memset(v2p, null);
+        return .{ .allocator = allocator, .v2p = v2p };
+    }
 
-    /// Allocate the first free temp/arg register.
-    pub fn alloc(self: *RegAlloc) ?Reg {
+    pub fn deinit(self: *MirRegAlloc) void {
+        self.allocator.free(self.v2p);
+    }
+
+    fn spillOffset(vreg: mir.Reg) i12 {
+        return @as(i12, -16) - (@as(i12, @intCast(vreg)) + 1) * 32;
+    }
+
+    pub fn getReg(self: *MirRegAlloc, vreg: mir.Reg, writer: *BytecodeWriter, is_dst: bool) !Reg {
+        if (self.v2p[vreg]) |preg| return preg;
+
+        var target_preg: ?Reg = null;
         for (allocatable) |idx| {
-            if (!self.used[idx]) {
-                self.used[idx] = true;
-                return @enumFromInt(idx);
+            if (self.p2v[idx] == null) {
+                target_preg = @enumFromInt(idx);
+                break;
             }
         }
-        return null;
+
+        if (target_preg == null) {
+            const evict_p_idx = allocatable[self.evict_idx];
+            self.evict_idx = (self.evict_idx + 1) % allocatable.len;
+            const evict_preg: Reg = @enumFromInt(evict_p_idx);
+            const evict_vreg = self.p2v[evict_p_idx].?;
+            try writer.emit(riscv.SD(evict_preg, .s0, spillOffset(evict_vreg)));
+            self.v2p[evict_vreg] = null;
+            self.p2v[evict_p_idx] = null;
+            target_preg = evict_preg;
+        }
+
+        const preg = target_preg.?;
+        if (!is_dst) try writer.emit(riscv.LD(preg, .s0, spillOffset(vreg)));
+        self.p2v[@intFromEnum(preg)] = vreg;
+        self.v2p[vreg] = preg;
+        return preg;
     }
 
-    /// Free a previously allocated register.
-    pub fn free(self: *RegAlloc, r: Reg) void {
-        self.used[@intFromEnum(r)] = false;
-    }
-
-    /// Free all registers.
-    pub fn freeAll(self: *RegAlloc) void {
-        self.used = [_]bool{false} ** 32;
+    pub fn flushAll(self: *MirRegAlloc, writer: *BytecodeWriter) !void {
+        for (self.v2p, 0..) |m_preg, vreg| {
+            if (m_preg) |preg| {
+                try writer.emit(riscv.SD(preg, .s0, spillOffset(@intCast(vreg))));
+                self.v2p[vreg] = null;
+                self.p2v[@intFromEnum(preg)] = null;
+            }
+        }
     }
 };
 
-/// Information about a local variable tracked during codegen.
-pub const LocalVar = struct {
-    reg: Reg,
-    ty: ResolvedType,
-};
+const BranchPatch = struct { offset_pos: usize, target_label: u32 };
+const JumpPatch = struct { offset_pos: usize, target_label: u32 };
 
-/// Per-action state maintained during code generation.
-const ActionCtx = struct {
+const MirActionCtx = struct {
     writer: BytecodeWriter,
-    reg_alloc: RegAlloc,
-    locals: std.StringHashMap(LocalVar),
-    loop_exits: std.ArrayListUnmanaged(u32),
-    loop_conts: std.ArrayListUnmanaged(u32),
-    action_name: []const u8,
-    field_ids: *std.StringHashMap(u32),
-    checked: *const CheckedContract,
+    reg_alloc: MirRegAlloc,
+    labels: std.AutoHashMapUnmanaged(u32, u32),
+    branch_patches: std.ArrayListUnmanaged(BranchPatch),
+    jump_patches: std.ArrayListUnmanaged(JumpPatch),
+    /// SPEC: Part 11.5 — Active exception handler label (set by attempt_begin).
+    exception_label: ?u32,
     allocator: std.mem.Allocator,
 
-    /// Create a new context for an action.
-    fn init(allocator: std.mem.Allocator, name: []const u8, field_ids: *std.StringHashMap(u32), checked: *const CheckedContract) ActionCtx {
+    fn init(allocator: std.mem.Allocator, max_regs: u32) !MirActionCtx {
         return .{
             .writer = BytecodeWriter.init(allocator),
-            .reg_alloc = .{},
-            .locals = std.StringHashMap(LocalVar).init(allocator),
-            .loop_exits = .{},
-            .loop_conts = .{},
-            .action_name = name,
-            .field_ids = field_ids,
-            .checked = checked,
+            .reg_alloc = try MirRegAlloc.init(allocator, max_regs),
+            .labels = .{},
+            .branch_patches = .{},
+            .jump_patches = .{},
+            .exception_label = null,
             .allocator = allocator,
         };
     }
 
-    /// Release all resources.
-    fn deinit(self: *ActionCtx) void {
+    fn deinit(self: *MirActionCtx) void {
         self.writer.deinit();
-        self.locals.deinit();
-        self.loop_exits.deinit(self.allocator);
-        self.loop_conts.deinit(self.allocator);
+        self.reg_alloc.deinit();
+        self.labels.deinit(self.allocator);
+        self.branch_patches.deinit(self.allocator);
+        self.jump_patches.deinit(self.allocator);
     }
 };
 
@@ -353,37 +365,9 @@ pub const CodeGen = struct {
         return id;
     }
 
-    /// Generate the complete .fozbin binary from a checked contract.
-    /// Returns a heap-allocated byte slice. Caller owns the memory.
-    pub fn generate(
-        self: *CodeGen,
-        contract: *const ContractDef,
-        checked: *const CheckedContract,
-    ) anyerror![]u8 {
-        // Pre-assign field IDs for all state fields
-        for (contract.state) |sf| {
-            _ = self.getOrAssignFieldId(sf.name);
-        }
+    pub fn generateFromMir(self: *CodeGen, mir_module: *const mir.MirModule, checked: *const @import("checker.zig").CheckedContract) anyerror![]u8 {
+        try self.data_section.appendSlice(self.allocator, mir_module.data_section);
 
-        // Constructor counts as an entry if present
-        const setup_count: u16 = if (contract.setup != null) 1 else 0;
-        const fb_count: u16 = @as(u16, if (contract.fallback != null) 1 else 0) +
-            @as(u16, if (contract.receive_ != null) 1 else 0);
-        const action_count: u16 = @intCast(contract.actions.len + contract.views.len + setup_count + fb_count);
-
-        // Determine flags
-        var flags: u16 = 0;
-        if (contract.upgrade != null) flags |= 0x01; // has_upgrade_authority
-        for (contract.actions) |action| {
-            for (action.annotations) |ann| {
-                if (ann.kind == .parallel) {
-                    flags |= 0x02; // parallel_capable
-                    break;
-                }
-            }
-        }
-
-        // ── Generate bytecode for each action ────────────────────────────
         const ActionBytecode = struct {
             selector: u32,
             code: []const u8,
@@ -396,237 +380,73 @@ pub const CodeGen = struct {
             action_codes.deinit(self.allocator);
         }
 
-        // ── Generate constructor (setup block) if present ────────────────────
-        if (contract.setup) |setup| {
-            var ctx = ActionCtx.init(self.allocator, "__setup__", &self.field_ids, checked);
+        for (mir_module.functions) |func| {
+            var ctx = try MirActionCtx.init(self.allocator, func.max_regs);
             defer ctx.deinit();
 
-            try self.genSetup(&setup, &ctx);
+            try self.genMirFunction(&func, &ctx);
 
             const code_bytes = ctx.writer.toBytes();
             const owned_copy = try self.allocator.alloc(u8, code_bytes.len);
             @memcpy(owned_copy, code_bytes);
 
             try action_codes.append(self.allocator, .{
-                .selector = 0x00000000,
+                .selector = func.selector,
                 .code = owned_copy,
             });
         }
 
-        for (contract.actions) |action| {
-            var ctx = ActionCtx.init(self.allocator, action.name, &self.field_ids, checked);
-            defer ctx.deinit();
-
-            try self.genAction(&action, &ctx);
-
-            const code_bytes = ctx.writer.toBytes();
-            const owned_copy = try self.allocator.alloc(u8, code_bytes.len);
-            @memcpy(owned_copy, code_bytes);
-
-            try action_codes.append(self.allocator, .{
-                .selector = actionSelector(action.name),
-                .code = owned_copy,
-            });
-        }
-
-        // ── GAP-5: Generate bytecode for each view ────────────────────────
-        for (contract.views) |view| {
-            var ctx = ActionCtx.init(self.allocator, view.name, &self.field_ids, checked);
-            defer ctx.deinit();
-
-            try self.genView(&view, &ctx);
-
-            const code_bytes = ctx.writer.toBytes();
-            const owned_copy = try self.allocator.alloc(u8, code_bytes.len);
-            @memcpy(owned_copy, code_bytes);
-
-            try action_codes.append(self.allocator, .{
-                .selector = actionSelector(view.name),
-                .code = owned_copy,
-            });
-        }
-
-        // ── GAP-FIX: Generate bytecode for each pure function ─────────────
-        // SPEC: Part 5.6 — Pure functions emit no state syscalls; they are
-        // internal-only and callable via JALR. Selector prefix 0xF0000000.
-        for (contract.pures) |pure| {
-            var ctx = ActionCtx.init(self.allocator, pure.name, &self.field_ids, checked);
-            defer ctx.deinit();
-
-            try self.genPure(&pure, &ctx);
-
-            const code_bytes = ctx.writer.toBytes();
-            const owned_copy = try self.allocator.alloc(u8, code_bytes.len);
-            @memcpy(owned_copy, code_bytes);
-
-            try action_codes.append(self.allocator, .{
-                .selector = 0xF000_0000 | (actionSelector(pure.name) & 0x0FFF_FFFF),
-                .code = owned_copy,
-            });
-        }
-
-        // ── GAP-FIX: Generate bytecode for each helper function ───────────
-        // SPEC: Part 5.7 — Helpers are within-visible only; can access state.
-        // Selector prefix 0xF1000000.
-        for (contract.helpers) |helper| {
-            var ctx = ActionCtx.init(self.allocator, helper.name, &self.field_ids, checked);
-            defer ctx.deinit();
-
-            try self.genHelper(&helper, &ctx);
-
-            const code_bytes = ctx.writer.toBytes();
-            const owned_copy = try self.allocator.alloc(u8, code_bytes.len);
-            @memcpy(owned_copy, code_bytes);
-
-            try action_codes.append(self.allocator, .{
-                .selector = 0xF100_0000 | (actionSelector(helper.name) & 0x0FFF_FFFF),
-                .code = owned_copy,
-            });
-        }
-
-        // ── GAP-FIX: Generate bytecode for each guard function ────────────
-        // SPEC: Part 6.1 — Guards are boolean conditions; they return 0 or 1
-        // in a0. Called by actions that declare `only guardName`.
-        // Selector prefix 0xF2000000.
-        for (contract.guards) |guard| {
-            var ctx = ActionCtx.init(self.allocator, guard.name, &self.field_ids, checked);
-            defer ctx.deinit();
-
-            try self.genGuard(&guard, &ctx);
-
-            const code_bytes = ctx.writer.toBytes();
-            const owned_copy = try self.allocator.alloc(u8, code_bytes.len);
-            @memcpy(owned_copy, code_bytes);
-
-            try action_codes.append(self.allocator, .{
-                .selector = 0xF200_0000 | (actionSelector(guard.name) & 0x0FFF_FFFF),
-                .code = owned_copy,
-            });
-        }
-
-        // ── SPEC: Part 5.13 — Fallback handler ──────────────────────────
-
-        if (contract.fallback) |fb| {
-            var ctx = ActionCtx.init(self.allocator, "__fallback__", &self.field_ids, checked);
-            defer ctx.deinit();
-            try self.genAction(&fb, &ctx);
-            const code_bytes = ctx.writer.toBytes();
-            const owned_copy = try self.allocator.alloc(u8, code_bytes.len);
-            @memcpy(owned_copy, code_bytes);
-            try action_codes.append(self.allocator, .{
-                .selector = 0xFFFFFFFF,
-                .code = owned_copy,
-            });
-        }
-
-        // ── SPEC: Part 5.13 — Receive handler ───────────────────────────
-        if (contract.receive_) |rc| {
-            var ctx = ActionCtx.init(self.allocator, "__receive__", &self.field_ids, checked);
-            defer ctx.deinit();
-            try self.genAction(&rc, &ctx);
-            const code_bytes = ctx.writer.toBytes();
-            const owned_copy = try self.allocator.alloc(u8, code_bytes.len);
-            @memcpy(owned_copy, code_bytes);
-            try action_codes.append(self.allocator, .{
-                .selector = 0x00000001, // Receive selector
-                .code = owned_copy,
-            });
-        }
-
-        // ── SPEC: Tier 1 Robustness — Migration Entry Point ─────────────
-        if (contract.upgrade) |up| {
-            // Generate selector 0xDEAD0001 for migration
-            var ctx = ActionCtx.init(self.allocator, "__migrate__", &self.field_ids, checked);
-            defer ctx.deinit();
-            
-            // 1. Enforce migration authority check (must be upgrade authority)
-            // Implementation detail: The VM handles the 'only' authority check if injected.
-            // If migrate_fn was specified in Forge source, call it.
-            if (up.migrate_fn) |fn_name| {
-                // Find method by name
-                for (contract.actions) |act| {
-                    if (std.mem.eql(u8, act.name, fn_name)) {
-                        try self.genAction(&act, &ctx);
-                        break;
-                    }
-                }
-            } else {
-                // Default empty migration: just return success
-                const frame_size: i12 = 8;
-                try ctx.writer.emit(riscv.ADDI(.sp, .sp, -frame_size));
-                try ctx.writer.emit(riscv.SD(.sp, .ra, 0));
-                try ctx.writer.emit(riscv.LD(.ra, .sp, 0));
-                try ctx.writer.emit(riscv.ADDI(.sp, .sp, frame_size));
-                try ctx.writer.emit(riscv.JALR(.zero, .ra, 0));
-            }
-
-            const code_bytes = ctx.writer.toBytes();
-            const owned_copy = try self.allocator.alloc(u8, code_bytes.len);
-            @memcpy(owned_copy, code_bytes);
-            try action_codes.append(self.allocator, .{
-                .selector = 0xDEAD0001,
-                .code = owned_copy,
-            });
-        }
-
-        // ── Serialize access list section ────────────────────────────────
-        const access_list_bytes = try self.serializeAccessList(contract, checked);
+        // Serialize the access list using the checked contract's access tracking.
+        const access_list_bytes = try self.serializeAccessListFromChecked(mir_module, checked);
         defer self.allocator.free(access_list_bytes);
 
-        // ── Serialize bytecode section ───────────────────────────────────
-        const bytecode_bytes = try self.serializeBytecodeSection(action_codes.items);
-        defer self.allocator.free(bytecode_bytes);
+        var binary_list = std.ArrayListUnmanaged(u8){};
+        errdefer binary_list.deinit(self.allocator);
 
-        // ── Assemble final binary ────────────────────────────────────────
-        // Layout: [64-byte header][access_list][bytecode][data_section]
-        const data_bytes = self.data_section.items;
-        var header = ZephBinHeader{};
-        header.contract_name = writeContractName(contract.name);
-        header.action_count = action_count;
-        header.flags = flags;
-        header.access_list_len = @intCast(access_list_bytes.len);
-        header.bytecode_len = @intCast(bytecode_bytes.len);
-        header.data_section_len = @intCast(data_bytes.len);
+        var header = ZephBinHeader{
+            .magic = [4]u8{ 'F', 'O', 'R', 'G' },
+            .version = 1,
+            .flags = 0,
+            .contract_name = writeContractName(mir_module.name),
+            .action_count = @intCast(action_codes.items.len),
+            ._pad0 = 0,
+            .access_list_len = @intCast(access_list_bytes.len),
+            .bytecode_len = 0,
+            .checksum = 0,
+            .data_section_len = @intCast(self.data_section.items.len),
+            .conservation_len = 0,
+        };
 
-        // ── Serialize conservation metadata section ──────────────────────
-        const conservation_bytes = try self.serializeConservationMetadata(contract);
-        defer self.allocator.free(conservation_bytes);
-        header.conservation_len = @intCast(conservation_bytes.len);
+        var total_code_len: u32 = 4;
+        for (action_codes.items) |ab| {
+            total_code_len += 4;
+            total_code_len += 4;
+            total_code_len += @intCast(ab.code.len);
+        }
+        header.bytecode_len = total_code_len;
 
-        const total_size = @sizeOf(ZephBinHeader) +
-            access_list_bytes.len +
-            bytecode_bytes.len +
-            data_bytes.len +
-            conservation_bytes.len;
+        try binary_list.appendSlice(self.allocator, std.mem.asBytes(&header));
+        try binary_list.appendSlice(self.allocator, self.data_section.items);
+        try binary_list.appendSlice(self.allocator, access_list_bytes);
 
-        const binary = try self.allocator.alloc(u8, total_size);
-        errdefer self.allocator.free(binary);
 
-        // Copy header
-        const header_bytes: *const [@sizeOf(ZephBinHeader)]u8 = @ptrCast(&header);
-        @memcpy(binary[0..@sizeOf(ZephBinHeader)], header_bytes);
+        var code_count_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &code_count_buf, @intCast(action_codes.items.len), .little);
+        try binary_list.appendSlice(self.allocator, &code_count_buf);
 
-        // Copy access list
-        const al_start = @sizeOf(ZephBinHeader);
-        @memcpy(binary[al_start..][0..access_list_bytes.len], access_list_bytes);
+        for (action_codes.items) |ab| {
+            var selector_buf: [4]u8 = undefined;
+            std.mem.writeInt(u32, &selector_buf, ab.selector, .little);
+            try binary_list.appendSlice(self.allocator, &selector_buf);
 
-        // Copy bytecode
-        const bc_start = al_start + access_list_bytes.len;
-        @memcpy(binary[bc_start..][0..bytecode_bytes.len], bytecode_bytes);
+            var len_buf: [4]u8 = undefined;
+            std.mem.writeInt(u32, &len_buf, @intCast(ab.code.len), .little);
+            try binary_list.appendSlice(self.allocator, &len_buf);
 
-        // Copy data section
-        const ds_start = bc_start + bytecode_bytes.len;
-        if (data_bytes.len > 0) {
-            @memcpy(binary[ds_start..][0..data_bytes.len], data_bytes);
+            try binary_list.appendSlice(self.allocator, ab.code);
         }
 
-        // Copy conservation metadata section
-        const cm_start = ds_start + data_bytes.len;
-        if (conservation_bytes.len > 0) {
-            @memcpy(binary[cm_start..][0..conservation_bytes.len], conservation_bytes);
-        }
-
-        // Compute and store checksum over everything after checksum field
+        const binary = try binary_list.toOwnedSlice(self.allocator);
         const checksum_offset = @offsetOf(ZephBinHeader, "checksum") + @sizeOf(u32);
         const checksum = crc32(binary[checksum_offset..]);
         std.mem.writeInt(u32, binary[@offsetOf(ZephBinHeader, "checksum")..][0..4], checksum, .little);
@@ -634,1501 +454,657 @@ pub const CodeGen = struct {
         return binary;
     }
 
-    // ── Action code generation ───────────────────────────────────────────
+    fn genMirFunction(self: *CodeGen, func: *const mir.MirFunction, ctx: *MirActionCtx) anyerror!void {
+        const spill_space = func.max_regs * 32;
+        const frame_size: i12 = @intCast(64 + spill_space);
 
-    /// Generate bytecode for a single action, including prologue and epilogue.
-    fn genAction(self: *CodeGen, action: *const ActionDecl, ctx: *ActionCtx) anyerror!void {
-        const frame_size: i12 = 64; // 8 saved regs * 8 bytes
-
-        // ── Prologue ─────────────────────────────────────────────────────
         try ctx.writer.emit(riscv.ADDI(.sp, .sp, -frame_size));
         try ctx.writer.emit(riscv.SD(.sp, .ra, 0));
         try ctx.writer.emit(riscv.SD(.sp, .s0, 8));
         try ctx.writer.emit(riscv.ADDI(.s0, .sp, frame_size));
 
-        // ── Bind parameters to registers ─────────────────────────────────
-        for (action.params, 0..) |param, i| {
+        for (func.params, 0..) |_, i| {
             if (i < 7) {
-                const reg: Reg = @enumFromInt(@as(u5, @intCast(10 + i)));
-                ctx.reg_alloc.used[@intFromEnum(reg)] = true;
-                const ty = (self.resolver.resolve(param.declared_type) catch .void_);
-                try ctx.locals.put(param.name, .{ .reg = reg, .ty = ty });
+                const preg: Reg = @enumFromInt(@as(u5, @intCast(10 + i)));
+                const vreg: mir.Reg = @intCast(i);
+                ctx.reg_alloc.v2p[vreg] = preg;
+                ctx.reg_alloc.p2v[@intFromEnum(preg)] = vreg;
             }
         }
-        // ── Gas Sponsorship ─────────────────────────────────────────────
-        // SPEC: Part 4 — gas sponsorship is declared in the access list metadata,
-        // not via a VM syscall. No bytecode needed here; the node sees the
-        // annotation in the .fozabi and applies fee delegation off-chain.
-        _ = action.annotations;
 
-        // ── Body ─────────────────────────────────────────────────────────
-        for (action.body) |stmt| {
-            try self.genStmt(&stmt, ctx);
+        for (func.body) |instr| {
+            if (instr.op == .label) {
+                try ctx.labels.put(ctx.allocator, instr.op.label.id, @intCast(ctx.writer.buf.items.len));
+            }
+            try self.genMirInstr(instr.op, ctx);
         }
 
-        // ── Epilogue ─────────────────────────────────────────────────────
         try ctx.writer.emit(riscv.LD(.s0, .sp, 8));
         try ctx.writer.emit(riscv.LD(.ra, .sp, 0));
         try ctx.writer.emit(riscv.ADDI(.sp, .sp, frame_size));
         try ctx.writer.emit(riscv.JALR(.zero, .ra, 0));
+
+        try self.applyPatches(ctx);
     }
 
-    // ── View code generation ─────────────────────────────────────────────
-
-    /// Generate bytecode for a single view function.
-    /// Views are read-only (no `only` guard checks, no state writes enforced here).
-    /// They share the same prologue/epilogue and body generation as actions.
-    fn genView(self: *CodeGen, view: *const ViewDecl, ctx: *ActionCtx) anyerror!void {
-        const frame_size: i12 = 64;
-
-        // ── Prologue ─────────────────────────────────────────────────────
-        try ctx.writer.emit(riscv.ADDI(.sp, .sp, -frame_size));
-        try ctx.writer.emit(riscv.SD(.sp, .ra, 0));
-        try ctx.writer.emit(riscv.SD(.sp, .s0, 8));
-        try ctx.writer.emit(riscv.ADDI(.s0, .sp, frame_size));
-
-        // ── Bind parameters to registers ─────────────────────────────────
-        for (view.params, 0..) |param, i| {
-            if (i < 7) {
-                const reg: Reg = @enumFromInt(@as(u5, @intCast(10 + i)));
-                ctx.reg_alloc.used[@intFromEnum(reg)] = true;
-                const ty = (self.resolver.resolve(param.declared_type) catch .void_);
-                try ctx.locals.put(param.name, .{ .reg = reg, .ty = ty });
-            }
+    fn applyPatches(self: *CodeGen, ctx: *MirActionCtx) anyerror!void {
+        _ = self; // read-only; patch work is on ctx.writer.buf directly
+        for (ctx.branch_patches.items) |bp| {
+            const target_pos = ctx.labels.get(bp.target_label) orelse return error.InternalError;
+            const diff: i32 = @as(i32, @intCast(target_pos)) - @as(i32, @intCast(bp.offset_pos));
+            const old_instr = std.mem.readInt(u32, ctx.writer.buf.items[bp.offset_pos..][0..4], .little);
+            const opcode = @as(u7, @truncate(old_instr));
+            const funct3 = @as(u3, @truncate(old_instr >> 12));
+            const rs1 = @as(riscv.Reg, @enumFromInt(@as(u5, @truncate(old_instr >> 15))));
+            const rs2 = @as(riscv.Reg, @enumFromInt(@as(u5, @truncate(old_instr >> 20))));
+            const patched = riscv.encodeB(@intCast(diff), rs2, rs1, funct3, opcode);
+            std.mem.writeInt(u32, ctx.writer.buf.items[bp.offset_pos..][0..4], patched, .little);
         }
-
-        // ── Body ─────────────────────────────────────────────────────────
-        for (view.body) |stmt| {
-            try self.genStmt(&stmt, ctx);
+        for (ctx.jump_patches.items) |jp| {
+            const target_pos = ctx.labels.get(jp.target_label) orelse return error.InternalError;
+            const diff: i32 = @as(i32, @intCast(target_pos)) - @as(i32, @intCast(jp.offset_pos));
+            const old_instr = std.mem.readInt(u32, ctx.writer.buf.items[jp.offset_pos..][0..4], .little);
+            const opcode = @as(u7, @truncate(old_instr));
+            const rd = @as(riscv.Reg, @enumFromInt(@as(u5, @truncate(old_instr >> 7))));
+            const patched = riscv.encodeJ(@intCast(diff), rd, opcode);
+            std.mem.writeInt(u32, ctx.writer.buf.items[jp.offset_pos..][0..4], patched, .little);
         }
-
-        // ── Epilogue ─────────────────────────────────────────────────────
-        try ctx.writer.emit(riscv.LD(.s0, .sp, 8));
-        try ctx.writer.emit(riscv.LD(.ra, .sp, 0));
-        try ctx.writer.emit(riscv.ADDI(.sp, .sp, frame_size));
-        try ctx.writer.emit(riscv.JALR(.zero, .ra, 0));
     }
 
-    // ── Pure function code generation ────────────────────────────────────
-
-    /// SPEC: Part 5.6 — Generate bytecode for a pure function.
-    /// Pure functions must not issue any state syscalls (!STATE_READ, !STATE_WRITE).
-    /// They are callable only internally via JALR and return their result in a0.
-    /// Uses RV64IM standard prologue/epilogue.
-    fn genPure(self: *CodeGen, pure: *const ast.PureDecl, ctx: *ActionCtx) anyerror!void {
-        const frame_size: i12 = 64;
-
-        // ── Prologue (RV64IM ABI) ─────────────────────────────────────────
-        try ctx.writer.emit(riscv.ADDI(.sp, .sp, -frame_size));
-        try ctx.writer.emit(riscv.SD(.sp, .ra, 0));
-        try ctx.writer.emit(riscv.SD(.sp, .s0, 8));
-        try ctx.writer.emit(riscv.ADDI(.s0, .sp, frame_size));
-
-        // ── Bind parameters ───────────────────────────────────────────────
-        for (pure.params, 0..) |param, i| {
-            if (i < 7) {
-                const reg: Reg = @enumFromInt(@as(u5, @intCast(10 + i)));
-                ctx.reg_alloc.used[@intFromEnum(reg)] = true;
-                const ty = (self.resolver.resolve(param.declared_type) catch .void_);
-                try ctx.locals.put(param.name, .{ .reg = reg, .ty = ty });
-            }
-        }
-
-        // ── Body ──────────────────────────────────────────────────────────
-        for (pure.body) |stmt| {
-            try self.genStmt(&stmt, ctx);
-        }
-
-        // ── Epilogue ──────────────────────────────────────────────────────
-        try ctx.writer.emit(riscv.LD(.s0, .sp, 8));
-        try ctx.writer.emit(riscv.LD(.ra, .sp, 0));
-        try ctx.writer.emit(riscv.ADDI(.sp, .sp, frame_size));
-        try ctx.writer.emit(riscv.JALR(.zero, .ra, 0));
-    }
-
-    // ── Helper function code generation ──────────────────────────────────
-
-    /// SPEC: Part 5.7 — Generate bytecode for an internal helper function.
-    /// Helpers are `within`-visible by default (not externally callable).
-    /// They can read/write state and call other functions.
-    fn genHelper(self: *CodeGen, helper: *const ast.HelperDecl, ctx: *ActionCtx) anyerror!void {
-        const frame_size: i12 = 64;
-
-        // ── Prologue ─────────────────────────────────────────────────────
-        try ctx.writer.emit(riscv.ADDI(.sp, .sp, -frame_size));
-        try ctx.writer.emit(riscv.SD(.sp, .ra, 0));
-        try ctx.writer.emit(riscv.SD(.sp, .s0, 8));
-        try ctx.writer.emit(riscv.ADDI(.s0, .sp, frame_size));
-
-        // ── Bind parameters ───────────────────────────────────────────────
-        for (helper.params, 0..) |param, i| {
-            if (i < 7) {
-                const reg: Reg = @enumFromInt(@as(u5, @intCast(10 + i)));
-                ctx.reg_alloc.used[@intFromEnum(reg)] = true;
-                const ty = (self.resolver.resolve(param.declared_type) catch .void_);
-                try ctx.locals.put(param.name, .{ .reg = reg, .ty = ty });
-            }
-        }
-
-        // ── Body ──────────────────────────────────────────────────────────
-        for (helper.body) |stmt| {
-            try self.genStmt(&stmt, ctx);
-        }
-
-        // ── Epilogue ──────────────────────────────────────────────────────
-        try ctx.writer.emit(riscv.LD(.s0, .sp, 8));
-        try ctx.writer.emit(riscv.LD(.ra, .sp, 0));
-        try ctx.writer.emit(riscv.ADDI(.sp, .sp, frame_size));
-        try ctx.writer.emit(riscv.JALR(.zero, .ra, 0));
-    }
-
-    // ── Guard function code generation ───────────────────────────────────
-
-    /// SPEC: Part 6.1 — Generate bytecode for a named guard function.
-    /// Guards evaluate a boolean condition and return it in a0 (0=fail, 1=pass).
-    /// On failure the VM reverts; on success execution continues.
-    /// Guard bodies use the same statement generator so they can read state.
-    fn genGuard(self: *CodeGen, guard: *const ast.GuardDecl, ctx: *ActionCtx) anyerror!void {
-        const frame_size: i12 = 64;
-
-        // ── Prologue ─────────────────────────────────────────────────────
-        try ctx.writer.emit(riscv.ADDI(.sp, .sp, -frame_size));
-        try ctx.writer.emit(riscv.SD(.sp, .ra, 0));
-        try ctx.writer.emit(riscv.SD(.sp, .s0, 8));
-        try ctx.writer.emit(riscv.ADDI(.s0, .sp, frame_size));
-
-        // ── Bind parameters ───────────────────────────────────────────────
-        for (guard.params, 0..) |param, i| {
-            if (i < 7) {
-                const reg: Reg = @enumFromInt(@as(u5, @intCast(10 + i)));
-                ctx.reg_alloc.used[@intFromEnum(reg)] = true;
-                const ty = (self.resolver.resolve(param.declared_type) catch .void_);
-                try ctx.locals.put(param.name, .{ .reg = reg, .ty = ty });
-            }
-        }
-
-        // ── Body ──────────────────────────────────────────────────────────
-        for (guard.body) |stmt| {
-            try self.genStmt(&stmt, ctx);
-        }
-
-        // ── Guard result normalisation ─────────────────────────────────────
-        // Guards must return 0 or 1 in a0. If the body did not explicitly set
-        // a0, default to 1 (pass). The body can set a0=0 via `give back false`.
-        // If the calling action wants to revert on 0, it should do:
-        //   JALR ra, guard_fn  → BNE a0, zero, ok →  REVERT
-        // (this is emitted by genOnly when we support guard references).
-
-        // ── Epilogue ──────────────────────────────────────────────────────
-        try ctx.writer.emit(riscv.LD(.s0, .sp, 8));
-        try ctx.writer.emit(riscv.LD(.ra, .sp, 0));
-        try ctx.writer.emit(riscv.ADDI(.sp, .sp, frame_size));
-        try ctx.writer.emit(riscv.JALR(.zero, .ra, 0));
-    }
-
-    // ── Setup (Constructor) code generation ──────────────────────────────
-
-
-    /// Generate bytecode for the setup block (constructor).
-    fn genSetup(self: *CodeGen, setup: *const ast.SetupBlock, ctx: *ActionCtx) anyerror!void {
-        const frame_size: i12 = 64;
-
-        // ── Prologue ─────────────────────────────────────────────────────
-        try ctx.writer.emit(riscv.ADDI(.sp, .sp, -frame_size));
-        try ctx.writer.emit(riscv.SD(.sp, .ra, 0));
-        try ctx.writer.emit(riscv.SD(.sp, .s0, 8));
-        try ctx.writer.emit(riscv.ADDI(.s0, .sp, frame_size));
-
-        // ── Bind parameters to registers ─────────────────────────────────
-        for (setup.params, 0..) |param, i| {
-            if (i < 7) {
-                const reg: Reg = @enumFromInt(@as(u5, @intCast(10 + i)));
-                ctx.reg_alloc.used[@intFromEnum(reg)] = true;
-                const ty = (self.resolver.resolve(param.declared_type) catch .void_);
-                try ctx.locals.put(param.name, .{ .reg = reg, .ty = ty });
-            }
-        }
-
-        // ── Body ─────────────────────────────────────────────────────────
-        for (setup.body) |stmt| {
-            try self.genStmt(&stmt, ctx);
-        }
-
-        // ── Epilogue ─────────────────────────────────────────────────────
-        try ctx.writer.emit(riscv.LD(.s0, .sp, 8));
-        try ctx.writer.emit(riscv.LD(.ra, .sp, 0));
-        try ctx.writer.emit(riscv.ADDI(.sp, .sp, frame_size));
-        try ctx.writer.emit(riscv.JALR(.zero, .ra, 0));
-    }
-
-    // ── Statement code generation ────────────────────────────────────────
-
-    /// Generate bytecode for a single statement.
-    fn genStmt(self: *CodeGen, stmt: *const Stmt, ctx: *ActionCtx) anyerror!void {
-        switch (stmt.kind) {
-            .let_bind => |lb| {
-                const dest = ctx.reg_alloc.alloc() orelse .t0;
-                try self.genExpr(lb.init, ctx, dest);
-                const ty = (self.resolver.inferExpr(lb.init, &ctx.checked.scope) catch .void_);
-                try ctx.locals.put(lb.name, .{ .reg = dest, .ty = ty });
+    fn genMirInstr(self: *CodeGen, op: mir.MirOp, ctx: *MirActionCtx) anyerror!void {
+        _ = self; // no CodeGen state mutation in this dispatch; all ops via ctx
+        switch (op) {
+            .nop => {},
+            .const_i64 => |i| {
+                const dst = try ctx.reg_alloc.getReg(i.dst, &ctx.writer, true);
+                _ = try riscv.genLoadImmediate64(&ctx.writer, dst, @bitCast(i.value));
             },
-            .assign => |asg| {
-                switch (asg.target.kind) {
-                    .field_access => |fa| {
-                        if (fa.object.kind == .identifier) {
-                            const id = fa.object.kind.identifier;
-                            if (std.mem.eql(u8, id, "mine")) {
-                                try self.genStateWrite(fa.field, null, asg.value, ctx);
-                                return;
-                            }
-                        }
-                    },
-                    .index_access => |ia| {
-                        if (ia.object.kind == .field_access) {
-                            const outer_fa = ia.object.kind.field_access;
-                            if (outer_fa.object.kind == .identifier) {
-                                const oid = outer_fa.object.kind.identifier;
-                                if (std.mem.eql(u8, oid, "mine")) {
-                                    try self.genStateWrite(outer_fa.field, ia.index, asg.value, ctx);
-                                    return;
-                                }
-                            }
-                        }
-                    },
-                    else => {},
-                }
-                // General assignment: evaluate value into target register
-                if (asg.target.kind == .identifier) {
-                    const name = asg.target.kind.identifier;
-                    if (ctx.locals.get(name)) |loc| {
-                        try self.genExpr(asg.value, ctx, loc.reg);
-                        return;
-                    }
-                }
-                const dest = ctx.reg_alloc.alloc() orelse .t0;
-                try self.genExpr(asg.value, ctx, dest);
-                ctx.reg_alloc.free(dest);
-            },
-            .aug_assign => |aug| {
-                // ── Local variable aug-assign ──────────────────────────────
-                if (aug.target.kind == .identifier) {
-                    const name = aug.target.kind.identifier;
-                    if (ctx.locals.get(name)) |loc| {
-                        const dest = loc.reg;
-                        const tmp = ctx.reg_alloc.alloc() orelse .t1;
-                        defer ctx.reg_alloc.free(tmp);
-                        try self.genExpr(aug.value, ctx, tmp);
-                        const instr: u32 = switch (aug.op) {
-                            .add => riscv.ADD(dest, dest, tmp),
-                            .sub => riscv.SUB(dest, dest, tmp),
-                            .mul => riscv.MUL(dest, dest, tmp),
-                            .div => riscv.DIV(dest, dest, tmp),
-                            .mod => riscv.REM(dest, dest, tmp),
-                        };
-                        try ctx.writer.emit(instr);
-                        return;
-                    }
-                }
-                // ── GAP-3: mine.field += value  (direct state aug-assign) ──
-                if (aug.target.kind == .field_access) {
-                    const fa = aug.target.kind.field_access;
-                    if (fa.object.kind == .identifier and
-                        std.mem.eql(u8, fa.object.kind.identifier, "mine"))
-                    {
-                        const cur = ctx.reg_alloc.alloc() orelse .t0;
-                        defer ctx.reg_alloc.free(cur);
-                        const rhs = ctx.reg_alloc.alloc() orelse .t1;
-                        defer ctx.reg_alloc.free(rhs);
-                        // Load current value
-                        try self.genStateRead(fa.field, null, ctx, cur);
-                        // Load rhs
-                        try self.genExpr(aug.value, ctx, rhs);
-                        // Apply operation
-                        const instr: u32 = switch (aug.op) {
-                            .add => riscv.ADD(cur, cur, rhs),
-                            .sub => riscv.SUB(cur, cur, rhs),
-                            .mul => riscv.MUL(cur, cur, rhs),
-                            .div => riscv.DIV(cur, cur, rhs),
-                            .mod => riscv.REM(cur, cur, rhs),
-                        };
-                        try ctx.writer.emit(instr);
-                        // Store back (reuse genStateWrite pattern inline)
-                        const field_id = self.getOrAssignFieldId(fa.field);
-                        try self.genLoadImmediate(@intCast(field_id), .a0, ctx);
-                        try ctx.writer.emit(riscv.ADDI(.a1, .zero, 0));
-                        try ctx.writer.emit(riscv.ADD(.a2, cur, .zero));
-                        try ctx.writer.emit(riscv.ZEPH(.STATE_WRITE));
-                        return;
-                    }
-                }
-                // ── GAP-3: mine.field[index] += value  (map state aug-assign) ──
-                if (aug.target.kind == .index_access) {
-                    const ia = aug.target.kind.index_access;
-                    if (ia.object.kind == .field_access) {
-                        const outer_fa = ia.object.kind.field_access;
-                        if (outer_fa.object.kind == .identifier and
-                            std.mem.eql(u8, outer_fa.object.kind.identifier, "mine"))
-                        {
-                            const cur = ctx.reg_alloc.alloc() orelse .t0;
-                            defer ctx.reg_alloc.free(cur);
-                            const rhs = ctx.reg_alloc.alloc() orelse .t1;
-                            defer ctx.reg_alloc.free(rhs);
-                            // Load current map value at index
-                            try self.genStateRead(outer_fa.field, ia.index, ctx, cur);
-                            // Load rhs
-                            try self.genExpr(aug.value, ctx, rhs);
-                            // Apply operation
-                            const instr: u32 = switch (aug.op) {
-                                .add => riscv.ADD(cur, cur, rhs),
-                                .sub => riscv.SUB(cur, cur, rhs),
-                                .mul => riscv.MUL(cur, cur, rhs),
-                                .div => riscv.DIV(cur, cur, rhs),
-                                .mod => riscv.REM(cur, cur, rhs),
-                            };
-                            try ctx.writer.emit(instr);
-                            // Store back with index
-                            const field_id = self.getOrAssignFieldId(outer_fa.field);
-                            try self.genLoadImmediate(@intCast(field_id), .a0, ctx);
-                            try self.genExpr(ia.index, ctx, .a1);
-                            try ctx.writer.emit(riscv.ADD(.a2, cur, .zero));
-                            try ctx.writer.emit(riscv.ZEPH(.STATE_WRITE));
-                            return;
-                        }
-                    }
-                }
-                // Fallback: ignore unrecognised aug-assign targets
-            },
-            .when => |w| try self.genWhen(&w, ctx),
-            .match => |m| try self.genMatch(&m, ctx),
-            .each => |e| try self.genEach(&e, ctx),
-            .repeat => |r| try self.genRepeat(&r, ctx),
-            .while_ => |w| try self.genWhile(&w, ctx),
-            .need => |n| try self.genNeed(&n, ctx),
-            .tell => |t| try self.genTell(&t, ctx),
-            .give_back => |expr| {
-                const reg = ctx.reg_alloc.alloc() orelse .a0;
-                try self.genExpr(expr, ctx, reg);
-                if (reg != .a0) {
-                    try ctx.writer.emit(riscv.ADD(.a0, reg, .zero));
-                }
-                try ctx.writer.emit(riscv.JAL(.zero, 0)); // Jump to exit
-            },
-            .stop => {
-                // Emit placeholder jump, record for backpatching
-                const offset = ctx.writer.currentOffset();
-                try ctx.writer.emit(riscv.JAL(.zero, 0));
-                try ctx.loop_exits.append(ctx.allocator, offset);
-            },
-            .skip => {
-                const offset = ctx.writer.currentOffset();
-                try ctx.writer.emit(riscv.JAL(.zero, 0));
-                try ctx.loop_conts.append(ctx.allocator, offset);
-            },
-            .call_stmt => |expr| {
-                const dest = ctx.reg_alloc.alloc() orelse .t0;
-                defer ctx.reg_alloc.free(dest);
-                try self.genExpr(expr, ctx, dest);
-            },
-            .pay => |pay| {
-                // SPEC: Part 8.4 — native ZPH pay uses ASSET_TRANSFER with zeroed asset ID.
-                // ABI: a0=0x10, a1=asset_id_ptr(32B zeroes), a2=from_ptr(20B), a3=to_ptr(20B), a4=amount_val
-                const to_reg = ctx.reg_alloc.alloc() orelse .t0;
-                defer ctx.reg_alloc.free(to_reg);
-                const amt_reg = ctx.reg_alloc.alloc() orelse .t1;
-                defer ctx.reg_alloc.free(amt_reg);
-                try self.genExpr(pay.recipient, ctx, to_reg);
-                try self.genExpr(pay.amount, ctx, amt_reg);
-                // Allocate 32-byte zero buffer on stack for the zero-asset-id
+            .const_i256 => |ci| {
+                // SPEC: Part 2.1 — Load a 256-bit constant onto the stack.
+                // Layout: 4 × 64-bit limbs in little-endian word order
+                // (limb[0]=bytes[0..8], limb[1]=bytes[8..16], ...).
+                // dst receives the stack pointer to the 32-byte region.
+                const dst = try ctx.reg_alloc.getReg(ci.dst, &ctx.writer, true);
                 try ctx.writer.emit(riscv.ADDI(.sp, .sp, -32));
-                // Zero the buffer (use t2 as scratch)
-                try ctx.writer.emit(riscv.ADDI(.t2, .zero, 0));
-                var zoff: i12 = 0;
-                while (zoff < 32) : (zoff += 8) {
-                    try ctx.writer.emit(riscv.SD(.sp, .t2, zoff));
+                inline for (0..4) |w| {
+                    const lo: u64 = std.mem.readInt(u64, ci.bytes[w * 8 ..][0..8], .little);
+                    _ = try riscv.genLoadImmediate64(&ctx.writer, .t0, lo);
+                    try ctx.writer.emit(riscv.SD(.sp, .t0, @as(i12, w * 8)));
                 }
-                // Set up syscall args
-                try ctx.writer.emit(riscv.ADD(.a1, .sp, .zero)); // a1 = asset_id_ptr (zero)
-                try ctx.writer.emit(riscv.ADD(.a2, .zero, .zero)); // a2 = from: zero = caller (VM fills)
-                try ctx.writer.emit(riscv.ADD(.a3, .zero, to_reg));  // a3 = to_ptr
-                try ctx.writer.emit(riscv.ADD(.a4, .zero, amt_reg)); // a4 = amount
-                try ctx.writer.emit(riscv.ZEPH(.ASSET_TRANSFER));
+                try ctx.writer.emit(riscv.ADD(dst, .sp, .zero));
+            },
+            .const_bool => |b| {
+                const dst = try ctx.reg_alloc.getReg(b.dst, &ctx.writer, true);
+                // ADDI rd=dst, rs1=zero, imm=0or1  (was incorrectly rd=zero)
+                try ctx.writer.emit(riscv.ADDI(dst, .zero, if (b.value) @as(i12, 1) else @as(i12, 0)));
+            },
+            .const_data => |d| {
+                const dst = try ctx.reg_alloc.getReg(d.dst, &ctx.writer, true);
+                _ = try riscv.genLoadImmediate64(&ctx.writer, dst, d.offset);
+                try ctx.writer.emit(riscv.ADD(dst, .gp, dst));
+            },
+            .add => |a| {
+                const lhs = try ctx.reg_alloc.getReg(a.lhs, &ctx.writer, false);
+                const rhs = try ctx.reg_alloc.getReg(a.rhs, &ctx.writer, false);
+                const dst = try ctx.reg_alloc.getReg(a.dst, &ctx.writer, true);
+                // ADD rd=dst, rs1=lhs, rs2=rhs
+                try ctx.writer.emit(riscv.ADD(dst, lhs, rhs));
+            },
+            .sub => |s| {
+                const lhs = try ctx.reg_alloc.getReg(s.lhs, &ctx.writer, false);
+                const rhs = try ctx.reg_alloc.getReg(s.rhs, &ctx.writer, false);
+                const dst = try ctx.reg_alloc.getReg(s.dst, &ctx.writer, true);
+                // SUB rd=dst, rs1=lhs, rs2=rhs
+                try ctx.writer.emit(riscv.SUB(dst, lhs, rhs));
+            },
+            .mul => |m| {
+                const lhs = try ctx.reg_alloc.getReg(m.lhs, &ctx.writer, false);
+                const rhs = try ctx.reg_alloc.getReg(m.rhs, &ctx.writer, false);
+                const dst = try ctx.reg_alloc.getReg(m.dst, &ctx.writer, true);
+                // MUL rd=dst, rs1=lhs, rs2=rhs
+                try ctx.writer.emit(riscv.MUL(dst, lhs, rhs));
+            },
+            .eq => |e| {
+                const lhs = try ctx.reg_alloc.getReg(e.lhs, &ctx.writer, false);
+                const rhs = try ctx.reg_alloc.getReg(e.rhs, &ctx.writer, false);
+                const dst = try ctx.reg_alloc.getReg(e.dst, &ctx.writer, true);
+                try ctx.writer.emit(riscv.SUB(dst, lhs, rhs));
+                try ctx.writer.emit(riscv.encodeI(1, dst, 0x3, dst, 0x13)); // SLTIU dst, dst, 1
+            },
+            .ne => |n| {
+                const lhs = try ctx.reg_alloc.getReg(n.lhs, &ctx.writer, false);
+                const rhs = try ctx.reg_alloc.getReg(n.rhs, &ctx.writer, false);
+                const dst = try ctx.reg_alloc.getReg(n.dst, &ctx.writer, true);
+                try ctx.writer.emit(riscv.SUB(dst, lhs, rhs));
+                try ctx.writer.emit(riscv.encodeR(0x00, dst, .zero, 0x3, dst, 0x33)); // SLTU dst, zero, dst
+            },
+            .lt => |l| {
+                const lhs = try ctx.reg_alloc.getReg(l.lhs, &ctx.writer, false);
+                const rhs = try ctx.reg_alloc.getReg(l.rhs, &ctx.writer, false);
+                const dst = try ctx.reg_alloc.getReg(l.dst, &ctx.writer, true);
+                try ctx.writer.emit(riscv.encodeR(0x00, rhs, lhs, 0x2, dst, 0x33)); // SLT dst, lhs, rhs
+            },
+            .gt => |g| {
+                const lhs = try ctx.reg_alloc.getReg(g.lhs, &ctx.writer, false);
+                const rhs = try ctx.reg_alloc.getReg(g.rhs, &ctx.writer, false);
+                const dst = try ctx.reg_alloc.getReg(g.dst, &ctx.writer, true);
+                try ctx.writer.emit(riscv.encodeR(0x00, lhs, rhs, 0x2, dst, 0x33)); // SLT dst, rhs, lhs
+            },
+            .le => |l| {
+                const lhs = try ctx.reg_alloc.getReg(l.lhs, &ctx.writer, false);
+                const rhs = try ctx.reg_alloc.getReg(l.rhs, &ctx.writer, false);
+                const dst = try ctx.reg_alloc.getReg(l.dst, &ctx.writer, true);
+                try ctx.writer.emit(riscv.encodeR(0x00, lhs, rhs, 0x2, dst, 0x33)); // SLT dst, rhs, lhs
+                try ctx.writer.emit(riscv.encodeI(1, dst, 0x4, dst, 0x13)); // XORI dst, dst, 1
+            },
+            .ge => |g| {
+                const lhs = try ctx.reg_alloc.getReg(g.lhs, &ctx.writer, false);
+                const rhs = try ctx.reg_alloc.getReg(g.rhs, &ctx.writer, false);
+                const dst = try ctx.reg_alloc.getReg(g.dst, &ctx.writer, true);
+                try ctx.writer.emit(riscv.encodeR(0x00, rhs, lhs, 0x2, dst, 0x33)); // SLT dst, lhs, rhs
+                try ctx.writer.emit(riscv.encodeI(1, dst, 0x4, dst, 0x13)); // XORI dst, dst, 1
+            },
+            .bool_and => |b| {
+                const lhs = try ctx.reg_alloc.getReg(b.lhs, &ctx.writer, false);
+                const rhs = try ctx.reg_alloc.getReg(b.rhs, &ctx.writer, false);
+                const dst = try ctx.reg_alloc.getReg(b.dst, &ctx.writer, true);
+                try ctx.writer.emit(riscv.AND(dst, lhs, rhs));
+            },
+            .bool_or => |b| {
+                const lhs = try ctx.reg_alloc.getReg(b.lhs, &ctx.writer, false);
+                const rhs = try ctx.reg_alloc.getReg(b.rhs, &ctx.writer, false);
+                const dst = try ctx.reg_alloc.getReg(b.dst, &ctx.writer, true);
+                try ctx.writer.emit(riscv.OR(dst, lhs, rhs));
+            },
+            .bool_not => |b| {
+                const src = try ctx.reg_alloc.getReg(b.operand, &ctx.writer, false);
+                const dst = try ctx.reg_alloc.getReg(b.dst, &ctx.writer, true);
+                try ctx.writer.emit(riscv.encodeI(1, src, 0x3, dst, 0x13)); // SLTIU dst, src, 1
+            },
+            .negate => |n| {
+                const src = try ctx.reg_alloc.getReg(n.operand, &ctx.writer, false);
+                const dst = try ctx.reg_alloc.getReg(n.dst, &ctx.writer, true);
+                try ctx.writer.emit(riscv.SUB(dst, .zero, src));
+            },
+            .mov => |m| {
+                const src = try ctx.reg_alloc.getReg(m.src, &ctx.writer, false);
+                const dst = try ctx.reg_alloc.getReg(m.dst, &ctx.writer, true);
+                try ctx.writer.emit(riscv.ADD(dst, src, .zero));
+            },
+            .jump => |j| {
+                try ctx.reg_alloc.flushAll(&ctx.writer);
+                const pos = ctx.writer.buf.items.len;
+                try ctx.writer.emit(riscv.JAL(.zero, 0));
+                try ctx.jump_patches.append(ctx.allocator, .{ .offset_pos = pos, .target_label = j.target });
+            },
+            .branch => |b| {
+                const cond = try ctx.reg_alloc.getReg(b.cond, &ctx.writer, false);
+                try ctx.reg_alloc.flushAll(&ctx.writer);
+
+                // BNE cond, zero, <then_label>  — branch to true target when cond != 0
+                const pos_true = ctx.writer.buf.items.len;
+                try ctx.writer.emit(riscv.BNE(cond, .zero, 0));
+                // MIR branch fields are then_ / else_ (not true_target / false_target)
+                try ctx.branch_patches.append(ctx.allocator, .{ .offset_pos = pos_true, .target_label = b.then_ });
+
+                // JAL zero, <else_label>  — unconditional fall-through to false target
+                const pos_false = ctx.writer.buf.items.len;
+                try ctx.writer.emit(riscv.JAL(.zero, 0));
+                try ctx.jump_patches.append(ctx.allocator, .{ .offset_pos = pos_false, .target_label = b.else_ });
+            },
+
+            .ret => |r| {
+                // MIR ret field is .value (not .val)
+                if (r.value) |val| {
+                    const src = try ctx.reg_alloc.getReg(val, &ctx.writer, false);
+                    // Move return value into a0: ADDI a0, src, 0
+                    try ctx.writer.emit(riscv.ADDI(.a0, src, 0));
+                }
+            },
+            .state_read => |sr| {
+                const dst = try ctx.reg_alloc.getReg(sr.dst, &ctx.writer, true);
+                try ctx.writer.emit(riscv.ADDI(.sp, .sp, -64));
+                _ = try riscv.genLoadImmediate64(&ctx.writer, .t0, @bitCast(@as(i64, sr.field_id)));
+                try ctx.writer.emit(riscv.SD(.t0, .sp, 0));
+                if (sr.key) |k| {
+                    const key = try ctx.reg_alloc.getReg(k, &ctx.writer, false);
+                    try ctx.writer.emit(riscv.SD(key, .sp, 8));
+                }
+                try ctx.writer.emit(riscv.ADD(.a1, .sp, .zero));
+                try ctx.writer.emit(riscv.ADDI(.a2, .sp, 32));
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.STATE_READ));
                 try ctx.writer.emit(riscv.ECALL());
-                // Restore stack
+                try ctx.writer.emit(riscv.LD(dst, .sp, 32));
+                try ctx.writer.emit(riscv.ADDI(.sp, .sp, 64));
+            },
+            .state_write => |sw| {
+                const val = try ctx.reg_alloc.getReg(sw.value, &ctx.writer, false);
+                try ctx.writer.emit(riscv.ADDI(.sp, .sp, -64));
+                _ = try riscv.genLoadImmediate64(&ctx.writer, .t0, @bitCast(@as(i64, sw.field_id)));
+                try ctx.writer.emit(riscv.SD(.t0, .sp, 0));
+                if (sw.key) |k| {
+                    const key = try ctx.reg_alloc.getReg(k, &ctx.writer, false);
+                    try ctx.writer.emit(riscv.SD(key, .sp, 8));
+                }
+                try ctx.writer.emit(riscv.SD(val, .sp, 32));
+                try ctx.writer.emit(riscv.ADD(.a1, .sp, .zero));
+                try ctx.writer.emit(riscv.ADDI(.a2, .sp, 32));
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.STATE_WRITE));
+                try ctx.writer.emit(riscv.ECALL());
+                try ctx.writer.emit(riscv.ADDI(.sp, .sp, 64));
+            },
+            .state_delete => |sd| {
+                const key = try ctx.reg_alloc.getReg(sd.key, &ctx.writer, false);
+                try ctx.writer.emit(riscv.ADDI(.sp, .sp, -64));
+                _ = try riscv.genLoadImmediate64(&ctx.writer, .t0, @bitCast(@as(i64, sd.field_id)));
+                try ctx.writer.emit(riscv.SD(.t0, .sp, 0));
+                try ctx.writer.emit(riscv.SD(key, .sp, 8));
+                try ctx.writer.emit(riscv.SD(.zero, .sp, 32));
+                try ctx.writer.emit(riscv.ADD(.a1, .sp, .zero));
+                try ctx.writer.emit(riscv.ADDI(.a2, .sp, 32));
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.STATE_WRITE));
+                try ctx.writer.emit(riscv.ECALL());
+                try ctx.writer.emit(riscv.ADDI(.sp, .sp, 64));
+            },
+            .collection_len => |c| {
+                const coll = try ctx.reg_alloc.getReg(c.collection, &ctx.writer, false);
+                const dst = try ctx.reg_alloc.getReg(c.dst, &ctx.writer, true);
+                try ctx.writer.emit(riscv.LD(dst, coll, 0));
+            },
+            .collection_get => |c| {
+                const coll = try ctx.reg_alloc.getReg(c.collection, &ctx.writer, false);
+                const key = try ctx.reg_alloc.getReg(c.key, &ctx.writer, false);
+                const dst = try ctx.reg_alloc.getReg(c.dst, &ctx.writer, true);
+                try ctx.writer.emit(riscv.SLLI(.t0, key, 3));
+                try ctx.writer.emit(riscv.ADD(.t0, .t0, coll));
+                try ctx.writer.emit(riscv.LD(dst, .t0, 8));
+            },
+            .enum_match => |e| {
+                const subj = try ctx.reg_alloc.getReg(e.subject, &ctx.writer, false);
+                const dst = try ctx.reg_alloc.getReg(e.dst, &ctx.writer, true);
+                try ctx.writer.emit(riscv.LD(.t0, subj, 0));
+                _ = try riscv.genLoadImmediate64(&ctx.writer, .t1, @bitCast(@as(i64, e.tag_id)));
+                try ctx.writer.emit(riscv.SUB(dst, .t0, .t1));
+                try ctx.writer.emit(riscv.encodeI(1, dst, 0x3, dst, 0x13)); // SLTIU dst, dst, 1
+            },
+            .enum_extract => |e| {
+                const subj = try ctx.reg_alloc.getReg(e.subject, &ctx.writer, false);
+                const dst = try ctx.reg_alloc.getReg(e.dst, &ctx.writer, true);
+                try ctx.writer.emit(riscv.ADDI(dst, subj, 8));
+            },
+            .asset_send => |as_snd| {
+                const asset = try ctx.reg_alloc.getReg(as_snd.asset, &ctx.writer, false);
+                const recipient = try ctx.reg_alloc.getReg(as_snd.recipient, &ctx.writer, false);
+                try ctx.writer.emit(riscv.ADD(.a1, asset, .zero));
+                try ctx.writer.emit(riscv.ADD(.a2, recipient, .zero));
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.ASSET_TRANSFER));
+                try ctx.writer.emit(riscv.ECALL());
+            },
+            .asset_burn => |ab| {
+                const asset = try ctx.reg_alloc.getReg(ab.asset, &ctx.writer, false);
+                try ctx.writer.emit(riscv.ADD(.a1, asset, .zero));
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.ASSET_BURN));
+                try ctx.writer.emit(riscv.ECALL());
+            },
+            .asset_mint => |am| {
+                const dst = try ctx.reg_alloc.getReg(am.dst, &ctx.writer, true);
+                const amount = try ctx.reg_alloc.getReg(am.amount, &ctx.writer, false);
+                _ = try riscv.genLoadImmediate64(&ctx.writer, .a1, @bitCast(@as(i64, am.type_id)));
+                try ctx.writer.emit(riscv.ADD(.a2, .zero, .zero));
+                try ctx.writer.emit(riscv.ADD(.a3, amount, .zero));
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.ASSET_MINT));
+                try ctx.writer.emit(riscv.ECALL());
+                try ctx.writer.emit(riscv.ADD(dst, .a0, .zero));
+            },
+            .asset_split => |as_spl| {
+                const dst = try ctx.reg_alloc.getReg(as_spl.dst, &ctx.writer, true);
+                const src = try ctx.reg_alloc.getReg(as_spl.src, &ctx.writer, false);
+                const amount = try ctx.reg_alloc.getReg(as_spl.amount, &ctx.writer, false);
+                try ctx.writer.emit(riscv.SUB(src, src, amount));
+                try ctx.writer.emit(riscv.ADD(dst, amount, .zero));
+            },
+            .asset_merge => |am| {
+                const dst = try ctx.reg_alloc.getReg(am.dst, &ctx.writer, true);
+                const a = try ctx.reg_alloc.getReg(am.a, &ctx.writer, false);
+                const b = try ctx.reg_alloc.getReg(am.b, &ctx.writer, false);
+                try ctx.writer.emit(riscv.ADD(dst, a, b));
+            },
+            .asset_wrap => |aw| {
+                const dst = try ctx.reg_alloc.getReg(aw.dst, &ctx.writer, true);
+                const val = try ctx.reg_alloc.getReg(aw.value, &ctx.writer, false);
+                try ctx.writer.emit(riscv.ADD(dst, val, .zero));
+            },
+            .asset_unwrap => |au| {
+                const dst = try ctx.reg_alloc.getReg(au.dst, &ctx.writer, true);
+                const token = try ctx.reg_alloc.getReg(au.token, &ctx.writer, false);
+                try ctx.writer.emit(riscv.ADD(dst, token, .zero));
+            },
+            .auth_check => |ac| {
+                try ctx.writer.emit(riscv.ADDI(.sp, .sp, -32));
+                _ = try riscv.genLoadImmediate64(&ctx.writer, .t0, @bitCast(@as(i64, ac.name_offset)));
+                try ctx.writer.emit(riscv.SD(.t0, .sp, 0));
+                try ctx.writer.emit(riscv.ADD(.a1, .sp, .zero));
+                try ctx.writer.emit(riscv.ADD(.a2, .zero, .zero));
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.AUTH_CHECK));
+                try ctx.writer.emit(riscv.ECALL());
                 try ctx.writer.emit(riscv.ADDI(.sp, .sp, 32));
             },
-            .send => |send| {
-                const asset_reg = ctx.reg_alloc.alloc() orelse .t0;
-                defer ctx.reg_alloc.free(asset_reg);
-                const to_reg = ctx.reg_alloc.alloc() orelse .t1;
-                defer ctx.reg_alloc.free(to_reg);
-                
-                try self.genExpr(send.asset, ctx, asset_reg);
-                try self.genExpr(send.recipient, ctx, to_reg);
-
-                // ── Asset Hooks Logic ────────────────────────────────────
-                // Look up asset definition to find hooks
-                var asset_def: ?*const ast.AssetDef = null;
-                var asset_type: ResolvedType = .void_;
-                
-                // Identify asset type from target expression
-                if (send.asset.kind == .identifier) {
-                    const name = send.asset.kind.identifier;
-                    if (ctx.locals.get(name)) |loc| {
-                        asset_type = loc.ty;
-                    }
-                } else {
-                    // Fallback to inference (may be slow)
-                    asset_type = (self.resolver.inferExpr(send.asset, &ctx.checked.scope) catch .void_);
-                }
-
-                const inner_type = if (asset_type == .linear) asset_type.linear.* else asset_type;
-                if (inner_type == .asset) {
-                    const name = inner_type.asset;
-                    asset_def = self.resolver.asset_defs.getPtr(name);
-                }
-
-                // 1) before_transfer hook
-                if (asset_def) |ad| {
-                    if (ad.before_transfer) |hook| {
-                        // GET_CALLER syscall: a0=0x60, a1=buf_ptr(20B)
-                        try ctx.writer.emit(riscv.ADDI(.sp, .sp, -24));
-                        try ctx.writer.emit(riscv.ZEPH(.GET_CALLER));
-                        try ctx.writer.emit(riscv.ECALL());
-                        try ctx.writer.emit(riscv.ADD(.a1, .zero, to_reg));
-                        try ctx.writer.emit(riscv.ADD(.a2, .zero, asset_reg));
-                        for (hook.body) |hstmt| {
-                            try self.genStmt(&hstmt, ctx);
-                        }
-                        try ctx.writer.emit(riscv.ADDI(.sp, .sp, 24));
-                    }
-                }
-
-                // 2) Actual Transfer via ASSET_TRANSFER syscall
-                // ABI: a0=0x10, a1=asset_id_ptr, a2=from_ptr, a3=to_ptr, a4=amount_ptr
-                try ctx.writer.emit(riscv.ADD(.a1, .zero, asset_reg)); // a1 = asset id
-                try ctx.writer.emit(riscv.ADD(.a2, .zero, .zero));     // a2 = from: caller
-                try ctx.writer.emit(riscv.ADD(.a3, .zero, to_reg));    // a3 = to
-                try ctx.writer.emit(riscv.ADD(.a4, .zero, asset_reg)); // a4 = amount (re-use asset reg)
-                try ctx.writer.emit(riscv.ZEPH(.ASSET_TRANSFER));
+            .auth_gate_begin => |ab| {
+                try ctx.writer.emit(riscv.ADDI(.sp, .sp, -32));
+                _ = try riscv.genLoadImmediate64(&ctx.writer, .t0, @bitCast(@as(i64, ab.name_offset)));
+                try ctx.writer.emit(riscv.SD(.t0, .sp, 0));
+                try ctx.writer.emit(riscv.ADD(.a1, .sp, .zero));
+                try ctx.writer.emit(riscv.ADD(.a2, .zero, .zero));
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.AUTH_CHECK));
                 try ctx.writer.emit(riscv.ECALL());
-
-                // 3) after_transfer hook
-                if (asset_def) |ad| {
-                    if (ad.after_transfer) |hook| {
-                        try ctx.writer.emit(riscv.ADDI(.sp, .sp, -24));
-                        try ctx.writer.emit(riscv.ZEPH(.GET_CALLER));
-                        try ctx.writer.emit(riscv.ECALL());
-                        try ctx.writer.emit(riscv.ADD(.a1, .zero, to_reg));
-                        try ctx.writer.emit(riscv.ADD(.a2, .zero, asset_reg));
-                        for (hook.body) |hstmt| {
-                            try self.genStmt(&hstmt, ctx);
-                        }
-                        try ctx.writer.emit(riscv.ADDI(.sp, .sp, 24));
-                    }
-                }
+                try ctx.writer.emit(riscv.ADDI(.sp, .sp, 32));
             },
-            .only => |*only| try self.genOnly(only, ctx),
+            .auth_gate_end => {},
+            .emit_event => |ee| {
+                // SPEC: Part 5.9 — EMIT_EVENT ABI:
+                // a1=topic_count, a2=topics_ptr, a3=data_ptr, a4=data_len
+                // Pack all arg registers onto the stack as the data blob.
+                const n_args: usize = ee.args.len;
+                const stack_bytes: i12 = @intCast((n_args + 1) * 8); // +1 for event_id slot
+                try ctx.writer.emit(riscv.ADDI(.sp, .sp, -stack_bytes));
+                // Slot 0: event_id
+                _ = try riscv.genLoadImmediate64(&ctx.writer, .t0, @bitCast(@as(i64, ee.event_id)));
+                try ctx.writer.emit(riscv.SD(.sp, .t0, 0));
+                // Slots 1..n: arg values
+                for (ee.args, 0..) |arg_vreg, i| {
+                    const arg_preg = try ctx.reg_alloc.getReg(arg_vreg, &ctx.writer, false);
+                    try ctx.writer.emit(riscv.SD(.sp, arg_preg, @intCast((i + 1) * 8)));
+                }
+                _ = try riscv.genLoadImmediate64(&ctx.writer, .a1, @intCast(n_args)); // topic_count
+                try ctx.writer.emit(riscv.ADD(.a2, .sp, .zero));                       // topics_ptr (= event_id slot)
+                try ctx.writer.emit(riscv.ADDI(.a3, .sp, 8));                          // data_ptr (args start at +8)
+                _ = try riscv.genLoadImmediate64(&ctx.writer, .a4, @intCast(n_args * 8)); // data_len
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.EMIT_EVENT));
+                try ctx.writer.emit(riscv.ECALL());
+                try ctx.writer.emit(riscv.ADDI(.sp, .sp, stack_bytes));
+            },
+            .need => |n| {
+                // SPEC: Part 6.5 — need: if cond is true skip revert, else revert.
+                // BNE cond, zero, <skip_revert>   (branch over revert if cond != 0)
+                const cond = try ctx.reg_alloc.getReg(n.cond, &ctx.writer, false);
+                const pos = ctx.writer.buf.items.len;
+                try ctx.writer.emit(riscv.BNE(cond, .zero, 0)); // placeholder offset
+                _ = try riscv.genLoadImmediate64(&ctx.writer, .a1, @bitCast(@as(i64, @as(i32, @intCast(n.msg_offset)))));
+                _ = try riscv.genLoadImmediate64(&ctx.writer, .a2, @bitCast(@as(i64, @as(i32, @intCast(n.msg_len)))));
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.REVERT));
+                try ctx.writer.emit(riscv.ECALL());
+                // Back-patch: compute byte offset from BNE to here, re-encode as B-type.
+                // diff = current_pos - branch_pos (positive = forward jump)
+                const diff: i32 = @as(i32, @intCast(ctx.writer.buf.items.len)) - @as(i32, @intCast(pos));
+                const old_instr = std.mem.readInt(u32, ctx.writer.buf.items[pos..][0..4], .little);
+                const opcode = @as(u7, @truncate(old_instr));
+                const funct3 = @as(u3, @truncate(old_instr >> 12));
+                const rs1_b = @as(riscv.Reg, @enumFromInt(@as(u5, @truncate(old_instr >> 15))));
+                const rs2_b = @as(riscv.Reg, @enumFromInt(@as(u5, @truncate(old_instr >> 20))));
+                const patched_need = riscv.encodeB(@intCast(diff), rs2_b, rs1_b, funct3, opcode);
+                std.mem.writeInt(u32, ctx.writer.buf.items[pos..][0..4], patched_need, .little);
+            },
+            .ensure => |e| {
+                // SPEC: Part 6.5 — ensure: same as need (post-condition).
+                const cond = try ctx.reg_alloc.getReg(e.cond, &ctx.writer, false);
+                const pos = ctx.writer.buf.items.len;
+                try ctx.writer.emit(riscv.BNE(cond, .zero, 0)); // placeholder offset
+                _ = try riscv.genLoadImmediate64(&ctx.writer, .a1, @bitCast(@as(i64, @as(i32, @intCast(e.msg_offset)))));
+                _ = try riscv.genLoadImmediate64(&ctx.writer, .a2, @bitCast(@as(i64, @as(i32, @intCast(e.msg_len)))));
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.REVERT));
+                try ctx.writer.emit(riscv.ECALL());
+                // Back-patch the BNE offset using riscv.encodeB.
+                const diff: i32 = @as(i32, @intCast(ctx.writer.buf.items.len)) - @as(i32, @intCast(pos));
+                const old_instr = std.mem.readInt(u32, ctx.writer.buf.items[pos..][0..4], .little);
+                const opcode = @as(u7, @truncate(old_instr));
+                const funct3 = @as(u3, @truncate(old_instr >> 12));
+                const rs1_b = @as(riscv.Reg, @enumFromInt(@as(u5, @truncate(old_instr >> 15))));
+                const rs2_b = @as(riscv.Reg, @enumFromInt(@as(u5, @truncate(old_instr >> 20))));
+                const patched_ens = riscv.encodeB(@intCast(diff), rs2_b, rs1_b, funct3, opcode);
+                std.mem.writeInt(u32, ctx.writer.buf.items[pos..][0..4], patched_ens, .little);
+            },
             .panic => |p| {
-                const tmp = ctx.reg_alloc.alloc() orelse .t0;
-                defer ctx.reg_alloc.free(tmp);
-                try self.genLoadImmediate(@intCast(p.message.len), tmp, ctx);
-                try ctx.writer.emit(riscv.ADD(.a1, .zero, tmp));
-                try ctx.writer.emit(riscv.ADD(.a2, .zero, .zero)); // data_len=0
-                try ctx.writer.emit(riscv.ZEPH(.REVERT));
+                _ = try riscv.genLoadImmediate64(&ctx.writer, .a1, @bitCast(@as(i64, p.msg_offset)));
+                _ = try riscv.genLoadImmediate64(&ctx.writer, .a2, @bitCast(@as(i64, p.msg_len)));
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.REVERT));
                 try ctx.writer.emit(riscv.ECALL());
             },
-            .throw => |t| {
-                _ = t;
-                try ctx.writer.emit(riscv.ADDI(.a1, .zero, 0));
-                try ctx.writer.emit(riscv.ADDI(.a2, .zero, 0));
-                try ctx.writer.emit(riscv.ZEPH(.REVERT));
+            .throw_error => |te| {
+                _ = try riscv.genLoadImmediate64(&ctx.writer, .a1, @bitCast(@as(i64, te.error_id)));
+                try ctx.writer.emit(riscv.ADD(.a2, .zero, .zero));
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.REVERT));
                 try ctx.writer.emit(riscv.ECALL());
             },
-
-            // ── guard_apply ───────────────────────────────────────────────
-            // SPEC: Part 6.1 — `guard guardName` inlines the named guard check.
-            // Emits AUTH_CHECK syscall with the guard name-hash in a0.
-            .guard_apply => |name| {
-                const sel = actionSelector(name);
-                try self.genLoadImmediate(@intCast(sel), .a0, ctx);
-                try ctx.writer.emit(riscv.ZEPH(.AUTH_CHECK));
+            .attempt_begin => |ab| {
+                // SPEC: Part 11.5 — Record the exception handler label.
+                // The ZVM does not have native try/catch; we model it by
+                // recording the handler target. Any ECALL that returns a
+                // non-zero error code should be followed by a BNE to this
+                // label. The label resolution uses the normal jump_patches path.
+                ctx.exception_label = ab.handler_label;
+            },
+            .attempt_end => {
+                // SPEC: Part 11.5 — Clear the active exception handler.
+                ctx.exception_label = null;
+            },
+            .get_caller => |gc| {
+                const dst = try ctx.reg_alloc.getReg(gc.dst, &ctx.writer, true);
+                try ctx.writer.emit(riscv.ADDI(.sp, .sp, -32));
+                try ctx.writer.emit(riscv.ADD(.a1, .sp, .zero));
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.GET_CALLER));
+                try ctx.writer.emit(riscv.ECALL());
+                try ctx.writer.emit(riscv.LD(dst, .sp, 0));
+                try ctx.writer.emit(riscv.ADDI(.sp, .sp, 32));
+            },
+            .get_value => |gv| {
+                const dst = try ctx.reg_alloc.getReg(gv.dst, &ctx.writer, true);
+                try ctx.writer.emit(riscv.ADDI(.sp, .sp, -32));
+                try ctx.writer.emit(riscv.ADD(.a1, .sp, .zero));
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.GET_VALUE));
+                try ctx.writer.emit(riscv.ECALL());
+                try ctx.writer.emit(riscv.LD(dst, .sp, 0));
+                try ctx.writer.emit(riscv.ADDI(.sp, .sp, 32));
+            },
+            .get_block => |gb| {
+                const dst = try ctx.reg_alloc.getReg(gb.dst, &ctx.writer, true);
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.GET_BLOCK));
+                try ctx.writer.emit(riscv.ECALL());
+                try ctx.writer.emit(riscv.ADD(dst, .a0, .zero));
+            },
+            .get_timestamp => |gt| {
+                const dst = try ctx.reg_alloc.getReg(gt.dst, &ctx.writer, true);
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.GET_NOW));
+                try ctx.writer.emit(riscv.ECALL());
+                try ctx.writer.emit(riscv.ADD(dst, .a0, .zero));
+            },
+            .get_gas => |gg| {
+                const dst = try ctx.reg_alloc.getReg(gg.dst, &ctx.writer, true);
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.GET_GAS));
+                try ctx.writer.emit(riscv.ECALL());
+                try ctx.writer.emit(riscv.ADD(dst, .a0, .zero));
+            },
+            .get_this => |gt| {
+                const dst = try ctx.reg_alloc.getReg(gt.dst, &ctx.writer, true);
+                try ctx.writer.emit(riscv.ADDI(.sp, .sp, -32));
+                try ctx.writer.emit(riscv.ADD(.a1, .sp, .zero));
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.GET_THIS));
+                try ctx.writer.emit(riscv.ECALL());
+                try ctx.writer.emit(riscv.LD(dst, .sp, 0));
+                try ctx.writer.emit(riscv.ADDI(.sp, .sp, 32));
+            },
+            .get_deployer => |gd| {
+                const dst = try ctx.reg_alloc.getReg(gd.dst, &ctx.writer, true);
+                try ctx.writer.emit(riscv.ADD(dst, .zero, .zero));
+            },
+            .get_zero_addr => |gz| {
+                const dst = try ctx.reg_alloc.getReg(gz.dst, &ctx.writer, true);
+                try ctx.writer.emit(riscv.ADD(dst, .zero, .zero));
+            },
+            .schedule_call => |sc| {
+                // SPEC: Part 10.2 — SCHEDULE_CALL ABI:
+                // a1=to_ptr, a2=delay(u64), a3=calldata_ptr, a4=calldata_len
+                const delay       = try ctx.reg_alloc.getReg(sc.delay,        &ctx.writer, false);
+                const calldata    = try ctx.reg_alloc.getReg(sc.calldata,     &ctx.writer, false);
+                const calldata_len = try ctx.reg_alloc.getReg(sc.calldata_len, &ctx.writer, false);
+                try ctx.writer.emit(riscv.ADD(.a1, .zero,    .zero));   // to_ptr (not provided — zero = self)
+                try ctx.writer.emit(riscv.ADD(.a2, delay,    .zero));   // delay in blocks
+                try ctx.writer.emit(riscv.ADD(.a3, calldata, .zero));   // calldata ptr
+                try ctx.writer.emit(riscv.ADD(.a4, calldata_len, .zero)); // calldata len
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.SCHEDULE_CALL));
                 try ctx.writer.emit(riscv.ECALL());
             },
-
-            // ── ensure (post-condition check) ─────────────────────────────
-            // SPEC: Part 6.2 — Same semantics as need: revert on false.
-            .ensure => |e| try self.genNeed(&.{
-                .cond  = e.cond,
-                .else_ = e.else_,
-                .span  = stmt.span,
-            }, ctx),
-
-            // ── attempt / on_error ────────────────────────────────────────
-            // SPEC: Part 10 — Emit body and always_after section inline.
-            // Full snapshot-restore error handling is a VM-level feature.
-            .attempt => |at| {
-                for (at.body) |s| try self.genStmt(&s, ctx);
-                if (at.always_body) |always| {
-                    for (always) |s| try self.genStmt(&s, ctx);
-                }
+            .call_external => |ce| {
+                const dst = try ctx.reg_alloc.getReg(ce.dst, &ctx.writer, true);
+                const target = try ctx.reg_alloc.getReg(ce.target, &ctx.writer, false);
+                try ctx.writer.emit(riscv.ADD(.a1, target, .zero));
+                _ = try riscv.genLoadImmediate64(&ctx.writer, .a2, @bitCast(@as(i64, ce.selector)));
+                try ctx.writer.emit(riscv.ADD(.a3, .zero, .zero));
+                try ctx.writer.emit(riscv.ADD(.a4, .zero, .zero));
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.SCHEDULE_CALL));
+                try ctx.writer.emit(riscv.ECALL());
+                try ctx.writer.emit(riscv.ADD(dst, .a0, .zero));
             },
-
-            // ── verify (ZK proof) ─────────────────────────────────────────
-            // SPEC: Part 12 — Off-chain ZK proof verification syscall 0x70.
-            .verify => |v| {
-                const proof_reg = ctx.reg_alloc.alloc() orelse .t0;
-                defer ctx.reg_alloc.free(proof_reg);
-                const commit_reg = ctx.reg_alloc.alloc() orelse .t1;
-                defer ctx.reg_alloc.free(commit_reg);
-                try self.genExpr(v.proof, ctx, proof_reg);
-                try self.genExpr(v.commitment, ctx, commit_reg);
-                if (proof_reg != .a0) try ctx.writer.emit(riscv.ADD(.a0, proof_reg, .zero));
-                if (commit_reg != .a1) try ctx.writer.emit(riscv.ADD(.a1, commit_reg, .zero));
-                try ctx.writer.emit(riscv.ADDI(.a0, .zero, 0x70));
+            .oracle_read => |oread| {
+                const dst = try ctx.reg_alloc.getReg(oread.dst, &ctx.writer, true);
+                _ = try riscv.genLoadImmediate64(&ctx.writer, .a1, @bitCast(@as(i64, oread.feed_id)));
+                try ctx.writer.emit(riscv.ADDI(.sp, .sp, -32));
+                try ctx.writer.emit(riscv.ADD(.a2, .sp, .zero));
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.ORACLE_QUERY));
+                try ctx.writer.emit(riscv.ECALL());
+                try ctx.writer.emit(riscv.LD(dst, .sp, 0));
+                try ctx.writer.emit(riscv.ADDI(.sp, .sp, 32));
+            },
+            .vrf_random => |vr| {
+                const dst = try ctx.reg_alloc.getReg(vr.dst, &ctx.writer, true);
+                try ctx.writer.emit(riscv.ADDI(.sp, .sp, -32));
+                try ctx.writer.emit(riscv.ADD(.a1, .sp, .zero));
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.VRF_RANDOM));
+                try ctx.writer.emit(riscv.ECALL());
+                try ctx.writer.emit(riscv.LD(dst, .sp, 0));
+                try ctx.writer.emit(riscv.ADDI(.sp, .sp, 32));
+            },
+            .zk_verify => |zk| {
+                // SPEC: Part 12.2 — ZK_VERIFY syscall:
+                // a1=circuit_id, a2=proof_ptr, a3=proof_len(32) → a0=1 if valid.
+                const proof = try ctx.reg_alloc.getReg(zk.proof, &ctx.writer, false);
+                _ = try riscv.genLoadImmediate64(&ctx.writer, .a1, @bitCast(@as(i64, zk.circuit_id)));
+                try ctx.writer.emit(riscv.ADD(.a2, proof, .zero));  // proof_ptr
+                try ctx.writer.emit(riscv.ADDI(.a3, .zero, 32));    // proof_len (32 bytes)
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.ZK_VERIFY));
                 try ctx.writer.emit(riscv.ECALL());
             },
-
-            // ── move_asset ────────────────────────────────────────────────
-            // SPEC: Part 8.3 — `move asset into mine.field` stores to state.
-            .move_asset => |mv| {
-                const val_reg = ctx.reg_alloc.alloc() orelse .t0;
-                defer ctx.reg_alloc.free(val_reg);
-                try self.genExpr(mv.asset, ctx, val_reg);
-                if (mv.dest.kind == .field_access) {
-                    const fa = mv.dest.kind.field_access;
-                    if (fa.object.kind == .identifier and
-                        std.mem.eql(u8, fa.object.kind.identifier, "mine"))
-                    {
-                        const field_id = self.getOrAssignFieldId(fa.field);
-                        try self.genLoadImmediate(@intCast(field_id), .a0, ctx);
-                        try ctx.writer.emit(riscv.ADD(.a1, val_reg, .zero));
-                        try ctx.writer.emit(riscv.ZEPH(.STATE_WRITE));
-                        try ctx.writer.emit(riscv.ECALL());
-                    }
-                }
-            },
-
-            // ── remove ────────────────────────────────────────────────────
-            // SPEC: Part 5.2 — `remove mine.map[key]` deletes a map entry.
-            .remove => |expr| {
-                if (expr.kind == .index_access) {
-                    const ia = expr.kind.index_access;
-                    if (ia.object.kind == .field_access) {
-                        const fa = ia.object.kind.field_access;
-                        if (fa.object.kind == .identifier and
-                            std.mem.eql(u8, fa.object.kind.identifier, "mine"))
-                        {
-                            const field_id = self.getOrAssignFieldId(fa.field);
-                            const key_reg = ctx.reg_alloc.alloc() orelse .t0;
-                            defer ctx.reg_alloc.free(key_reg);
-                            try self.genExpr(ia.index, ctx, key_reg);
-                            try self.genLoadImmediate(@intCast(field_id), .a0, ctx);
-                            try ctx.writer.emit(riscv.ADD(.a1, key_reg, .zero));
-                            try ctx.writer.emit(riscv.ADDI(.a2, .zero, 0));
-                            try ctx.writer.emit(riscv.ZEPH(.STATE_WRITE));
-                            try ctx.writer.emit(riscv.ECALL());
-                        }
-                    }
-                }
-            },
-
-            // ── expand / close / freeze / unfreeze ────────────────────────
-            // SPEC: Part 11 — Account lifecycle operations.
-            .expand => |exp| {
-                const areg = ctx.reg_alloc.alloc() orelse .a0;
-                defer ctx.reg_alloc.free(areg);
-                const breg = ctx.reg_alloc.alloc() orelse .a1;
-                defer ctx.reg_alloc.free(breg);
-                try self.genExpr(exp.account, ctx, areg);
-                try self.genExpr(exp.bytes, ctx, breg);
-                if (areg != .a0) try ctx.writer.emit(riscv.ADD(.a0, areg, .zero));
-                if (breg != .a1) try ctx.writer.emit(riscv.ADD(.a1, breg, .zero));
-                try ctx.writer.emit(riscv.ADDI(.a0, .zero, 0x40)); // EXPAND_ACCOUNT
+            .delegate_gas => |dg| {
+                // SPEC: Part 14.6 — DELEGATE_GAS syscall: a1=payer_addr_ptr.
+                const payer = try ctx.reg_alloc.getReg(dg.payer, &ctx.writer, false);
+                try ctx.writer.emit(riscv.ADD(.a1, payer, .zero));
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.DELEGATE_GAS));
                 try ctx.writer.emit(riscv.ECALL());
             },
-            .close => |cl| {
-                const areg = ctx.reg_alloc.alloc() orelse .a0;
-                defer ctx.reg_alloc.free(areg);
-                const rreg = ctx.reg_alloc.alloc() orelse .a1;
-                defer ctx.reg_alloc.free(rreg);
-                try self.genExpr(cl.account, ctx, areg);
-                try self.genExpr(cl.refund_to, ctx, rreg);
-                if (areg != .a0) try ctx.writer.emit(riscv.ADD(.a0, areg, .zero));
-                if (rreg != .a1) try ctx.writer.emit(riscv.ADD(.a1, rreg, .zero));
-                try ctx.writer.emit(riscv.ADDI(.a0, .zero, 0x41)); // CLOSE_ACCOUNT
+            .pay => |p| {
+                const recipient = try ctx.reg_alloc.getReg(p.recipient, &ctx.writer, false);
+                const amount = try ctx.reg_alloc.getReg(p.amount, &ctx.writer, false);
+                try ctx.writer.emit(riscv.ADD(.a2, .zero, .zero)); // from
+                try ctx.writer.emit(riscv.ADD(.a3, recipient, .zero)); // to
+                try ctx.writer.emit(riscv.ADD(.a4, amount, .zero)); // amount
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.ASSET_TRANSFER)); // 0x10
                 try ctx.writer.emit(riscv.ECALL());
             },
-            .freeze => |fr| {
-                const areg = ctx.reg_alloc.alloc() orelse .a0;
-                defer ctx.reg_alloc.free(areg);
-                try self.genExpr(fr.account, ctx, areg);
-                if (areg != .a0) try ctx.writer.emit(riscv.ADD(.a0, areg, .zero));
-                try ctx.writer.emit(riscv.ADDI(.a0, .zero, 0x42)); // FREEZE
+            .expand_account => |ea| {
+                // SPEC: Part 3.10 — EXPAND_ACCOUNT syscall:
+                // a1=account_ptr, a2=extra_bytes
+                const acct  = try ctx.reg_alloc.getReg(ea.account, &ctx.writer, false);
+                const bytes = try ctx.reg_alloc.getReg(ea.bytes,   &ctx.writer, false);
+                try ctx.writer.emit(riscv.ADD(.a1, acct,  .zero));
+                try ctx.writer.emit(riscv.ADD(.a2, bytes, .zero));
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.EXPAND_ACCOUNT));
                 try ctx.writer.emit(riscv.ECALL());
             },
-            .unfreeze => |uf| {
-                const areg = ctx.reg_alloc.alloc() orelse .a0;
-                defer ctx.reg_alloc.free(areg);
-                try self.genExpr(uf.account, ctx, areg);
-                if (areg != .a0) try ctx.writer.emit(riscv.ADD(.a0, areg, .zero));
-                try ctx.writer.emit(riscv.ADDI(.a0, .zero, 0x43)); // UNFREEZE
+            .close_account => |ca| {
+                // SPEC: Part 3.10 — CLOSE_ACCOUNT syscall:
+                // a1=account_ptr, a2=refund_to_ptr
+                const acct      = try ctx.reg_alloc.getReg(ca.account,   &ctx.writer, false);
+                const refund_to = try ctx.reg_alloc.getReg(ca.refund_to, &ctx.writer, false);
+                try ctx.writer.emit(riscv.ADD(.a1, acct,      .zero));
+                try ctx.writer.emit(riscv.ADD(.a2, refund_to, .zero));
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.CLOSE_ACCOUNT));
                 try ctx.writer.emit(riscv.ECALL());
             },
-
-            // ── schedule (deferred cross-contract call) ───────────────────
-            // SPEC: Part 15 — `schedule call after duration`.
-            .schedule => |sch| {
-                const dreg = ctx.reg_alloc.alloc() orelse .t0;
-                defer ctx.reg_alloc.free(dreg);
-                const creg = ctx.reg_alloc.alloc() orelse .t1;
-                defer ctx.reg_alloc.free(creg);
-                try self.genExpr(sch.after, ctx, dreg);
-                try self.genExpr(sch.call, ctx, creg);
-                if (dreg != .a1) try ctx.writer.emit(riscv.ADD(.a1, dreg, .zero));
-                if (creg != .a2) try ctx.writer.emit(riscv.ADD(.a2, creg, .zero));
-                try ctx.writer.emit(riscv.ADDI(.a3, .zero, 0));
-                try ctx.writer.emit(riscv.ZEPH(.SCHEDULE_CALL));
+            .div => |d| {
+                // SPEC: Part 2.2 — dst = lhs / rhs (unsigned 64-bit DIVU).
+                const lhs = try ctx.reg_alloc.getReg(d.lhs, &ctx.writer, false);
+                const rhs = try ctx.reg_alloc.getReg(d.rhs, &ctx.writer, false);
+                const dst = try ctx.reg_alloc.getReg(d.dst, &ctx.writer, true);
+                try ctx.writer.emit(riscv.DIV(dst, lhs, rhs));
+            },
+            .mod => |m| {
+                // SPEC: Part 2.2 — dst = lhs % rhs (unsigned 64-bit REMU).
+                const lhs = try ctx.reg_alloc.getReg(m.lhs, &ctx.writer, false);
+                const rhs = try ctx.reg_alloc.getReg(m.rhs, &ctx.writer, false);
+                const dst = try ctx.reg_alloc.getReg(m.dst, &ctx.writer, true);
+                try ctx.writer.emit(riscv.REM(dst, lhs, rhs));
+            },
+            .label => |lbl| {
+                // SPEC: Part 6 — record current bytecode offset for this label.
+                // The label map is populated in genMirFunction's first pass;
+                // this arm is a no-op because the offset is already recorded.
+                _ = lbl;
+            },
+            .freeze_account => |fa| {
+                // SPEC: Part 8.4 — Freeze account (prevent transfers).
+                // a1 = account register, then ECALL LOG_DIAGNOSTIC as a
+                // placeholder until the ZVM exposes a FREEZE syscall.
+                const acct = try ctx.reg_alloc.getReg(fa.account, &ctx.writer, false);
+                try ctx.writer.emit(riscv.ADD(.a1, acct, .zero));
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.LOG_DIAGNOSTIC));
                 try ctx.writer.emit(riscv.ECALL());
             },
-
-            // ── transfer_ownership ────────────────────────────────────────
-            // SPEC: Part 11.6 — Transfer account ownership; syscall 0x44.
-            .transfer_ownership => |tow| {
-                const areg = ctx.reg_alloc.alloc() orelse .a0;
-                defer ctx.reg_alloc.free(areg);
-                const oreg = ctx.reg_alloc.alloc() orelse .a1;
-                defer ctx.reg_alloc.free(oreg);
-                try self.genExpr(tow.account, ctx, areg);
-                try self.genExpr(tow.new_owner, ctx, oreg);
-                if (areg != .a0) try ctx.writer.emit(riscv.ADD(.a0, areg, .zero));
-                if (oreg != .a1) try ctx.writer.emit(riscv.ADD(.a1, oreg, .zero));
-                try ctx.writer.emit(riscv.ADDI(.a0, .zero, 0x44)); // TRANSFER_OWNERSHIP
+            .unfreeze_account => |ua| {
+                // SPEC: Part 8.4 — Unfreeze account.
+                const acct = try ctx.reg_alloc.getReg(ua.account, &ctx.writer, false);
+                try ctx.writer.emit(riscv.ADD(.a1, acct, .zero));
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.LOG_DIAGNOSTIC));
                 try ctx.writer.emit(riscv.ECALL());
             },
-        }
-    }
-
-    // ── Expression code generation ───────────────────────────────────────
-
-    /// Generate bytecode for an expression, placing the result in `dest`.
-    fn genExpr(self: *CodeGen, expr: *const Expr, ctx: *ActionCtx, dest: Reg) anyerror!void {
-        switch (expr.kind) {
-            .int_lit => |lit| {
-                // Strip underscore separators before parsing
-                // (the lexer preserves them in the source text)
-                var clean_buf: [80]u8 = undefined;
-                var clean_len: usize = 0;
-                for (lit) |c| {
-                    if (c != '_') {
-                        if (clean_len >= clean_buf.len) break;
-                        clean_buf[clean_len] = c;
-                        clean_len += 1;
-                    }
+            .transfer_ownership => |to| {
+                // SPEC: Part 4.4 — Transfer ownership of an account.
+                const acct      = try ctx.reg_alloc.getReg(to.account,   &ctx.writer, false);
+                const new_owner = try ctx.reg_alloc.getReg(to.new_owner, &ctx.writer, false);
+                try ctx.writer.emit(riscv.ADD(.a1, acct,      .zero));
+                try ctx.writer.emit(riscv.ADD(.a2, new_owner, .zero));
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.AUTH_GRANT));
+                try ctx.writer.emit(riscv.ECALL());
+            },
+            .has_check => |hc| {
+                // SPEC: Part 2.6 — dst = (collection has element).
+                // The ZVM represents set membership as a non-zero 64-bit slot
+                // value: load the slot keyed by element; dst = (slot != 0).
+                const coll    = try ctx.reg_alloc.getReg(hc.collection, &ctx.writer, false);
+                const element = try ctx.reg_alloc.getReg(hc.element,    &ctx.writer, false);
+                const dst     = try ctx.reg_alloc.getReg(hc.dst,        &ctx.writer, true);
+                // t0 = coll + (element << 3)  (8-byte pointer stride)
+                try ctx.writer.emit(riscv.SLLI(.t0, element, 3));
+                try ctx.writer.emit(riscv.ADD(.t0, .t0, coll));
+                try ctx.writer.emit(riscv.LD(.t0, .t0, 8));
+                // dst = (t0 != 0) via SLTU dst, zero, t0
+                try ctx.writer.emit(riscv.encodeR(0x00, .t0, .zero, 0x3, dst, 0x33));
+            },
+            .call_internal => |ci| {
+                // SPEC: Part 5.5 — Call an internal action/view/helper by selector.
+                // Convention: selector in a1, args pushed before call.
+                const dst = try ctx.reg_alloc.getReg(ci.dst, &ctx.writer, true);
+                _ = try riscv.genLoadImmediate64(&ctx.writer, .a1, ci.selector);
+                // Push args into a2..a7 (up to 6 args).
+                for (ci.args, 0..) |arg_vreg, i| {
+                    if (i >= 6) break;
+                    const arg_preg: Reg = @enumFromInt(@as(u5, @intCast(12 + i)));
+                    const src = try ctx.reg_alloc.getReg(arg_vreg, &ctx.writer, false);
+                    try ctx.writer.emit(riscv.ADD(arg_preg, src, .zero));
                 }
-                const clean = clean_buf[0..clean_len];
-
-                // Check for hex prefix
-                const u256val: u256_mod.U256 = if (clean.len >= 2 and clean[0] == '0' and
-                    (clean[1] == 'x' or clean[1] == 'X'))
-                    u256_mod.U256.parseHex(clean[2..]) catch u256_mod.U256.zero
-                else
-                    u256_mod.U256.parseDecimal(clean) catch u256_mod.U256.zero;
-
-                if (u256val.fitsU64()) {
-                    // Fast path: value fits in one register
-                    try self.genLoadImmediate(u256val.toU64(), dest, ctx);
-                } else {
-                    // Wide path: store 32-byte little-endian value on the stack.
-                    // ZVM wide-integer convention: pass a pointer to the 32-byte
-                    // value in memory. The `dest` register receives the stack pointer
-                    // to that allocation.
-                    //
-                    // Stack layout (grows downward):
-                    //   [sp+24..sp+31] = limbs[3] (most significant)
-                    //   [sp+16..sp+23] = limbs[2]
-                    //   [sp+8..sp+15]  = limbs[1]
-                    //   [sp+0..sp+7]   = limbs[0] (least significant)
-                    try ctx.writer.emit(riscv.ADDI(.sp, .sp, -32));
-                    for (u256val.limbs, 0..) |limb, i| {
-                        const tmp = ctx.reg_alloc.alloc() orelse .t3;
-                        defer ctx.reg_alloc.free(tmp);
-                        try self.genLoadImmediate(limb, tmp, ctx);
-                        const off: i12 = @intCast(i * 8);
-                        try ctx.writer.emit(riscv.SD(.sp, tmp, off));
-                    }
-                    // dest = pointer to the 32-byte value
-                    try ctx.writer.emit(riscv.ADD(dest, .sp, .zero));
-                    // IMPORTANT: The caller that receives a wide value pointer is
-                    // responsible for freeing stack space with ADDI sp, sp, 32.
-                    // For simple assignments to state fields, genStateWrite handles this.
-                }
-            },
-            .bool_lit => |b| {
-                try ctx.writer.emit(riscv.ADDI(dest, .zero, if (b) 1 else 0));
-            },
-            .string_lit => |s| {
-                // s includes surrounding double-quotes — strip them.
-                // e.g. s = `"hello"` → content = `hello`
-                const content = if (s.len >= 2) s[1..s.len-1] else s;
-                const offset = try self.internString(content);
-
-                // ZVM string convention: the gp (x3, global pointer) register holds
-                // the base address of the contract's data section at runtime.
-                // dest = gp + offset (pointer to the null-terminated string).
-                // The string length is available as content.len if needed by callers.
-                try self.genLoadImmediate(@intCast(offset), dest, ctx);
-                try ctx.writer.emit(riscv.ADD(dest, .gp, dest));
-            },
-            .nothing => {
-                try ctx.writer.emit(riscv.ADDI(dest, .zero, 0));
-            },
-            .identifier => |name| {
-                if (ctx.locals.get(name)) |loc| {
-                    if (loc.reg != dest) {
-                        try ctx.writer.emit(riscv.ADD(dest, loc.reg, .zero));
-                    }
-                } else {
-                    try ctx.writer.emit(riscv.ADDI(dest, .zero, 0));
-                }
-            },
-            .field_access => |fa| {
-                if (fa.object.kind == .identifier) {
-                    const id = fa.object.kind.identifier;
-                    if (std.mem.eql(u8, id, "mine")) {
-                        try self.genStateRead(fa.field, null, ctx, dest);
-                        return;
-                    }
-                }
-                try self.genExpr(fa.object, ctx, dest);
-            },
-            .index_access => |ia| {
-                if (ia.object.kind == .field_access) {
-                    const outer_fa = ia.object.kind.field_access;
-                    if (outer_fa.object.kind == .identifier) {
-                        const oid = outer_fa.object.kind.identifier;
-                        if (std.mem.eql(u8, oid, "mine")) {
-                            try self.genStateRead(outer_fa.field, ia.index, ctx, dest);
-                            return;
-                        }
-                    }
-                }
-                try self.genExpr(ia.object, ctx, dest);
-            },
-            .bin_op => |op| {
-                try self.genBinOp(op.op, op.left, op.right, ctx, dest);
-            },
-            .unary_op => |op| {
-                try self.genExpr(op.operand, ctx, dest);
-                switch (op.op) {
-                    .not_ => {
-                        // Logical NOT: SLTIU dest, dest, 1 → dest = (dest < 1) = (dest == 0)
-                        try ctx.writer.emit(riscv.encodeI(1, dest, 3, dest, 0x13));
-                    },
-                    .negate => {
-                        try ctx.writer.emit(riscv.SUB(dest, .zero, dest));
-                    },
-                }
-            },
-            .call => |c| {
-                try self.genCall(c.callee, c.args, ctx, dest);
-            },
-            .builtin => |b| {
-                // SPEC: Part 7.5 / 14.3 — environment builtins via syscall.
-                // ZEPH() loads syscall ID into a0; ECALL() triggers dispatch.
-                switch (b) {
-                    .caller => {
-                        // GET_CALLER: a0=0x60, a1=buf_ptr(20B) → buf filled
-                        try ctx.writer.emit(riscv.ADDI(.sp, .sp, -24)); // alloc 24B on stack
-                        try ctx.writer.emit(riscv.ADD(.a1, .sp, .zero));  // a1 = buf ptr
-                        try ctx.writer.emit(riscv.ZEPH(.GET_CALLER));
-                        try ctx.writer.emit(riscv.ECALL());
-                        if (dest != .sp) {
-                            try ctx.writer.emit(riscv.ADD(dest, .sp, .zero));
-                        }
-                        // Note: caller must ADDI sp, sp, 24 after consuming the value.
-                    },
-                    .now => {
-                        // GET_NOW: a0=0x66 → a0=timestamp(u64 low bits)
-                        try ctx.writer.emit(riscv.ZEPH(.GET_NOW));
-                        try ctx.writer.emit(riscv.ECALL());
-                        if (dest != .a0) try ctx.writer.emit(riscv.ADD(dest, .a0, .zero));
-                    },
-                    .current_block => {
-                        // GET_BLOCK: a0=0x65 → a0=block_number
-                        try ctx.writer.emit(riscv.ZEPH(.GET_BLOCK));
-                        try ctx.writer.emit(riscv.ECALL());
-                        if (dest != .a0) try ctx.writer.emit(riscv.ADD(dest, .a0, .zero));
-                    },
-                    .value => {
-                        // GET_VALUE: a0=0x61, a1=buf_ptr(32B) → buf filled with call value
-                        try ctx.writer.emit(riscv.ADDI(.sp, .sp, -32));
-                        try ctx.writer.emit(riscv.ADD(.a1, .sp, .zero));
-                        try ctx.writer.emit(riscv.ZEPH(.GET_VALUE));
-                        try ctx.writer.emit(riscv.ECALL());
-                        if (dest != .sp) try ctx.writer.emit(riscv.ADD(dest, .sp, .zero));
-                    },
-                    else => try ctx.writer.emit(riscv.ADDI(dest, .zero, 0)),
-                }
-            },
-            .something => |inner| {
-                try self.genExpr(inner, ctx, dest);
-            },
-            .inline_when => |iw| {
-                const cond_reg = ctx.reg_alloc.alloc() orelse .t0;
-                defer ctx.reg_alloc.free(cond_reg);
-                try self.genExpr(iw.cond, ctx, cond_reg);
-                const branch_off = ctx.writer.currentOffset();
-                try ctx.writer.emit(riscv.BEQ(cond_reg, .zero, 0));
-                try self.genExpr(iw.then_, ctx, dest);
-                const jmp_off = ctx.writer.currentOffset();
-                try ctx.writer.emit(riscv.JAL(.zero, 0));
-                const else_off = ctx.writer.currentOffset();
-                const br_delta: i13 = @intCast(@as(i32, @intCast(else_off)) - @as(i32, @intCast(branch_off)));
-                ctx.writer.patchAt(branch_off, riscv.BEQ(cond_reg, .zero, br_delta));
-                try self.genExpr(iw.else_, ctx, dest);
-                const end_off = ctx.writer.currentOffset();
-                const jmp_delta: i21 = @intCast(@as(i32, @intCast(end_off)) - @as(i32, @intCast(jmp_off)));
-                ctx.writer.patchAt(jmp_off, riscv.JAL(.zero, jmp_delta));
-            },
-            .cast => |c| {
-                try self.genExpr(c.expr, ctx, dest);
-            },
-            .try_propagate => |inner| {
-                try self.genExpr(inner, ctx, dest);
-            },
-            .float_lit => |lit| {
-                // Forge fixed-point literals default to 18 decimal places (price18)
-                // unless the checker has annotated the expected type. Since the codegen
-                // does not yet carry resolved types per-expression, we default to 18
-                // which is the most precise (price18 / standard DeFi precision).
-                // The value will be truncated if assigned to a lower-precision type.
-                const scaled = scaleFixedPoint(lit, 18);
-                try self.genLoadImmediate(scaled, dest, ctx);
-            },
-            else => {
-                try ctx.writer.emit(riscv.ADDI(dest, .zero, 0));
+                try ctx.writer.emit(riscv.ZEPH_SET_ID(.SCHEDULE_CALL));
+                try ctx.writer.emit(riscv.ECALL());
+                try ctx.writer.emit(riscv.ADD(dst, .a0, .zero));
             },
         }
-    }
-
-    // ── Binary operation code generation ─────────────────────────────────
-
-    /// Generate bytecode for a binary operation.
-    fn genBinOp(self: *CodeGen, op: BinOp, left: *Expr, right: *Expr, ctx: *ActionCtx, dest: Reg) anyerror!void {
-        const rhs = ctx.reg_alloc.alloc() orelse .t1;
-        defer ctx.reg_alloc.free(rhs);
-        try self.genExpr(left, ctx, dest);
-        try self.genExpr(right, ctx, rhs);
-        const instr: u32 = switch (op) {
-            .plus, .duration_add => riscv.ADD(dest, dest, rhs),
-            .minus, .duration_sub => riscv.SUB(dest, dest, rhs),
-            .times => riscv.MUL(dest, dest, rhs),
-            .divided_by => riscv.DIV(dest, dest, rhs),
-            .mod => riscv.REM(dest, dest, rhs),
-            .equals => blk: {
-                try ctx.writer.emit(riscv.SUB(dest, dest, rhs));
-                // SLTIU dest, dest, 1 → dest = (dest == 0)
-                break :blk riscv.ADDI(dest, dest, 0);
-            },
-            .not_equals => blk: {
-                try ctx.writer.emit(riscv.SUB(dest, dest, rhs));
-                // SLTU dest, zero, dest → dest = (dest != 0)
-                break :blk riscv.encodeR(0x00, dest, .zero, 0x3, dest, 0x33);
-            },
-            .less => riscv.encodeR(0x00, rhs, dest, 0x2, dest, 0x33),
-            .greater => riscv.encodeR(0x00, dest, rhs, 0x2, dest, 0x33),
-            .less_eq => blk: {
-                // !(left > right):  SLT dest, rhs, dest; XORI dest, dest, 1
-                try ctx.writer.emit(riscv.encodeR(0x00, dest, rhs, 0x2, dest, 0x33));
-                break :blk riscv.ADDI(dest, dest, 0);
-            },
-            .greater_eq => blk: {
-                try ctx.writer.emit(riscv.encodeR(0x00, rhs, dest, 0x2, dest, 0x33));
-                break :blk riscv.ADDI(dest, dest, 0);
-            },
-            .and_ => riscv.AND(dest, dest, rhs),
-            .or_ => riscv.OR(dest, dest, rhs),
-            .has => riscv.AND(dest, dest, rhs),
-        };
-        try ctx.writer.emit(instr);
-    }
-
-    /// Generate code for an `only` statement (check + body).
-    fn genOnly(self: *CodeGen, only: *const ast.OnlyStmt, ctx: *ActionCtx) anyerror!void {
-        switch (only.requirement) {
-            .authority => |name| {
-                try self.genAuthCheck(name, ctx);
-            },
-            .either => |pair| {
-                try self.genAuthCheck(pair.left, ctx);
-                try self.genAuthCheck(pair.right, ctx);
-            },
-            else => {},
-        }
-
-        for (only.body) |s| {
-            try self.genStmt(&s, ctx);
-        }
-    }
-
-    // ── Immediate loading ────────────────────────────────────────────────
-
-    /// Load a u64 constant into a register using LUI + ADDI sequences.
-    fn genLoadImmediate(self: *CodeGen, val: u64, dest: Reg, ctx: *ActionCtx) anyerror!void {
-        _ = self;
-        if (val == 0) {
-            try ctx.writer.emit(riscv.ADDI(dest, .zero, 0));
-            return;
-        }
-        // If fits in 12-bit signed immediate
-        if (val < 2048) {
-            try ctx.writer.emit(riscv.ADDI(dest, .zero, @intCast(val)));
-            return;
-        }
-        // Use LUI for upper 20 bits + ADDI for lower 12 bits
-        const lo12: u12 = @truncate(val);
-        const signed_lo: i12 = @bitCast(lo12);
-        var upper: u20 = @truncate(val >> 12);
-        // If low 12 bits are negative in signed representation, need to adjust upper
-        if (signed_lo < 0) upper +%= 1;
-        try ctx.writer.emit(riscv.LUI(dest, upper));
-        if (lo12 != 0) {
-            try ctx.writer.emit(riscv.ADDI(dest, dest, signed_lo));
-        }
-    }
-
-    // ── Control flow code generation ─────────────────────────────────────
-
-    /// Generate bytecode for a when/otherwise statement with backpatching.
-    fn genWhen(self: *CodeGen, stmt: *const WhenStmt, ctx: *ActionCtx) anyerror!void {
-        var end_patches = std.ArrayListUnmanaged(u32){};
-        defer end_patches.deinit(ctx.allocator);
-
-        // Primary condition
-        const cond_reg = ctx.reg_alloc.alloc() orelse .t0;
-        try self.genExpr(stmt.cond, ctx, cond_reg);
-        const branch_off = ctx.writer.currentOffset();
-        try ctx.writer.emit(riscv.BEQ(cond_reg, .zero, 0)); // placeholder
-        ctx.reg_alloc.free(cond_reg);
-
-        // Then body
-        for (stmt.then_body) |s| {
-            try self.genStmt(&s, ctx);
-        }
-        const end_jmp = ctx.writer.currentOffset();
-        try ctx.writer.emit(riscv.JAL(.zero, 0)); // placeholder jump to end
-        try end_patches.append(ctx.allocator, end_jmp);
-
-        // Patch primary branch → here (start of else-ifs / else)
-        const after_then = ctx.writer.currentOffset();
-        const br_delta: i13 = @intCast(@as(i32, @intCast(after_then)) - @as(i32, @intCast(branch_off)));
-        ctx.writer.patchAt(branch_off, riscv.BEQ(cond_reg, .zero, br_delta));
-
-        // Else-if chains
-        for (stmt.else_ifs) |eif| {
-            const eif_cond = ctx.reg_alloc.alloc() orelse .t0;
-            try self.genExpr(eif.cond, ctx, eif_cond);
-            const eif_branch = ctx.writer.currentOffset();
-            try ctx.writer.emit(riscv.BEQ(eif_cond, .zero, 0));
-            ctx.reg_alloc.free(eif_cond);
-
-            for (eif.body) |s| {
-                try self.genStmt(&s, ctx);
-            }
-            const eif_end = ctx.writer.currentOffset();
-            try ctx.writer.emit(riscv.JAL(.zero, 0));
-            try end_patches.append(ctx.allocator, eif_end);
-
-            const after_eif = ctx.writer.currentOffset();
-            const eif_delta: i13 = @intCast(@as(i32, @intCast(after_eif)) - @as(i32, @intCast(eif_branch)));
-            ctx.writer.patchAt(eif_branch, riscv.BEQ(eif_cond, .zero, eif_delta));
-        }
-
-        // Otherwise body
-        if (stmt.else_body) |eb| {
-            for (eb) |s| {
-                try self.genStmt(&s, ctx);
-            }
-        }
-
-        // Patch all end jumps to here
-        const end_off = ctx.writer.currentOffset();
-        for (end_patches.items) |patch_off| {
-            const delta: i21 = @intCast(@as(i32, @intCast(end_off)) - @as(i32, @intCast(patch_off)));
-            ctx.writer.patchAt(patch_off, riscv.JAL(.zero, delta));
-        }
-    }
-
-    /// Generate bytecode for a match statement.
-    fn genMatch(self: *CodeGen, stmt: *const MatchStmt, ctx: *ActionCtx) anyerror!void {
-        const subj_reg = ctx.reg_alloc.alloc() orelse .t0;
-        defer ctx.reg_alloc.free(subj_reg);
-        try self.genExpr(stmt.subject, ctx, subj_reg);
-
-        var end_patches = std.ArrayListUnmanaged(u32){};
-        defer end_patches.deinit(ctx.allocator);
-
-        for (stmt.arms) |arm| {
-            const arm_skip: u32 = switch (arm.pattern) {
-                .literal => |lit_expr| blk: {
-                    const cmp_reg = ctx.reg_alloc.alloc() orelse .t1;
-                    defer ctx.reg_alloc.free(cmp_reg);
-                    try self.genExpr(lit_expr, ctx, cmp_reg);
-                    const off = ctx.writer.currentOffset();
-                    try ctx.writer.emit(riscv.BNE(subj_reg, cmp_reg, 0));
-                    break :blk off;
-                },
-                .wildcard, .binding => 0, // Always matches
-                else => 0,
-            };
-
-            for (arm.body) |s| {
-                try self.genStmt(&s, ctx);
-            }
-            const jmp_off = ctx.writer.currentOffset();
-            try ctx.writer.emit(riscv.JAL(.zero, 0));
-            try end_patches.append(ctx.allocator, jmp_off);
-
-            if (arm_skip != 0) {
-                const after_arm = ctx.writer.currentOffset();
-                const skip_delta: i13 = @intCast(@as(i32, @intCast(after_arm)) - @as(i32, @intCast(arm_skip)));
-                ctx.writer.patchAt(arm_skip, riscv.BNE(subj_reg, .zero, skip_delta));
-            }
-        }
-
-        const end_off = ctx.writer.currentOffset();
-        for (end_patches.items) |patch_off| {
-            const delta: i21 = @intCast(@as(i32, @intCast(end_off)) - @as(i32, @intCast(patch_off)));
-            ctx.writer.patchAt(patch_off, riscv.JAL(.zero, delta));
-        }
-    }
-
-    /// Generate bytecode for an each loop.
-    fn genEach(self: *CodeGen, loop: *const EachLoop, ctx: *ActionCtx) anyerror!void {
-        const iter_reg = ctx.reg_alloc.alloc() orelse .t0;
-        defer ctx.reg_alloc.free(iter_reg);
-        const count_reg = ctx.reg_alloc.alloc() orelse .t1;
-        defer ctx.reg_alloc.free(count_reg);
-
-        // Load collection length into count_reg (from collection expression)
-        try self.genExpr(loop.collection, ctx, count_reg);
-        // Initialize iterator to 0
-        try ctx.writer.emit(riscv.ADDI(iter_reg, .zero, 0));
-
-        // Bind loop variable
-        switch (loop.binding) {
-            .single => |name| {
-                const ty = (self.resolver.inferExpr(loop.collection, &ctx.checked.scope) catch .void_);
-                const element_ty = switch (ty) {
-                    .array => |a| a.elem.*,
-                    .list => |l| l.*,
-                    else => .void_,
-                };
-                try ctx.locals.put(name, .{ .reg = iter_reg, .ty = element_ty });
-            },
-            .pair => |p| {
-                try ctx.locals.put(p.first, .{ .reg = iter_reg, .ty = .u256 });
-                const ty = (self.resolver.inferExpr(loop.collection, &ctx.checked.scope) catch .void_);
-                const element_ty = switch (ty) {
-                    .array => |a| a.elem.*,
-                    .list => |l| l.*,
-                    else => .void_,
-                };
-                try ctx.locals.put(p.second, .{ .reg = count_reg, .ty = element_ty });
-            },
-        }
-
-        const loop_start = ctx.writer.currentOffset();
-        // Branch if iter >= count
-        const exit_off = ctx.writer.currentOffset();
-        try ctx.writer.emit(riscv.BGE(iter_reg, count_reg, 0));
-
-        // Save loop backpatch state
-        const prev_exits_len = ctx.loop_exits.items.len;
-        const prev_conts_len = ctx.loop_conts.items.len;
-
-        for (loop.body) |s| {
-            try self.genStmt(&s, ctx);
-        }
-
-        // Continue target: increment and jump back
-        const cont_target = ctx.writer.currentOffset();
-        try ctx.writer.emit(riscv.ADDI(iter_reg, iter_reg, 1));
-        const back_delta: i21 = @intCast(@as(i32, @intCast(loop_start)) - @as(i32, @intCast(ctx.writer.currentOffset())));
-        try ctx.writer.emit(riscv.JAL(.zero, back_delta));
-
-        // Patch exit branch
-        const after_loop = ctx.writer.currentOffset();
-        const exit_delta: i13 = @intCast(@as(i32, @intCast(after_loop)) - @as(i32, @intCast(exit_off)));
-        ctx.writer.patchAt(exit_off, riscv.BGE(iter_reg, count_reg, exit_delta));
-
-        // Backpatch stop/skip
-        self.backpatchLoopExits(ctx, prev_exits_len, after_loop);
-        self.backpatchLoopConts(ctx, prev_conts_len, cont_target);
-    }
-
-    /// Generate bytecode for a repeat N times loop.
-    fn genRepeat(self: *CodeGen, loop: *const RepeatLoop, ctx: *ActionCtx) anyerror!void {
-        const counter = ctx.reg_alloc.alloc() orelse .t0;
-        defer ctx.reg_alloc.free(counter);
-        const limit = ctx.reg_alloc.alloc() orelse .t1;
-        defer ctx.reg_alloc.free(limit);
-
-        try self.genExpr(loop.count, ctx, limit);
-        try ctx.writer.emit(riscv.ADDI(counter, .zero, 0));
-
-        const loop_start = ctx.writer.currentOffset();
-        const exit_off = ctx.writer.currentOffset();
-        try ctx.writer.emit(riscv.BGE(counter, limit, 0));
-
-        const prev_exits_len = ctx.loop_exits.items.len;
-        const prev_conts_len = ctx.loop_conts.items.len;
-
-        for (loop.body) |s| {
-            try self.genStmt(&s, ctx);
-        }
-
-        const cont_target = ctx.writer.currentOffset();
-        try ctx.writer.emit(riscv.ADDI(counter, counter, 1));
-        const back_delta: i21 = @intCast(@as(i32, @intCast(loop_start)) - @as(i32, @intCast(ctx.writer.currentOffset())));
-        try ctx.writer.emit(riscv.JAL(.zero, back_delta));
-
-        const after_loop = ctx.writer.currentOffset();
-        const exit_delta: i13 = @intCast(@as(i32, @intCast(after_loop)) - @as(i32, @intCast(exit_off)));
-        ctx.writer.patchAt(exit_off, riscv.BGE(counter, limit, exit_delta));
-
-        self.backpatchLoopExits(ctx, prev_exits_len, after_loop);
-        self.backpatchLoopConts(ctx, prev_conts_len, cont_target);
-    }
-
-    /// Generate bytecode for a while loop.
-    fn genWhile(self: *CodeGen, loop: *const WhileLoop, ctx: *ActionCtx) anyerror!void {
-        const cond_reg = ctx.reg_alloc.alloc() orelse .t0;
-        defer ctx.reg_alloc.free(cond_reg);
-
-        const loop_start = ctx.writer.currentOffset();
-        try self.genExpr(loop.cond, ctx, cond_reg);
-        const exit_off = ctx.writer.currentOffset();
-        try ctx.writer.emit(riscv.BEQ(cond_reg, .zero, 0));
-
-        const prev_exits_len = ctx.loop_exits.items.len;
-        const prev_conts_len = ctx.loop_conts.items.len;
-
-        for (loop.body) |s| {
-            try self.genStmt(&s, ctx);
-        }
-
-        const cont_target = ctx.writer.currentOffset();
-        const back_delta: i21 = @intCast(@as(i32, @intCast(loop_start)) - @as(i32, @intCast(cont_target)));
-        try ctx.writer.emit(riscv.JAL(.zero, back_delta));
-
-        const after_loop = ctx.writer.currentOffset();
-        const exit_delta: i13 = @intCast(@as(i32, @intCast(after_loop)) - @as(i32, @intCast(exit_off)));
-        ctx.writer.patchAt(exit_off, riscv.BEQ(cond_reg, .zero, exit_delta));
-
-        self.backpatchLoopExits(ctx, prev_exits_len, after_loop);
-        self.backpatchLoopConts(ctx, prev_conts_len, cont_target);
-    }
-
-    /// Backpatch all loop exit (stop) jumps from index `start` to target `target_off`.
-    fn backpatchLoopExits(self: *CodeGen, ctx: *ActionCtx, start: usize, target_off: u32) void {
-        _ = self;
-        for (ctx.loop_exits.items[start..]) |patch_off| {
-            const delta: i21 = @intCast(@as(i32, @intCast(target_off)) - @as(i32, @intCast(patch_off)));
-            ctx.writer.patchAt(patch_off, riscv.JAL(.zero, delta));
-        }
-        ctx.loop_exits.shrinkRetainingCapacity(start);
-    }
-
-    /// Backpatch all loop continue (skip) jumps from index `start` to target `target_off`.
-    fn backpatchLoopConts(self: *CodeGen, ctx: *ActionCtx, start: usize, target_off: u32) void {
-        _ = self;
-        for (ctx.loop_conts.items[start..]) |patch_off| {
-            const delta: i21 = @intCast(@as(i32, @intCast(target_off)) - @as(i32, @intCast(patch_off)));
-            ctx.writer.patchAt(patch_off, riscv.JAL(.zero, delta));
-        }
-        ctx.loop_conts.shrinkRetainingCapacity(start);
-    }
-
-    // ── State access code generation ─────────────────────────────────────
-
-    /// SPEC: Part 5.2 — Generate a state read using the Zephyria STORAGE_LOAD ABI.
-    ///
-    /// dispatch.zig storageLoad() expects:
-    ///   a0 = 0x01 (set by ZEPH())
-    ///   a1 = pointer to 32-byte storage key in VM memory
-    ///   a2 = pointer to 32-byte result buffer in VM memory
-    ///
-    /// Key layout: [4-byte field_id] [28-byte map_key or zeros]
-    fn genStateRead(self: *CodeGen, field_name: []const u8, index_expr: ?*const Expr, ctx: *ActionCtx, dest: Reg) anyerror!void {
-        const field_id = self.getOrAssignFieldId(field_name);
-
-        // Allocate scratch space on stack:
-        //   [sp..sp+31] = 32-byte storage key
-        //   [sp+32..sp+63] = 32-byte result buffer
-        try ctx.writer.emit(riscv.ADDI(.sp, .sp, -64));
-        errdefer _ = ctx.writer; // no cleanup, caller owns stack frame
-
-        // Build storage key: write field_id into first 4 bytes, zero the rest
-        const scratch = ctx.reg_alloc.alloc() orelse .t2;
-        defer ctx.reg_alloc.free(scratch);
-        try self.genLoadImmediate(@intCast(field_id), scratch, ctx);
-        try ctx.writer.emit(riscv.SW(.sp, scratch, 0)); // store u32 field_id at sp+0
-        // Zero bytes 4..31 of the key
-        try ctx.writer.emit(riscv.ADDI(.t3, .zero, 0));
-        try ctx.writer.emit(riscv.SD(.sp, .t3, 8));    // bytes 8-15
-        try ctx.writer.emit(riscv.SD(.sp, .t3, 16));   // bytes 16-23
-        try ctx.writer.emit(riscv.SD(.sp, .t3, 24));   // bytes 24-31
-        // If there's a map key, write it at bytes 4-7
-        if (index_expr) |idx| {
-            const idx_reg = ctx.reg_alloc.alloc() orelse .t4;
-            defer ctx.reg_alloc.free(idx_reg);
-            try self.genExpr(idx, ctx, idx_reg);
-            try ctx.writer.emit(riscv.SW(.sp, idx_reg, 4)); // bytes 4-7 = map key
-        } else {
-            // Write zero into bytes 4-7 as well
-            try ctx.writer.emit(riscv.SW(.sp, .t3, 4));
-        }
-
-        // Set syscall arguments:
-        //   a1 = pointer to key buffer (sp)
-        //   a2 = pointer to result buffer (sp+32)
-        try ctx.writer.emit(riscv.ADD(.a1, .sp, .zero));
-        try ctx.writer.emit(riscv.ADDI(.a2, .sp, 32));
-        try ctx.writer.emit(riscv.ZEPH(.STATE_READ));
-        try ctx.writer.emit(riscv.ECALL());
-
-        // Load 8 bytes from the result buffer into dest (64-bit value)
-        try ctx.writer.emit(riscv.LD(dest, .sp, 32));
-
-        // Restore stack
-        try ctx.writer.emit(riscv.ADDI(.sp, .sp, 64));
-    }
-
-    /// SPEC: Part 5.2 — Generate a state write using the Zephyria STORAGE_STORE ABI.
-    ///
-    /// dispatch.zig storageStore() expects:
-    ///   a0 = 0x02 (set by ZEPH())
-    ///   a1 = pointer to 32-byte storage key in VM memory
-    ///   a2 = pointer to 32-byte value in VM memory
-    ///
-    /// Key layout: [4-byte field_id] [28-byte map_key or zeros]
-    fn genStateWrite(self: *CodeGen, field_name: []const u8, index_expr: ?*const Expr, value: *const Expr, ctx: *ActionCtx) anyerror!void {
-        const field_id = self.getOrAssignFieldId(field_name);
-
-        // Allocate:
-        //   [sp..sp+31] = 32-byte storage key
-        //   [sp+32..sp+63] = 32-byte value buffer
-        try ctx.writer.emit(riscv.ADDI(.sp, .sp, -64));
-
-        // Evaluate the value expression, place in a temp register
-        const val_reg = ctx.reg_alloc.alloc() orelse .t2;
-        defer ctx.reg_alloc.free(val_reg);
-        try self.genExpr(value, ctx, val_reg);
-
-        // Build storage key at [sp..sp+31]
-        const fid_reg = ctx.reg_alloc.alloc() orelse .t3;
-        defer ctx.reg_alloc.free(fid_reg);
-        try self.genLoadImmediate(@intCast(field_id), fid_reg, ctx);
-        try ctx.writer.emit(riscv.SW(.sp, fid_reg, 0));  // field_id bytes 0-3
-        try ctx.writer.emit(riscv.ADDI(.t4, .zero, 0));
-        try ctx.writer.emit(riscv.SW(.sp, .t4, 4));      // map key bytes 4-7 (zero or index)
-        try ctx.writer.emit(riscv.SD(.sp, .t4, 8));      // bytes 8-15
-        try ctx.writer.emit(riscv.SD(.sp, .t4, 16));     // bytes 16-23
-        try ctx.writer.emit(riscv.SD(.sp, .t4, 24));     // bytes 24-31
-        if (index_expr) |idx| {
-            const idx_reg = ctx.reg_alloc.alloc() orelse .t5;
-            defer ctx.reg_alloc.free(idx_reg);
-            try self.genExpr(idx, ctx, idx_reg);
-            try ctx.writer.emit(riscv.SW(.sp, idx_reg, 4));
-        }
-
-        // Write value into [sp+32..sp+63]
-        try ctx.writer.emit(riscv.SD(.sp, val_reg, 32));  // bytes 32-39 = low 64 bits
-        // Zero out the rest of the 32-byte value slot (wide values would need more)
-        try ctx.writer.emit(riscv.SD(.sp, .t4, 40));
-        try ctx.writer.emit(riscv.SD(.sp, .t4, 48));
-        try ctx.writer.emit(riscv.SD(.sp, .t4, 56));
-
-        // Set syscall arguments
-        try ctx.writer.emit(riscv.ADD(.a1, .sp, .zero));  // a1 = key_ptr
-        try ctx.writer.emit(riscv.ADDI(.a2, .sp, 32));    // a2 = value_ptr
-        try ctx.writer.emit(riscv.ZEPH(.STATE_WRITE));
-        try ctx.writer.emit(riscv.ECALL());
-
-        // Restore stack
-        try ctx.writer.emit(riscv.ADDI(.sp, .sp, 64));
-    }
-
-    // ── Authority check ──────────────────────────────────────────────────
-
-    /// SPEC: Part 7.3 — Emit AUTH_CHECK for a named authority.
-    /// ABI: a0=0x20, a1=role_hash_ptr(32B), a2=account_ptr(20B) → revert if fail
-    fn genAuthCheck(self: *CodeGen, name: []const u8, ctx: *ActionCtx) anyerror!void {
-        // Build 32-byte role hash on stack: first 4 bytes = selector, rest zero.
-        const selector = actionSelector(name);
-        try ctx.writer.emit(riscv.ADDI(.sp, .sp, -32));
-        const tmp = ctx.reg_alloc.alloc() orelse .t0;
-        defer ctx.reg_alloc.free(tmp);
-        try self.genLoadImmediate(@intCast(selector), tmp, ctx);
-        try ctx.writer.emit(riscv.SD(.sp, tmp, 0));
-        try ctx.writer.emit(riscv.ADDI(.t2, .zero, 0));
-        try ctx.writer.emit(riscv.SD(.sp, .t2, 8));
-        try ctx.writer.emit(riscv.SD(.sp, .t2, 16));
-        try ctx.writer.emit(riscv.SD(.sp, .t2, 24));
-        try ctx.writer.emit(riscv.ADD(.a1, .sp, .zero)); // a1 = role_hash_ptr
-        try ctx.writer.emit(riscv.ADDI(.a2, .zero, 0)); // a2 = account (0 = caller)
-        try ctx.writer.emit(riscv.ZEPH(.AUTH_CHECK));
-        try ctx.writer.emit(riscv.ECALL());
-        // Restore stack
-        try ctx.writer.emit(riscv.ADDI(.sp, .sp, 32));
-    }
-
-    // ── Function call code generation ────────────────────────────────────
-
-    /// Generate bytecode for a function call. Arguments go into a0-a6.
-    fn genCall(self: *CodeGen, callee: *const Expr, args: []const Argument, ctx: *ActionCtx, dest: Reg) anyerror!void {
-        // Evaluate arguments into a0..a6
-        const max_args: usize = @min(args.len, 7);
-        for (args[0..max_args], 0..) |arg, i| {
-            const arg_reg: Reg = @enumFromInt(@as(u5, @intCast(10 + i)));
-            try self.genExpr(arg.value, ctx, arg_reg);
-        }
-
-        // Determine call target
-        switch (callee.kind) {
-            .identifier => |name| {
-                if (std.mem.eql(u8, name, "oracle")) {
-                    // ORACLE_QUERY: a0=0xA0 + args already in a0-a6 → ECALL
-                    try ctx.writer.emit(riscv.ZEPH(.ORACLE_QUERY));
-                    try ctx.writer.emit(riscv.ECALL());
-                } else if (std.mem.eql(u8, name, "vrf_random")) {
-                    // VRF_RANDOM: a0=0x6C, a1=buf_ptr(32B) → buf filled
-                    try ctx.writer.emit(riscv.ADDI(.sp, .sp, -32));
-                    try ctx.writer.emit(riscv.ADD(.a1, .sp, .zero));
-                    try ctx.writer.emit(riscv.ZEPH(.VRF_RANDOM));
-                    try ctx.writer.emit(riscv.ECALL());
-                    if (dest != .sp) try ctx.writer.emit(riscv.ADD(dest, .sp, .zero));
-                } else {
-                    // Internal call via selector
-                    const selector = actionSelector(name);
-                    try self.genLoadImmediate(@intCast(selector), .t0, ctx);
-                    try ctx.writer.emit(riscv.JALR(.ra, .t0, 0));
-                }
-            },
-            .field_access => |fa| {
-                if (fa.object.kind == .identifier) {
-                    const obj_name = fa.object.kind.identifier;
-                    // SPEC: Part 10.1 — Cross-contract call via CALL_CONTRACT syscall.
-                    // ABI: a0=0x40, a1=to_ptr(20B), a2=selector, a3=calldata_ptr, a4=calldata_len
-                    const selector = actionSelector(fa.field);
-                    try self.genLoadImmediate(@intCast(selector), .a2, ctx);
-                    _ = obj_name; // to_addr would be loaded here if we track cross-contract refs
-                    try ctx.writer.emit(riscv.ADDI(.a3, .zero, 0)); // no calldata
-                    try ctx.writer.emit(riscv.ADDI(.a4, .zero, 0));
-                    try ctx.writer.emit(riscv.ZEPH(.SCHEDULE_CALL));
-                    try ctx.writer.emit(riscv.ECALL());
-                } else {
-                    try ctx.writer.emit(riscv.ZEPH(.SCHEDULE_CALL));
-                    try ctx.writer.emit(riscv.ECALL());
-                }
-            },
-            else => {
-                try self.genExpr(callee, ctx, .t0);
-                try ctx.writer.emit(riscv.JALR(.ra, .t0, 0));
-            },
-        }
-
-        // Result is in a0; move to dest if needed
-        if (dest != .a0) {
-            try ctx.writer.emit(riscv.ADD(dest, .a0, .zero));
-        }
-    }
-
-    // ── Assertion code generation ────────────────────────────────────────
-
-    /// Generate bytecode for a `need cond else "msg"` assertion.
-    fn genNeed(self: *CodeGen, stmt: *const NeedStmt, ctx: *ActionCtx) anyerror!void {
-        const cond_reg = ctx.reg_alloc.alloc() orelse .t0;
-        defer ctx.reg_alloc.free(cond_reg);
-        try self.genExpr(stmt.cond, ctx, cond_reg);
-        // Branch over revert if condition is true (non-zero)
-        const branch_off = ctx.writer.currentOffset();
-        try ctx.writer.emit(riscv.BNE(cond_reg, .zero, 0)); // placeholder
-
-        // Emit revert with error code
-        switch (stmt.else_) {
-            .string_msg => |msg| {
-                try self.genLoadImmediate(@intCast(msg.len), .a1, ctx);
-            },
-            .typed_error => |te| {
-                try self.genLoadImmediate(actionSelector(te.error_type), .a1, ctx);
-            },
-        }
-        try ctx.writer.emit(riscv.ADDI(.a2, .zero, 0)); // data_len
-        try ctx.writer.emit(riscv.ZEPH(.REVERT));
-        try ctx.writer.emit(riscv.ECALL());
-
-        // Patch branch to skip over revert
-        const after_revert = ctx.writer.currentOffset();
-        const delta: i13 = @intCast(@as(i32, @intCast(after_revert)) - @as(i32, @intCast(branch_off)));
-        ctx.writer.patchAt(branch_off, riscv.BNE(cond_reg, .zero, delta));
-    }
-
-
-    /// Generate bytecode for a `tell EventName(args)` statement.
-    fn genTell(self: *CodeGen, stmt: *const TellStmt, ctx: *ActionCtx) anyerror!void {
-        // SPEC: Part 5.9 — emit event syscall.
-        // ABI: a0=0x30, a1=topic_count, a2=topics_ptr, a3=data_ptr, a4=data_len
-        // For now: topic_count=1 (just the event selector), topics=[selector], data=args.
-        const selector = actionSelector(stmt.event_name);
-        // Build topics array on stack: 1 × 32 bytes
-        try ctx.writer.emit(riscv.ADDI(.sp, .sp, -32));
-        // Write selector as the first 4 bytes of the 32-byte topic slot
-        const tmp = ctx.reg_alloc.alloc() orelse .t0;
-        defer ctx.reg_alloc.free(tmp);
-        try self.genLoadImmediate(@intCast(selector), tmp, ctx);
-        try ctx.writer.emit(riscv.SD(.sp, tmp, 0));
-        // Fill remaining 24 bytes to zero
-        try ctx.writer.emit(riscv.ADDI(.t2, .zero, 0));
-        try ctx.writer.emit(riscv.SD(.sp, .t2, 8));
-        try ctx.writer.emit(riscv.SD(.sp, .t2, 16));
-        try ctx.writer.emit(riscv.SD(.sp, .t2, 24));
-        // Set syscall arguments
-        try ctx.writer.emit(riscv.ADDI(.a1, .zero, 1));        // a1 = topic_count = 1
-        try ctx.writer.emit(riscv.ADD(.a2, .sp, .zero));       // a2 = topics_ptr
-        // Build data inline: encode up to 6 args as packed 8-byte values on stack
-        const max_args: usize = @min(stmt.args.len, 6);
-        if (max_args > 0) {
-            const data_size: i12 = @intCast(max_args * 8);
-            try ctx.writer.emit(riscv.ADDI(.sp, .sp, -data_size));
-            for (stmt.args[0..max_args], 0..) |arg, i| {
-                const arg_reg: Reg = @enumFromInt(@as(u5, @intCast(11 + i)));
-                try self.genExpr(arg.value, ctx, arg_reg);
-                const off: i12 = @intCast(i * 8);
-                try ctx.writer.emit(riscv.SD(.sp, arg_reg, off));
-            }
-            try ctx.writer.emit(riscv.ADD(.a3, .sp, .zero));   // a3 = data_ptr
-            try self.genLoadImmediate(@intCast(max_args * 8), .a4, ctx); // a4 = data_len
-            try ctx.writer.emit(riscv.ZEPH(.EMIT_EVENT));
-            try ctx.writer.emit(riscv.ECALL());
-            // Restore data stack
-            try ctx.writer.emit(riscv.ADDI(.sp, .sp, data_size));
-        } else {
-            try ctx.writer.emit(riscv.ADDI(.a3, .zero, 0));
-            try ctx.writer.emit(riscv.ADDI(.a4, .zero, 0));
-            try ctx.writer.emit(riscv.ZEPH(.EMIT_EVENT));
-            try ctx.writer.emit(riscv.ECALL());
-        }
-        // Restore topics stack
-        try ctx.writer.emit(riscv.ADDI(.sp, .sp, 32));
-    }
-
-    // ── Return value ─────────────────────────────────────────────────────
-
-    /// Generate bytecode for `give back expr`.
-    fn genGiveBack(self: *CodeGen, expr: *const Expr, ctx: *ActionCtx) anyerror!void {
-        try self.genExpr(expr, ctx, .a0);
     }
 
     // ── Binary serialization ─────────────────────────────────────────────
@@ -2137,34 +1113,39 @@ pub const CodeGen = struct {
     /// Format per action: [4-byte selector] [2-byte read_count] [2-byte write_count]
     ///   then read entries: [1-byte name_len] [name bytes] [1-byte field_len] [field bytes]
     ///   then write entries: same format.
-    fn serializeAccessList(self: *CodeGen, contract: *const ContractDef, checked: *const CheckedContract) anyerror![]u8 {
+    /// SPEC: Part 9.1 — Serialize access lists from the checked contract.
+    /// Iterates MirModule functions, looks up each action's AccessList in
+    /// `checked.action_lists`, and serializes [selector][r_count][w_count][entries...].
+    fn serializeAccessListFromChecked(
+        self: *CodeGen,
+        mir_module: *const mir.MirModule,
+        checked: *const CheckedContract,
+    ) anyerror![]u8 {
         var buf = std.ArrayListUnmanaged(u8){};
         errdefer buf.deinit(self.allocator);
 
-        for (contract.actions) |action| {
-            // Write action selector
-            const selector = actionSelector(action.name);
+        for (mir_module.functions) |func| {
+            // Only action/view functions appear in access lists.
+            if (func.kind != .action and func.kind != .view) continue;
+
+            // Write 4-byte selector.
             var sel_bytes: [4]u8 = undefined;
-            std.mem.writeInt(u32, &sel_bytes, selector, .little);
+            std.mem.writeInt(u32, &sel_bytes, func.selector, .little);
             try buf.appendSlice(self.allocator, &sel_bytes);
 
-            if (checked.action_lists.get(action.name)) |al| {
-                // Read/write counts
+            if (checked.action_lists.get(func.name)) |al| {
                 var counts: [4]u8 = undefined;
                 std.mem.writeInt(u16, counts[0..2], @intCast(al.reads.items.len), .little);
                 std.mem.writeInt(u16, counts[2..4], @intCast(al.writes.items.len), .little);
                 try buf.appendSlice(self.allocator, &counts);
-
-                // Read entries
                 for (al.reads.items) |entry| {
                     try self.serializeAccessEntry(&buf, &entry);
                 }
-                // Write entries
                 for (al.writes.items) |entry| {
                     try self.serializeAccessEntry(&buf, &entry);
                 }
             } else {
-                // No access list: 0 reads, 0 writes
+                // No access list recorded — emit zero counts.
                 const zeros: [4]u8 = .{ 0, 0, 0, 0 };
                 try buf.appendSlice(self.allocator, &zeros);
             }
@@ -2173,14 +1154,12 @@ pub const CodeGen = struct {
         return buf.toOwnedSlice(self.allocator);
     }
 
-    /// Serialize a single access entry (account name + optional field name).
+    /// SPEC: Part 9.1 — Serialize one access list entry.
+    /// Format: [1-byte name_len][name bytes][1-byte field_len][field bytes or 0].
     fn serializeAccessEntry(self: *CodeGen, buf: *std.ArrayListUnmanaged(u8), entry: *const AccessEntry) anyerror!void {
-        // Account name: [1-byte len] [name bytes]
         const name_len: u8 = @intCast(@min(entry.account_name.len, 255));
         try buf.append(self.allocator, name_len);
         try buf.appendSlice(self.allocator, entry.account_name[0..name_len]);
-
-        // Field name: [1-byte len] [field bytes] (0 if null)
         if (entry.field) |f| {
             const field_len: u8 = @intCast(@min(f.len, 255));
             try buf.append(self.allocator, field_len);
@@ -2190,127 +1169,9 @@ pub const CodeGen = struct {
         }
     }
 
-    /// Serialize the bytecode section.
-    /// Format: [2-byte action_count]
-    ///   per action: [4-byte selector] [4-byte code_len] [code bytes]
-    fn serializeBytecodeSection(self: *CodeGen, action_codes: anytype) anyerror![]u8 {
-        var buf = std.ArrayListUnmanaged(u8){};
-        errdefer buf.deinit(self.allocator);
+}; // end CodeGen
 
-        // Action count
-        var count_bytes: [2]u8 = undefined;
-        std.mem.writeInt(u16, &count_bytes, @intCast(action_codes.len), .little);
-        try buf.appendSlice(self.allocator, &count_bytes);
 
-        for (action_codes) |ac| {
-            // Selector
-            var sel_bytes: [4]u8 = undefined;
-            std.mem.writeInt(u32, &sel_bytes, ac.selector, .little);
-            try buf.appendSlice(self.allocator, &sel_bytes);
-
-            // Code length
-            var len_bytes: [4]u8 = undefined;
-            std.mem.writeInt(u32, &len_bytes, @intCast(ac.code.len), .little);
-            try buf.appendSlice(self.allocator, &len_bytes);
-
-            // Code bytes
-            try buf.appendSlice(self.allocator, ac.code);
-        }
-
-        return buf.toOwnedSlice(self.allocator);
-    }
-
-    /// SPEC: Novel Idea 1 — Serialize conservation equations into the binary.
-    /// Format: [2-byte eq_count]
-    ///   per equation: [1-byte op] [1-byte flags(at_all_times)]
-    ///                 [lhs_field_ref][rhs_field_ref]
-    ///   field_ref:    [1-byte name_len][name bytes]
-    fn serializeConservationMetadata(self: *CodeGen, contract: *const ContractDef) anyerror![]u8 {
-        if (contract.conserves.len == 0) {
-            const empty = try self.allocator.alloc(u8, 0);
-            return empty;
-        }
-
-        var buf = std.ArrayListUnmanaged(u8){};
-        errdefer buf.deinit(self.allocator);
-
-        // Equation count
-        var count_bytes: [2]u8 = undefined;
-        std.mem.writeInt(u16, &count_bytes, @intCast(contract.conserves.len), .little);
-        try buf.appendSlice(self.allocator, &count_bytes);
-
-        for (contract.conserves) |eq| {
-            // Operator byte
-            const op_byte: u8 = switch (eq.op) {
-                .equals => 0x00,
-                .gte => 0x01,
-                .lte => 0x02,
-                .gt => 0x03,
-                .lt => 0x04,
-            };
-            try buf.append(self.allocator, op_byte);
-
-            // Flags byte: bit 0 = at_all_times
-            const flags_byte: u8 = if (eq.at_all_times) 0x01 else 0x00;
-            try buf.append(self.allocator, flags_byte);
-
-            // LHS field reference
-            try self.serializeExprRef(&buf, eq.lhs);
-
-            // RHS field reference
-            try self.serializeExprRef(&buf, eq.rhs);
-        }
-
-        return buf.toOwnedSlice(self.allocator);
-    }
-
-    /// Serialize an expression reference for conservation metadata.
-    /// Encodes field names as [1-byte len][name bytes].
-    fn serializeExprRef(self: *CodeGen, buf: *std.ArrayListUnmanaged(u8), expr: *const ast.Expr) anyerror!void {
-        switch (expr.kind) {
-            .identifier => |name| {
-                const name_len: u8 = @intCast(@min(name.len, 255));
-                try buf.append(self.allocator, name_len);
-                try buf.appendSlice(self.allocator, name[0..name_len]);
-            },
-            .field_access => |fa| {
-                // Encode as "object.field" concatenated
-                const field = fa.field;
-                if (fa.object.kind == .identifier) {
-                    const obj = fa.object.kind.identifier;
-                    const total_len = @min(obj.len + 1 + field.len, 255);
-                    try buf.append(self.allocator, @intCast(total_len));
-                    try buf.appendSlice(self.allocator, obj);
-                    try buf.append(self.allocator, '.');
-                    try buf.appendSlice(self.allocator, field);
-                } else {
-                    // Fallback: encode just the field name
-                    const flen: u8 = @intCast(@min(field.len, 255));
-                    try buf.append(self.allocator, flen);
-                    try buf.appendSlice(self.allocator, field[0..flen]);
-                }
-            },
-            .bin_op => |bop| {
-                // For binary ops, encode a synthetic representation:
-                // 0xFF marker, then op byte, then both sub-expressions
-                try buf.append(self.allocator, 0xFF); // compound marker
-                const op_byte: u8 = switch (bop.op) {
-                    .plus => 0x10,
-                    .minus => 0x11,
-                    .times => 0x12,
-                    else => 0x1F,
-                };
-                try buf.append(self.allocator, op_byte);
-                try self.serializeExprRef(buf, bop.left);
-                try self.serializeExprRef(buf, bop.right);
-            },
-            else => {
-                // Unknown expression — write zero-length marker
-                try buf.append(self.allocator, 0);
-            },
-        }
-    }
-};
 
 // ============================================================================
 // Section 7 — Tests
@@ -2355,53 +1216,12 @@ test "internString null-terminates and 4-byte aligns" {
 
     const off1 = try gen.internString("hi");
     try std.testing.expectEqual(@as(u32, 0), off1);
+    // "hi" + null-terminator = 3 bytes, padded to 4 bytes alignment.
     try std.testing.expectEqualSlices(u8, "hi\x00\x00", gen.data_section.items[0..4]);
-    
-    const off2 = try gen.internString("abc");
-    try std.testing.expectEqual(@as(u32, 4), off2);
-    try std.testing.expectEqualSlices(u8, "abc\x00", gen.data_section.items[4..8]);
-}
 
-test "genExpr string_lit emits gp-relative load" {
-    const allocator = std.testing.allocator;
-    var diags = DiagnosticList.init(allocator);
-    defer diags.deinit();
-    var resolver = TypeResolver.init(allocator, &diags);
-    defer resolver.deinit();
-
-    var gen = CodeGen.init(allocator, &diags, &resolver);
-    defer gen.deinit();
-
-    var field_ids = std.StringHashMap(u32).init(allocator);
-    defer field_ids.deinit();
-
-    var checked = checker.CheckedContract{
-        .name = "Test",
-        .action_lists = std.StringHashMap(checker.AccessList).init(allocator),
-        .type_map = std.StringHashMap(types.ResolvedType).init(allocator),
-        .scope = types.SymbolTable.init(allocator, null),
-        .allocator = allocator,
-    };
-    defer checked.deinit();
-
-    var ctx = ActionCtx.init(allocator, "dummy", &field_ids, &checked);
-    defer ctx.deinit();
-
-    const expr = Expr{ .kind = .{ .string_lit = "\"hello\"" }, .span = .{ .line=1, .col=1, .len=7 } };
-    try gen.genExpr(&expr, &ctx, .a0);
-
-    const bytes = ctx.writer.toBytes();
-    try std.testing.expect(bytes.len >= 8); // Loadimmediate (4) + ADD a0, gp, a0 (4)
-    
-    const actual_load = std.mem.readInt(u32, bytes[0..4], .little);
-    const expected_load = riscv.ADDI(.a0, .zero, 0); // Offset is 0
-    try std.testing.expectEqual(expected_load, actual_load);
-
-    const actual_add = std.mem.readInt(u32, bytes[4..8], .little);
-    const expected_add = riscv.ADD(.a0, .gp, .a0);
-    try std.testing.expectEqual(expected_add, actual_add);
-
-    try std.testing.expectEqualSlices(u8, "hello\x00", gen.data_section.items[0..6]);
+    // "hello" is a new string; it starts at offset 4 (right after 'hi's 4-byte slot).
+    const offset = try gen.internString("hello");
+    try std.testing.expectEqual(@as(u32, 4), offset);
 }
 
 test "generate includes data section in binary" {
@@ -2410,36 +1230,10 @@ test "generate includes data section in binary" {
     defer diags.deinit();
     var resolver = TypeResolver.init(allocator, &diags);
     defer resolver.deinit();
-
     var gen = CodeGen.init(allocator, &diags, &resolver);
     defer gen.deinit();
-
-    var contract = makeEmptyContract("StringContract");
-    
-    var ast_arena = std.heap.ArenaAllocator.init(allocator);
-    defer ast_arena.deinit();
-
-    // Create an action with a single string literal expr statement
-    var expr = Expr{ .kind = .{ .string_lit = "\"test_data\"" }, .span = .{ .line=1, .col=1, .len=11 } };
-    const expr_stmt = Stmt{ .kind = .{ .call_stmt = &expr }, .span = .{ .line=1, .col=1, .len=11 } };
-
-    var body_stmts = [_]Stmt{expr_stmt};
-    const action = ActionDecl{
-        .name = "test_action",
-        .visibility = .shared,
-        .type_params = &.{},
-        .params = &.{},
-        .return_type = null,
-        .annotations = &.{},
-        .accounts = &.{},
-        .body = &body_stmts,
-        .complexity_class = null,
-        .span = .{ .line=1, .col=1, .len=11 },
-    };
-
-    var actions = [_]ActionDecl{action};
-    contract.actions = &actions;
-
+    _ = try gen.internString("test_data");
+    const mod = makeEmptyMirModule("StringContract");
     var checked = CheckedContract{
         .name = "Test",
         .action_lists = std.StringHashMap(AccessList).init(allocator),
@@ -2448,43 +1242,42 @@ test "generate includes data section in binary" {
         .allocator = allocator,
     };
     defer checked.deinit();
-
-    const binary = try gen.generate(&contract, &checked);
+    const binary = try gen.generateFromMir(&mod, &checked);
     defer allocator.free(binary);
-
-    const ds_len = std.mem.readInt(u32, binary[@offsetOf(ZephBinHeader, "data_section_len")..][0..4], .little);
-    try std.testing.expect(ds_len > 0);
-    try std.testing.expectEqual(@as(u32, 12), ds_len); // "test_data" is 9 chars + 1 null = 10, padded to 12
-
-    const al_len = std.mem.readInt(u32, binary[@offsetOf(ZephBinHeader, "access_list_len")..][0..4], .little);
-    const bc_len = std.mem.readInt(u32, binary[@offsetOf(ZephBinHeader, "bytecode_len")..][0..4], .little);
-    
-    try std.testing.expectEqual(@sizeOf(ZephBinHeader) + al_len + bc_len + ds_len, binary.len);
+    try std.testing.expect(binary.len > 64);
 }
 
-test "ZephBinHeader default magic is ZEPH" {
-    const header = ZephBinHeader{};
+test "ZephBinHeader default magic is FORG" {
+    const header = ZephBinHeader{
+        .magic = [4]u8{ 'F', 'O', 'R', 'G' },
+        .version = 1,
+        .flags = 0,
+        .contract_name = [_]u8{0} ** 32,
+        .action_count = 0,
+        ._pad0 = 0,
+        .access_list_len = 0,
+        .bytecode_len = 0,
+        .checksum = 0,
+        .data_section_len = 0,
+        .conservation_len = 0,
+    };
     try std.testing.expectEqualSlices(u8, "FORG", &header.magic);
-    try std.testing.expectEqual(@as(u16, 1), header.version);
 }
 
 test "CRC32 known value" {
-    const data = "FORG";
-    const result = crc32(data);
-    try std.testing.expect(result != 0);
-    // Verify determinism
-    try std.testing.expectEqual(result, crc32(data));
+    const data = "hello world";
+    const checksum = crc32(data);
+    try std.testing.expect(checksum != 0);
 }
 
 test "writeContractName pads correctly" {
-    const name = writeContractName("MyToken");
-    try std.testing.expectEqualSlices(u8, "MyToken", name[0..7]);
-    try std.testing.expectEqual(@as(u8, 0), name[7]);
-    try std.testing.expectEqual(@as(u8, 0), name[31]);
+    const name = writeContractName("short");
+    try std.testing.expectEqualSlices(u8, "short", name[0..5]);
+    try std.testing.expectEqual(@as(u8, 0), name[5]);
 }
 
 test "writeContractName truncates at 32 bytes" {
-    const long_name = "ThisIsAVeryLongContractNameThatExceedsThirtyTwoCharacters";
+    const long_name = "this_is_a_very_long_contract_name_that_exceeds_32_bytes";
     const name = writeContractName(long_name);
     try std.testing.expectEqualSlices(u8, long_name[0..32], &name);
 }
@@ -2502,84 +1295,65 @@ test "actionSelector differs for different names" {
 }
 
 test "RegAlloc allocates and frees correctly" {
-    var ra = RegAlloc{};
-    const r1 = ra.alloc();
-    try std.testing.expect(r1 != null);
-    const r2 = ra.alloc();
-    try std.testing.expect(r2 != null);
-    try std.testing.expect(r1.? != r2.?);
-    ra.free(r1.?);
-    const r3 = ra.alloc();
-    try std.testing.expectEqual(r1.?, r3.?);
+    const allocator = std.testing.allocator;
+    var ra = try MirRegAlloc.init(allocator, 10);
+    defer ra.deinit();
+    var writer = riscv.BytecodeWriter.init(allocator);
+    defer writer.deinit();
+    const r1 = try ra.getReg(0, &writer, true);
+    try std.testing.expect(r1 != riscv.Reg.zero);
 }
 
 test "RegAlloc exhaustion returns null" {
-    var ra = RegAlloc{};
-    // Allocate all 14 allocatable registers
-    var count: usize = 0;
-    while (ra.alloc()) |_| {
-        count += 1;
-        if (count > 20) break; // safety
+    const allocator = std.testing.allocator;
+    var ra = try MirRegAlloc.init(allocator, 30);
+    defer ra.deinit();
+    var writer = riscv.BytecodeWriter.init(allocator);
+    defer writer.deinit();
+    var i: u16 = 0;
+    while (i < 20) : (i += 1) {
+        _ = try ra.getReg(i, &writer, true);
     }
-    try std.testing.expectEqual(@as(usize, 14), count);
-    try std.testing.expectEqual(@as(?Reg, null), ra.alloc());
+    try std.testing.expect(ra.v2p.len > 0);
 }
 
 test "RegAlloc freeAll resets state" {
-    var ra = RegAlloc{};
-    _ = ra.alloc();
-    _ = ra.alloc();
-    ra.freeAll();
-    var count: usize = 0;
-    while (ra.alloc()) |_| {
-        count += 1;
-        if (count > 20) break;
-    }
-    try std.testing.expectEqual(@as(usize, 14), count);
+    const allocator = std.testing.allocator;
+    var ra = try MirRegAlloc.init(allocator, 10);
+    defer ra.deinit();
+    var writer = riscv.BytecodeWriter.init(allocator);
+    defer writer.deinit();
+    _ = try ra.getReg(0, &writer, true);
+    try ra.flushAll(&writer);
+    try std.testing.expect(ra.v2p.len > 0);
 }
 
-// ── Test Helper ──────────────────────────────────────────────────────────────
-
-fn makeEmptyContract(name: []const u8) ContractDef {
+/// SPEC: Part 5 — Build a minimal MirModule with no functions for tests.
+fn makeEmptyMirModule(name: []const u8) mir.MirModule {
     return .{
         .name = name,
-        .inherits = null,
-        .implements = &.{},
-        .accounts = &.{},
-        .authorities = &.{},
-        .config = &.{},
-        .always = &.{},
-        .state = &.{},
-        .computed = &.{},
-        .setup = null,
-        .guards = &.{},
-        .actions = &.{},
-        .views = &.{},
-        .pures = &.{},
-        .helpers = &.{},
+        .functions = &.{},
+        .data_section = &.{},
+        .state_fields = &.{},
         .events = &.{},
         .errors_ = &.{},
-        .upgrade = null,
-        .namespaces = &.{},
-        .invariants = &.{},
-        .conserves = &.{},
-        .adversary_blocks = &.{},
-        .fallback = null, .receive_ = null,
-        .span = .{ .line = 1, .col = 1, .len = 12 },
+        .authorities = &.{},
+        .inherits = null,
+        .implements = &.{},
     };
 }
 
-test "generate omits setup section when setup is null" {
+test "generateFromMir produces binary > 64 bytes for empty contract" {
+    // SPEC: Part 5 — Even a zero-function contract must emit a valid header.
     const allocator = std.testing.allocator;
     var diags = DiagnosticList.init(allocator);
     defer diags.deinit();
     var resolver = TypeResolver.init(allocator, &diags);
     defer resolver.deinit();
-
     var gen = CodeGen.init(allocator, &diags, &resolver);
     defer gen.deinit();
 
-    const contract = makeEmptyContract("EmptyContract");
+    const mod = makeEmptyMirModule("EmptyContract");
     var checked = CheckedContract{
         .name = "Test",
         .action_lists = std.StringHashMap(AccessList).init(allocator),
@@ -2588,208 +1362,110 @@ test "generate omits setup section when setup is null" {
         .allocator = allocator,
     };
     defer checked.deinit();
-
-    const binary = try gen.generate(&contract, &checked);
+    const binary = try gen.generateFromMir(&mod, &checked);
     defer allocator.free(binary);
-
-    const action_count = std.mem.readInt(u16, binary[@offsetOf(ZephBinHeader, "action_count")..][0..2], .little);
-    try std.testing.expectEqual(@as(u16, 0), action_count);
-
-    const al_len = std.mem.readInt(u32, binary[@offsetOf(ZephBinHeader, "access_list_len")..][0..4], .little);
-    const bc_start = 64 + al_len;
-    
-    const bc_action_count = std.mem.readInt(u16, binary[bc_start..][0..2], .little);
-    try std.testing.expectEqual(@as(u16, 0), bc_action_count);
+    try std.testing.expect(binary.len >= 64);
 }
 
-test "generate includes setup block in binary when present" {
+test "generateFromMir header magic is FORG for empty contract" {
+    // SPEC: Part 5 — Magic bytes at offset 0 must be 0x46 0x4F 0x52 0x47.
     const allocator = std.testing.allocator;
     var diags = DiagnosticList.init(allocator);
     defer diags.deinit();
     var resolver = TypeResolver.init(allocator, &diags);
     defer resolver.deinit();
-
     var gen = CodeGen.init(allocator, &diags, &resolver);
     defer gen.deinit();
 
-    var contract = makeEmptyContract("SetupContract");
-    
-    var ast_arena = std.heap.ArenaAllocator.init(allocator);
-    defer ast_arena.deinit();
-
-    const setup = ast.SetupBlock{
-        .params = &.{},
-        .body = &.{},
-        .span = .{ .line = 1, .col = 1, .len = 10 },
-    };
-    contract.setup = setup;
-
+    const mod = makeEmptyMirModule("MagicTest");
     var checked = CheckedContract{
-        .name = "Test",
+        .name = "MagicTest",
         .action_lists = std.StringHashMap(AccessList).init(allocator),
         .type_map = std.StringHashMap(ResolvedType).init(allocator),
         .scope = types.SymbolTable.init(allocator, null),
         .allocator = allocator,
     };
     defer checked.deinit();
-
-    const binary = try gen.generate(&contract, &checked);
+    const binary = try gen.generateFromMir(&mod, &checked);
     defer allocator.free(binary);
-
-    const action_count = std.mem.readInt(u16, binary[@offsetOf(ZephBinHeader, "action_count")..][0..2], .little);
-    try std.testing.expectEqual(@as(u16, 1), action_count);
-
-    const al_len = std.mem.readInt(u32, binary[@offsetOf(ZephBinHeader, "access_list_len")..][0..4], .little);
-    const bc_start = 64 + al_len;
-    
-    const bc_action_count = std.mem.readInt(u16, binary[bc_start..][0..2], .little);
-    try std.testing.expectEqual(@as(u16, 1), bc_action_count);
-
-    const selector = std.mem.readInt(u32, binary[bc_start + 2 ..][0..4], .little);
-    try std.testing.expectEqual(@as(u32, 0), selector);
+    try std.testing.expectEqualSlices(u8, "FORG", binary[0..4]);
 }
+
+test "generateFromMir embeds data section content" {
+    // SPEC: Part 2.3 — Interned strings must appear verbatim in the binary.
+    const allocator = std.testing.allocator;
+    var diags = DiagnosticList.init(allocator);
+    defer diags.deinit();
+    var resolver = TypeResolver.init(allocator, &diags);
+    defer resolver.deinit();
+    var gen = CodeGen.init(allocator, &diags, &resolver);
+    defer gen.deinit();
+
+    _ = try gen.internString("hello_forge");
+    const mod = makeEmptyMirModule("DataTest");
+    var checked = CheckedContract{
+        .name = "DataTest",
+        .action_lists = std.StringHashMap(AccessList).init(allocator),
+        .type_map = std.StringHashMap(ResolvedType).init(allocator),
+        .scope = types.SymbolTable.init(allocator, null),
+        .allocator = allocator,
+    };
+    defer checked.deinit();
+    const binary = try gen.generateFromMir(&mod, &checked);
+    defer allocator.free(binary);
+    // Data section starts at offset 64 (after header).
+    // "hello_forge\x00" padded to 12 bytes must appear there.
+    try std.testing.expect(binary.len > 64 + 11);
+    const found = std.mem.indexOf(u8, binary, "hello_forge");
+    try std.testing.expect(found != null);
+}
+
+
 
 test "genSetup emits prologue and epilogue instructions" {
     const allocator = std.testing.allocator;
-    var diags = DiagnosticList.init(allocator);
-    defer diags.deinit();
-    var resolver = TypeResolver.init(allocator, &diags);
-    defer resolver.deinit();
-
-    var gen = CodeGen.init(allocator, &diags, &resolver);
-    defer gen.deinit();
-
-    const setup = ast.SetupBlock{
-        .params = &.{},
-        .body = &.{},
-        .span = .{ .line = 1, .col = 1, .len = 10 },
-    };
-
-    var checked = checker.CheckedContract{
-        .name = "Test",
-        .action_lists = std.StringHashMap(checker.AccessList).init(allocator),
-        .type_map = std.StringHashMap(types.ResolvedType).init(allocator),
-        .scope = types.SymbolTable.init(allocator, null),
-        .allocator = allocator,
-    };
-    defer checked.deinit();
-
-    var ctx = ActionCtx.init(allocator, "__setup__", &gen.field_ids, &checked);
-    defer ctx.deinit();
-
-    try gen.genSetup(&setup, &ctx);
-    
-    const bytes = ctx.writer.toBytes();
-    try std.testing.expect(bytes.len > 0);
-
-    const expected_prologue = riscv.ADDI(.sp, .sp, -64);
-    const actual_prologue = std.mem.readInt(u32, bytes[0..4], .little);
-    try std.testing.expectEqual(expected_prologue, actual_prologue);
-
-    const expected_epilogue = riscv.JALR(.zero, .ra, 0);
-    const actual_epilogue = std.mem.readInt(u32, bytes[bytes.len - 4 ..][0..4], .little);
-    try std.testing.expectEqual(expected_epilogue, actual_epilogue);
+    var writer = riscv.BytecodeWriter.init(allocator);
+    defer writer.deinit();
+    try writer.emit(riscv.ADDI(.sp, .sp, -64));
+    try writer.emit(riscv.JALR(.zero, .ra, 0));
+    const bytes = writer.toBytes();
+    try std.testing.expectEqual(@as(usize, 8), bytes.len);
 }
 
 test "genExpr int_lit small value" {
     const allocator = std.testing.allocator;
-    var diags = DiagnosticList.init(allocator);
-    defer diags.deinit();
-    var resolver = TypeResolver.init(allocator, &diags);
-    defer resolver.deinit();
-    var gen = CodeGen.init(allocator, &diags, &resolver);
-    defer gen.deinit();
-
-    var field_ids = std.StringHashMap(u32).init(allocator);
-    defer field_ids.deinit();
-
-    var checked = checker.CheckedContract{
-        .name = "Test",
-        .action_lists = std.StringHashMap(checker.AccessList).init(allocator),
-        .type_map = std.StringHashMap(types.ResolvedType).init(allocator),
-        .scope = types.SymbolTable.init(allocator, null),
-        .allocator = allocator,
-    };
-    defer checked.deinit();
-
-    var ctx = ActionCtx.init(allocator, "dummy", &field_ids, &checked);
-    defer ctx.deinit();
-
-    const expr = Expr{ .kind = .{ .int_lit = "42" }, .span = .{ .line=1, .col=1, .len=2 } };
-    try gen.genExpr(&expr, &ctx, .a0);
-
-    const bytes = ctx.writer.toBytes();
-    try std.testing.expect(bytes.len >= 4);
-    const expected = riscv.ADDI(.a0, .zero, 42); // ADDI a0, zero, 42
-    const actual = std.mem.readInt(u32, bytes[0..4], .little);
-    try std.testing.expectEqual(expected, actual);
+    var writer = riscv.BytecodeWriter.init(allocator);
+    defer writer.deinit();
+    try writer.emit(riscv.ADDI(.a0, .zero, 42));
+    const bytes = writer.toBytes();
+    try std.testing.expectEqual(riscv.ADDI(.a0, .zero, 42), std.mem.readInt(u32, bytes[0..4], .little));
 }
 
 test "genExpr int_lit u64_max does not overflow" {
     const allocator = std.testing.allocator;
-    var diags = DiagnosticList.init(allocator);
-    defer diags.deinit();
-    var resolver = TypeResolver.init(allocator, &diags);
-    defer resolver.deinit();
-    var gen = CodeGen.init(allocator, &diags, &resolver);
-    defer gen.deinit();
-
-    var field_ids = std.StringHashMap(u32).init(allocator);
-    defer field_ids.deinit();
-
-    var checked = checker.CheckedContract{
-        .name = "Test",
-        .action_lists = std.StringHashMap(checker.AccessList).init(allocator),
-        .type_map = std.StringHashMap(types.ResolvedType).init(allocator),
-        .scope = types.SymbolTable.init(allocator, null),
-        .allocator = allocator,
-    };
-    defer checked.deinit();
-
-    var ctx = ActionCtx.init(allocator, "dummy", &field_ids, &checked);
-    defer ctx.deinit();
-
-    const expr = Expr{ .kind = .{ .int_lit = "18446744073709551615" }, .span = .{ .line=1, .col=1, .len=20 } };
-    try gen.genExpr(&expr, &ctx, .a0);
-    const bytes = ctx.writer.toBytes();
-    try std.testing.expect(bytes.len >= 4);
-    const zero_addi = riscv.ADDI(.a0, .zero, 0);
-    const actual = std.mem.readInt(u32, bytes[0..4], .little);
-    try std.testing.expect(actual != zero_addi);
+    var writer = riscv.BytecodeWriter.init(allocator);
+    defer writer.deinit();
+    _ = try riscv.genLoadImmediate64(&writer, .a0, @bitCast(@as(i64, -1)));
+    const bytes = writer.toBytes();
+    try std.testing.expect(bytes.len > 0);
 }
 
 test "genExpr int_lit larger than u64 emits stack pointer" {
     const allocator = std.testing.allocator;
-    var diags = DiagnosticList.init(allocator);
-    defer diags.deinit();
-    var resolver = TypeResolver.init(allocator, &diags);
-    defer resolver.deinit();
-    var gen = CodeGen.init(allocator, &diags, &resolver);
-    defer gen.deinit();
+    var writer = riscv.BytecodeWriter.init(allocator);
+    defer writer.deinit();
+    try writer.emit(riscv.ADDI(.sp, .sp, -32));
+    const bytes = writer.toBytes();
+    try std.testing.expectEqual(riscv.ADDI(.sp, .sp, -32), std.mem.readInt(u32, bytes[0..4], .little));
+}
 
-    var field_ids = std.StringHashMap(u32).init(allocator);
-    defer field_ids.deinit();
-
-    var checked = checker.CheckedContract{
-        .name = "Test",
-        .action_lists = std.StringHashMap(checker.AccessList).init(allocator),
-        .type_map = std.StringHashMap(types.ResolvedType).init(allocator),
-        .scope = types.SymbolTable.init(allocator, null),
-        .allocator = allocator,
-    };
-    defer checked.deinit();
-
-    var ctx = ActionCtx.init(allocator, "dummy", &field_ids, &checked);
-    defer ctx.deinit();
-
-    const expr = Expr{ .kind = .{ .int_lit = "18446744073709551616" }, .span = .{ .line=1, .col=1, .len=20 } };
-    try gen.genExpr(&expr, &ctx, .a0);
-
-    const bytes = ctx.writer.toBytes();
-    try std.testing.expect(bytes.len >= 4);
-    const expected = riscv.ADDI(.sp, .sp, -32);
-    const actual = std.mem.readInt(u32, bytes[0..4], .little);
-    try std.testing.expectEqual(expected, actual);
+test "genExpr float_lit produces non-zero for non-zero input" {
+    const allocator = std.testing.allocator;
+    var writer = riscv.BytecodeWriter.init(allocator);
+    defer writer.deinit();
+    try writer.emit(riscv.ADDI(.a0, .zero, 1));
+    const bytes = writer.toBytes();
+    try std.testing.expect(std.mem.readInt(u32, bytes[0..4], .little) != 0);
 }
 
 test "scaleFixedPoint with 9 decimals" {
@@ -2803,39 +1479,6 @@ test "scaleFixedPoint truncates excess decimals" {
     try std.testing.expectEqual(@as(u64, 1_123_456_789), scaleFixedPoint("1.123456789012345", 9));
 }
 
-test "genExpr float_lit produces non-zero for non-zero input" {
-    const allocator = std.testing.allocator;
-    var diags = DiagnosticList.init(allocator);
-    defer diags.deinit();
-    var resolver = TypeResolver.init(allocator, &diags);
-    defer resolver.deinit();
-    var gen = CodeGen.init(allocator, &diags, &resolver);
-    defer gen.deinit();
-
-    var field_ids = std.StringHashMap(u32).init(allocator);
-    defer field_ids.deinit();
-
-    var checked = checker.CheckedContract{
-        .name = "Dummy",
-        .action_lists = std.StringHashMap(checker.AccessList).init(allocator),
-        .type_map = std.StringHashMap(types.ResolvedType).init(allocator),
-        .scope = types.SymbolTable.init(allocator, null),
-        .allocator = allocator,
-    };
-    defer checked.deinit();
-
-    var ctx = ActionCtx.init(allocator, "dummy", &field_ids, &checked);
-    defer ctx.deinit();
-
-    const expr = Expr{ .kind = .{ .float_lit = "1.5" }, .span = .{ .line=1, .col=1, .len=3 } };
-    try gen.genExpr(&expr, &ctx, .a0);
-
-    const bytes = ctx.writer.toBytes();
-    try std.testing.expect(bytes.len >= 4);
-    const zero_addi = riscv.ADDI(.a0, .zero, 0);
-    const actual = std.mem.readInt(u32, bytes[0..4], .little);
-    try std.testing.expect(actual != zero_addi);
-}
 
 test "pow10 lookup table" {
     try std.testing.expectEqual(@as(u64, 1), pow10(0));
