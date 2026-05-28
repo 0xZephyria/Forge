@@ -120,10 +120,21 @@ pub const CompileError = error{
     LinearAssetUsedTwice,
     /// A field marked as `immutable_fields` in an `upgrade:` block was modified.
     ImmutableFieldViolation,
+    /// A view body contains a statement that consumes linear assets (illegal in views).
+    IllegalInView,
     /// An annotation argument is malformed (e.g. invalid hex for sponsorship).
     InvalidAnnotationArgument,
     /// An asset transfer hook (`before_transfer`, etc.) has an invalid signature.
     InvalidHookSignature,
+
+    // ── Module / import errors ─────────────────────────────────────────────
+    /// A `use` import path could not be resolved to a file or built-in module.
+    ImportNotFound,
+    /// Two imported modules share the same name, or an import collides with a
+    /// local declaration (namespace collision).
+    ImportCollision,
+    /// A cyclic import dependency was detected: A → B → … → A.
+    CyclicImport,
 
     // ── Novel feature errors ──────────────────────────────────────────────
     /// An action provably breaks a declared `conserves` equation.
@@ -193,7 +204,7 @@ pub const DiagnosticList = struct {
     /// Create an empty list backed by `allocator`.
     pub fn init(allocator: std.mem.Allocator) DiagnosticList {
         return .{
-            .items    = .{},
+            .items = .{},
             .allocator = allocator,
         };
     }
@@ -257,99 +268,107 @@ pub const DiagnosticList = struct {
 fn errorCode(kind: CompileError) u16 {
     return switch (kind) {
         // Lexer
-        error.UnexpectedCharacter            => 0,
-        error.UnterminatedString             => 1,
-        error.InvalidNumberLiteral           => 2,
-        error.InvalidHexLiteral              => 3,
+        error.UnexpectedCharacter => 0,
+        error.UnterminatedString => 1,
+        error.InvalidNumberLiteral => 2,
+        error.InvalidHexLiteral => 3,
         // Parser
-        error.UnexpectedToken                => 4,
-        error.ExpectedToken                  => 5,
-        error.UnexpectedEOF                  => 6,
-        error.MissingColon                   => 7,
-        error.MissingArrow                   => 8,
+        error.UnexpectedToken => 4,
+        error.ExpectedToken => 5,
+        error.UnexpectedEOF => 6,
+        error.MissingColon => 7,
+        error.MissingArrow => 8,
         // Type
-        error.TypeMismatch                   => 9,
-        error.UndeclaredIdentifier           => 10,
-        error.UndeclaredType                 => 11,
-        error.UndeclaredAccount              => 12,
-        error.InvalidTypeForOperation        => 13,
-        error.CannotAssignToReadonly         => 14,
+        error.TypeMismatch => 9,
+        error.UndeclaredIdentifier => 10,
+        error.UndeclaredType => 11,
+        error.UndeclaredAccount => 12,
+        error.InvalidTypeForOperation => 13,
+        error.CannotAssignToReadonly => 14,
         // Semantic
-        error.DuplicateDeclaration           => 15,
-        error.DuplicateField                 => 16,
-        error.MissingSetupBlock              => 17,
-        error.AccountNotDeclared             => 18,
-        error.FieldNotInCapabilityList       => 19,
-        error.WriteToReadonlyAccount         => 20,
-        error.CrossProgramStateAccess        => 21,
+        error.DuplicateDeclaration => 15,
+        error.DuplicateField => 16,
+        error.MissingSetupBlock => 17,
+        error.AccountNotDeclared => 18,
+        error.FieldNotInCapabilityList => 19,
+        error.WriteToReadonlyAccount => 20,
+        error.CrossProgramStateAccess => 21,
         // Authority
-        error.UnknownAuthority               => 22,
-        error.AuthorityTypeMismatch          => 23,
+        error.UnknownAuthority => 22,
+        error.AuthorityTypeMismatch => 23,
         // Access list
-        error.UndeclaredWrite                => 24,
-        error.UndeclaredRead                 => 25,
+        error.UndeclaredWrite => 24,
+        error.UndeclaredRead => 25,
         // Loop safety
         error.UnboundedLoopMissingAnnotation => 26,
         // Asset
-        error.LinearAssetDropped             => 27,
-        error.LinearAssetUsedTwice           => 28,
-        error.ImmutableFieldViolation        => 29,
-        error.InvalidAnnotationArgument      => 30,
-        error.InvalidHookSignature           => 31,
+        error.LinearAssetDropped => 27,
+        error.LinearAssetUsedTwice => 28,
+        error.ImmutableFieldViolation => 29,
+        error.InvalidAnnotationArgument => 30,
+        error.InvalidHookSignature => 31,
+        error.IllegalInView => 32,
+        error.ImportNotFound => 33,
+        error.ImportCollision => 34,
+        error.CyclicImport => 35,
         // Novel features
-        error.ConservationViolated           => 32,
-        error.ComplexityViolated             => 33,
-        error.AttackSucceeded               => 34,
-        error.AttackBlocked                 => 35,
+        error.ConservationViolated => 36,
+        error.ComplexityViolated => 37,
+        error.AttackSucceeded => 38,
+        error.AttackBlocked => 39,
         // General
-        error.OutOfMemory                    => 36,
-        error.InternalError                  => 37,
+        error.OutOfMemory => 40,
+        error.InternalError => 41,
     };
 }
 
 /// The human-readable label shown after `error[Exxxx]:`.
 fn errorLabel(kind: CompileError) []const u8 {
     return switch (kind) {
-        error.UnexpectedCharacter            => "unexpected character",
-        error.UnterminatedString             => "unterminated string literal",
-        error.InvalidNumberLiteral           => "invalid number literal",
-        error.InvalidHexLiteral              => "invalid hex literal",
-        error.UnexpectedToken                => "unexpected token",
-        error.ExpectedToken                  => "expected token",
-        error.UnexpectedEOF                  => "unexpected end of file",
-        error.MissingColon                   => "missing colon",
-        error.MissingArrow                   => "missing arrow (->)",
-        error.TypeMismatch                   => "type mismatch",
-        error.UndeclaredIdentifier           => "undeclared identifier",
-        error.UndeclaredType                 => "undeclared type",
-        error.UndeclaredAccount              => "undeclared account",
-        error.InvalidTypeForOperation        => "invalid type for operation",
-        error.CannotAssignToReadonly         => "cannot assign to read-only binding",
-        error.DuplicateDeclaration           => "duplicate declaration",
-        error.DuplicateField                 => "duplicate field",
-        error.MissingSetupBlock              => "missing setup block",
-        error.AccountNotDeclared             => "account not declared in accounts: block",
-        error.FieldNotInCapabilityList       => "field not in capability list",
-        error.WriteToReadonlyAccount         => "write to read-only account",
-        error.CrossProgramStateAccess        => "cross-program state access",
-        error.UnknownAuthority               => "unknown authority",
-        error.AuthorityTypeMismatch          => "authority type mismatch",
-        error.UndeclaredWrite                => "undeclared write in access list",
-        error.UndeclaredRead                 => "undeclared read in access list",
+        error.UnexpectedCharacter => "unexpected character",
+        error.UnterminatedString => "unterminated string literal",
+        error.InvalidNumberLiteral => "invalid number literal",
+        error.InvalidHexLiteral => "invalid hex literal",
+        error.UnexpectedToken => "unexpected token",
+        error.ExpectedToken => "expected token",
+        error.UnexpectedEOF => "unexpected end of file",
+        error.MissingColon => "missing colon",
+        error.MissingArrow => "missing arrow (->)",
+        error.TypeMismatch => "type mismatch",
+        error.UndeclaredIdentifier => "undeclared identifier",
+        error.UndeclaredType => "undeclared type",
+        error.UndeclaredAccount => "undeclared account",
+        error.InvalidTypeForOperation => "invalid type for operation",
+        error.CannotAssignToReadonly => "cannot assign to read-only binding",
+        error.DuplicateDeclaration => "duplicate declaration",
+        error.DuplicateField => "duplicate field",
+        error.MissingSetupBlock => "missing setup block",
+        error.AccountNotDeclared => "account not declared in accounts: block",
+        error.FieldNotInCapabilityList => "field not in capability list",
+        error.WriteToReadonlyAccount => "write to read-only account",
+        error.CrossProgramStateAccess => "cross-program state access",
+        error.UnknownAuthority => "unknown authority",
+        error.AuthorityTypeMismatch => "authority type mismatch",
+        error.UndeclaredWrite => "undeclared write in access list",
+        error.UndeclaredRead => "undeclared read in access list",
         error.UnboundedLoopMissingAnnotation => "unbounded loop missing #[max_iterations] annotation",
-        error.LinearAssetDropped             => "linear asset dropped without consumption",
-        error.LinearAssetUsedTwice           => "linear asset used more than once",
-        error.ImmutableFieldViolation        => "immutable field modification violation",
-        error.InvalidAnnotationArgument      => "invalid annotation argument",
-        error.InvalidHookSignature           => "invalid asset transfer hook signature",
+        error.LinearAssetDropped => "linear asset dropped without consumption",
+        error.LinearAssetUsedTwice => "linear asset used more than once",
+        error.ImmutableFieldViolation => "immutable field modification violation",
+        error.InvalidAnnotationArgument => "invalid annotation argument",
+        error.InvalidHookSignature => "invalid asset transfer hook signature",
+        error.IllegalInView => "illegal operation in read-only view",
+        error.ImportNotFound => "import not found",
+        error.ImportCollision => "import namespace collision",
+        error.CyclicImport => "cyclic import dependency",
         // Novel features
-        error.ConservationViolated           => "conservation proof violation",
-        error.ComplexityViolated             => "gas complexity class exceeded",
-        error.AttackSucceeded               => "adversary attack succeeded (potential vulnerability)",
-        error.AttackBlocked                 => "adversary attack was blocked",
+        error.ConservationViolated => "conservation proof violation",
+        error.ComplexityViolated => "gas complexity class exceeded",
+        error.AttackSucceeded => "adversary attack succeeded (potential vulnerability)",
+        error.AttackBlocked => "adversary attack was blocked",
         // General
-        error.OutOfMemory                    => "out of memory",
-        error.InternalError                  => "internal compiler error",
+        error.OutOfMemory => "out of memory",
+        error.InternalError => "internal compiler error",
     };
 }
 
@@ -369,7 +388,7 @@ fn errorLabel(kind: CompileError) []const u8 {
 /// The gutter (left of `|`) is `line_number_width + 1` characters wide so
 /// that the `|` separator aligns between the location header and caret line.
 fn printDiagnostic(d: Diagnostic, writer: anytype) anyerror!void {
-    const code  = errorCode(d.kind);
+    const code = errorCode(d.kind);
     const label = errorLabel(d.kind);
 
     // ── Header line ───────────────────────────────────────────────────────
@@ -383,7 +402,7 @@ fn printDiagnostic(d: Diagnostic, writer: anytype) anyerror!void {
     // ── Gutter width ──────────────────────────────────────────────────────
     // Minimum 1 digit for the line number; the gutter is one wider.
     const line_num_width: usize = digitCount(d.line);
-    const gutter_width: usize   = line_num_width + 1;
+    const gutter_width: usize = line_num_width + 1;
 
     // ── Location line ─────────────────────────────────────────────────────
     //  --> contracts/Token.foz:47:12
@@ -493,12 +512,12 @@ pub fn makeDiagnostic(
 ) anyerror!Diagnostic {
     const message = try std.fmt.allocPrint(allocator, fmt, args);
     return Diagnostic{
-        .file        = file,
-        .line        = line,
-        .col         = col,
-        .len         = len,
-        .kind        = kind,
-        .message     = message,
+        .file = file,
+        .line = line,
+        .col = col,
+        .len = len,
+        .kind = kind,
+        .message = message,
         .source_line = source_line,
     };
 }
@@ -524,12 +543,12 @@ test "diagnostic print format" {
     defer list.deinit();
 
     try list.add(Diagnostic{
-        .file        = "contracts/Token.foz",
-        .line        = 47,
-        .col         = 29,    // 1-based: 'y' in 'yes' (4 spaces + "mine.balances[caller] = " = 28 chars)
-        .len         = 3,     // "yes"
-        .kind        = CompileError.TypeMismatch,
-        .message     = message,
+        .file = "contracts/Token.foz",
+        .line = 47,
+        .col = 29, // 1-based: 'y' in 'yes' (4 spaces + "mine.balances[caller] = " = 28 chars)
+        .len = 3, // "yes"
+        .kind = CompileError.TypeMismatch,
+        .message = message,
         .source_line = source_line,
     });
 
@@ -581,22 +600,22 @@ test "diagnostic multiple errors printed in order" {
     const msg_b = try std.fmt.allocPrint(allocator, "loop has no #[max_iterations] annotation", .{});
 
     try list.add(Diagnostic{
-        .file        = "contracts/A.foz",
-        .line        = 3,
-        .col         = 10,
-        .len         = 3,
-        .kind        = CompileError.UndeclaredType,
-        .message     = msg_a,
+        .file = "contracts/A.foz",
+        .line = 3,
+        .col = 10,
+        .len = 3,
+        .kind = CompileError.UndeclaredType,
+        .message = msg_a,
         .source_line = src_a,
     });
 
     try list.add(Diagnostic{
-        .file        = "contracts/B.foz",
-        .line        = 99,
-        .col         = 1,
-        .len         = 4,
-        .kind        = CompileError.UnboundedLoopMissingAnnotation,
-        .message     = msg_b,
+        .file = "contracts/B.foz",
+        .line = 99,
+        .col = 1,
+        .len = 4,
+        .kind = CompileError.UnboundedLoopMissingAnnotation,
+        .message = msg_b,
         .source_line = src_b,
     });
 
@@ -630,7 +649,9 @@ test "makeDiagnostic helper allocates message correctly" {
     const d = try makeDiagnostic(
         allocator,
         "contracts/Vault.foz",
-        12, 14, 6,
+        12,
+        14,
+        6,
         CompileError.UndeclaredIdentifier,
         "identifier '{s}' is not declared in this scope",
         .{"callar"},

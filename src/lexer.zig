@@ -14,14 +14,14 @@
 //
 // This is a library file. No main() function.
 
-const std    = @import("std");
-const ast    = @import("ast.zig");
+const std = @import("std");
+const ast = @import("ast.zig");
 const errors = @import("errors.zig");
 
-pub const Span            = ast.Span;
-pub const CompileError    = errors.CompileError;
-pub const Diagnostic      = errors.Diagnostic;
-pub const DiagnosticList  = errors.DiagnosticList;
+pub const Span = ast.Span;
+pub const CompileError = errors.CompileError;
+pub const Diagnostic = errors.Diagnostic;
+pub const DiagnosticList = errors.DiagnosticList;
 
 // ============================================================================
 // SECTION 1 — Token Kind Enum
@@ -106,9 +106,9 @@ pub const TokenKind = enum {
     // ── Keywords — Arithmetic operators (English) ─────────────────────────
     kw_plus,
     kw_minus,
-    kw_times_op,    // `times` used as multiplication (not loop-times)
-    kw_divided,     // first word of `divided by`
-    kw_by,          // second word of `divided by`; parser assembles the pair
+    kw_times_op, // `times` used as multiplication (not loop-times)
+    kw_divided, // first word of `divided by`
+    kw_by, // second word of `divided by`; parser assembles the pair
     kw_mod,
 
     // ── Keywords — Comparison ─────────────────────────────────────────────
@@ -119,7 +119,7 @@ pub const TokenKind = enum {
     kw_nothing,
     kw_something,
     kw_maybe,
-    kw_or_fallback,  // `or` when used as optional fallback (same token, parser decides)
+    kw_or_fallback, // `or` when used as optional fallback (same token, parser decides)
 
     // ── Keywords — Access control ─────────────────────────────────────────
     kw_only,
@@ -156,18 +156,52 @@ pub const TokenKind = enum {
     kw_inherits,
 
     // ── Keywords — Type names (Part 2.1) ──────────────────────────────────
-    kw_u8,           kw_u16,  kw_u32,   kw_u64,   kw_u128, kw_u256, kw_uint,
-    kw_i8,           kw_i16,  kw_i32,   kw_i64,   kw_i128, kw_i256, kw_int,
+    kw_u8,
+    kw_u16,
+    kw_u32,
+    kw_u64,
+    kw_u128,
+    kw_u256,
+    kw_uint,
+    kw_i8,
+    kw_i16,
+    kw_i32,
+    kw_i64,
+    kw_i128,
+    kw_i256,
+    kw_int,
     kw_bool,
-    kw_account_type, kw_wallet_type, kw_program_type, kw_system_acc,
-    kw_hash_type,    kw_hash20, kw_commitment,
-    kw_byte_type,    kw_bytes_type, kw_bytes32, kw_bytes64,
-    kw_signature,    kw_pubkey,
-    kw_string_type,  kw_short_str, kw_label,
-    kw_timestamp,    kw_duration, kw_block_number, kw_epoch, kw_slot,
-    kw_price9,       kw_price18, kw_percent,
+    kw_account_type,
+    kw_wallet_type,
+    kw_program_type,
+    kw_system_acc,
+    kw_hash_type,
+    kw_hash20,
+    kw_commitment,
+    kw_byte_type,
+    kw_bytes_type,
+    kw_bytes32,
+    kw_bytes64,
+    kw_signature,
+    kw_pubkey,
+    kw_string_type,
+    kw_short_str,
+    kw_label,
+    kw_timestamp,
+    kw_duration,
+    kw_block_number,
+    kw_epoch,
+    kw_slot,
+    kw_price9,
+    kw_price18,
+    kw_percent,
     kw_fixed,
-    kw_result_type,  kw_map, kw_enum_map, kw_list, kw_set, kw_array,
+    kw_result_type,
+    kw_map,
+    kw_enum_map,
+    kw_list,
+    kw_set,
+    kw_array,
     kw_tuple,
 
     // ── Keywords — Asset operations ───────────────────────────────────────
@@ -184,7 +218,7 @@ pub const TokenKind = enum {
     kw_tell,
     kw_throw,
     kw_schedule,
-    kw_give_back,    // two-word: parser assembles `give` + `back`
+    kw_give_back, // two-word: parser assembles `give` + `back`
     kw_remove,
     kw_close,
     kw_freeze,
@@ -193,14 +227,22 @@ pub const TokenKind = enum {
     kw_transfer_ownership,
 
     // ── Keywords — Duration units (Part 2.2) ──────────────────────────────
-    kw_millisecond,  kw_milliseconds,
-    kw_second,       kw_seconds,
-    kw_minute,       kw_minutes,
-    kw_hour,         kw_hours,
-    kw_day,          kw_days,
-    kw_week,         kw_weeks,
-    kw_month,        kw_months,
-    kw_year,         kw_years,
+    kw_millisecond,
+    kw_milliseconds,
+    kw_second,
+    kw_seconds,
+    kw_minute,
+    kw_minutes,
+    kw_hour,
+    kw_hours,
+    kw_day,
+    kw_days,
+    kw_week,
+    kw_weeks,
+    kw_month,
+    kw_months,
+    kw_year,
+    kw_years,
 
     // ── Keywords — Misc / imports ─────────────────────────────────────────
     kw_use,
@@ -208,12 +250,12 @@ pub const TokenKind = enum {
     kw_as,
     kw_let,
     kw_alias,
-    kw_gives,        // `gives ReturnType`
+    kw_gives, // `gives ReturnType`
     kw_ok,
     kw_fail,
     kw_deployer,
     kw_caller,
-    kw_value_kw,     // `value` (built-in)
+    kw_value_kw, // `value` (built-in)
     kw_now,
     kw_current_block,
     kw_gas_remaining,
@@ -261,42 +303,42 @@ pub const TokenKind = enum {
     kw_against,
 
     // ── Punctuation ───────────────────────────────────────────────────────
-    colon,          // :
-    double_colon,   // ::
-    semicolon,      // ;
-    comma,          // ,
-    dot,            // .
-    dot_dot,        // .. (range)
-    lparen,         // (
-    rparen,         // )
-    lbracket,       // [
-    rbracket,       // ]
-    lbrace,         // {
-    rbrace,         // }
-    arrow,          // ->
-    fat_arrow,      // =>
-    question,       // ?
-    at_sign,        // @
-    hash_sym,       // #
-    equals_sign,    // =
-    plus_eq,        // +=
-    minus_eq,       // -=
-    times_eq,       // *=
-    slash,          // /
-    backslash,      // \
-    pipe,           // |
-    ampersand,      // &
-    gt,             // >
-    lt,             // <
-    gte,            // >=
-    lte,            // <=
-    tilde,          // ~
+    colon, // :
+    double_colon, // ::
+    semicolon, // ;
+    comma, // ,
+    dot, // .
+    dot_dot, // .. (range)
+    lparen, // (
+    rparen, // )
+    lbracket, // [
+    rbracket, // ]
+    lbrace, // {
+    rbrace, // }
+    arrow, // ->
+    fat_arrow, // =>
+    question, // ?
+    at_sign, // @
+    hash_sym, // #
+    equals_sign, // =
+    plus_eq, // +=
+    minus_eq, // -=
+    times_eq, // *=
+    slash, // /
+    backslash, // \
+    pipe, // |
+    ampersand, // &
+    gt, // >
+    lt, // <
+    gte, // >=
+    lte, // <=
+    tilde, // ~
 
     // ── Special ───────────────────────────────────────────────────────────
     identifier,
-    doc_comment,    // /// documentation comment
-    line_comment,   // // single-line comment
-    block_comment,  // /* … */ multi-line comment
+    doc_comment, // /// documentation comment
+    line_comment, // // single-line comment
+    block_comment, // /* … */ multi-line comment
 
     /// A character sequence the lexer could not classify.
     /// Always accompanied by a Diagnostic in the DiagnosticList.
@@ -329,241 +371,241 @@ pub const Token = struct {
 /// keywords by string; it queries `tokenKindOf()`.
 const keyword_map = std.StaticStringMap(TokenKind).initComptime(.{
     // Declaration structure
-    .{ "version",               .kw_version            },
-    .{ "contract",              .kw_contract            },
-    .{ "asset",                 .kw_asset               },
-    .{ "interface",             .kw_interface           },
-    .{ "struct",                .kw_struct              },
-    .{ "record",                .kw_record              },
-    .{ "enum",                  .kw_enum                },
-    .{ "error",                 .kw_error               },
-    .{ "event",                 .kw_event               },
-    .{ "guard",                 .kw_guard               },
-    .{ "always",                .kw_always              },
-    .{ "has",                   .kw_has                 },
-    .{ "setup",                 .kw_setup               },
-    .{ "authorities",           .kw_authorities         },
-    .{ "accounts",              .kw_accounts            },
-    .{ "implements",            .kw_implements          },
-    .{ "config",                .kw_config              },
-    .{ "computed",              .kw_computed            },
-    .{ "upgrade",               .kw_upgrade             },
-    .{ "namespace",             .kw_namespace           },
-    .{ "invariant",             .kw_invariant           },
+    .{ "version", .kw_version },
+    .{ "contract", .kw_contract },
+    .{ "asset", .kw_asset },
+    .{ "interface", .kw_interface },
+    .{ "struct", .kw_struct },
+    .{ "record", .kw_record },
+    .{ "enum", .kw_enum },
+    .{ "error", .kw_error },
+    .{ "event", .kw_event },
+    .{ "guard", .kw_guard },
+    .{ "always", .kw_always },
+    .{ "has", .kw_has },
+    .{ "setup", .kw_setup },
+    .{ "authorities", .kw_authorities },
+    .{ "accounts", .kw_accounts },
+    .{ "implements", .kw_implements },
+    .{ "config", .kw_config },
+    .{ "computed", .kw_computed },
+    .{ "upgrade", .kw_upgrade },
+    .{ "namespace", .kw_namespace },
+    .{ "invariant", .kw_invariant },
     // Function-like
-    .{ "action",                .kw_action              },
-    .{ "view",                  .kw_view                },
-    .{ "pure",                  .kw_pure                },
-    .{ "hidden",                .kw_hidden              },
-    .{ "helper",                .kw_helper              },
+    .{ "action", .kw_action },
+    .{ "view", .kw_view },
+    .{ "pure", .kw_pure },
+    .{ "hidden", .kw_hidden },
+    .{ "helper", .kw_helper },
     // Control flow
-    .{ "when",                  .kw_when                },
-    .{ "otherwise",             .kw_otherwise           },
-    .{ "then",                  .kw_then                },
-    .{ "match",                 .kw_match               },
-    .{ "each",                  .kw_each                },
-    .{ "in",                    .kw_in                  },
-    .{ "repeat",                .kw_repeat              },
-    .{ "times",                 .kw_times               },
-    .{ "while",                 .kw_while               },
-    .{ "stop",                  .kw_stop                },
-    .{ "skip",                  .kw_skip                },
-    .{ "give",                  .kw_give                },
-    .{ "back",                  .kw_back                },
-    .{ "panic",                 .kw_panic               },
-    .{ "need",                  .kw_need                },
-    .{ "else",                  .kw_else                },
-    .{ "ensure",                .kw_ensure              },
-    .{ "attempt",               .kw_attempt             },
-    .{ "on_error",              .kw_on_error            },
-    .{ "always_after",          .kw_always_after        },
+    .{ "when", .kw_when },
+    .{ "otherwise", .kw_otherwise },
+    .{ "then", .kw_then },
+    .{ "match", .kw_match },
+    .{ "each", .kw_each },
+    .{ "in", .kw_in },
+    .{ "repeat", .kw_repeat },
+    .{ "times", .kw_times },
+    .{ "while", .kw_while },
+    .{ "stop", .kw_stop },
+    .{ "skip", .kw_skip },
+    .{ "give", .kw_give },
+    .{ "back", .kw_back },
+    .{ "panic", .kw_panic },
+    .{ "need", .kw_need },
+    .{ "else", .kw_else },
+    .{ "ensure", .kw_ensure },
+    .{ "attempt", .kw_attempt },
+    .{ "on_error", .kw_on_error },
+    .{ "always_after", .kw_always_after },
     // Boolean
-    .{ "yes",                   .kw_yes                 },
-    .{ "no",                    .kw_no                  },
-    .{ "not",                   .kw_not                 },
+    .{ "yes", .kw_yes },
+    .{ "no", .kw_no },
+    .{ "not", .kw_not },
     // Logic
-    .{ "and",                   .kw_and                 },
-    .{ "or",                    .kw_or                  },
+    .{ "and", .kw_and },
+    .{ "or", .kw_or },
     // Arithmetic (English)
-    .{ "plus",                  .kw_plus                },
-    .{ "minus",                 .kw_minus               },
-    .{ "divided",               .kw_divided             },
-    .{ "by",                    .kw_by                  },
-    .{ "mod",                   .kw_mod                 },
+    .{ "plus", .kw_plus },
+    .{ "minus", .kw_minus },
+    .{ "divided", .kw_divided },
+    .{ "by", .kw_by },
+    .{ "mod", .kw_mod },
     // Comparison
-    .{ "equals",                .kw_equals              },
-    .{ "is",                    .kw_is                  },
+    .{ "equals", .kw_equals },
+    .{ "is", .kw_is },
     // Optional
-    .{ "nothing",               .kw_nothing             },
-    .{ "something",             .kw_something           },
-    .{ "maybe",                 .kw_maybe               },
+    .{ "nothing", .kw_nothing },
+    .{ "something", .kw_something },
+    .{ "maybe", .kw_maybe },
     // Access control
-    .{ "only",                  .kw_only                },
-    .{ "shared",                .kw_shared              },
-    .{ "within",                .kw_within              },
-    .{ "outside",               .kw_outside             },
-    .{ "system",                .kw_system              },
-    .{ "readonly",              .kw_readonly            },
+    .{ "only", .kw_only },
+    .{ "shared", .kw_shared },
+    .{ "within", .kw_within },
+    .{ "outside", .kw_outside },
+    .{ "system", .kw_system },
+    .{ "readonly", .kw_readonly },
     // Account keywords
-    .{ "owned_by",              .kw_owned_by            },
-    .{ "seeded_by",             .kw_seeded_by           },
-    .{ "create_if_missing",     .kw_create_if_missing   },
-    .{ "child_of",              .kw_child_of            },
-    .{ "can",                   .kw_can                 },
-    .{ "read",                  .kw_read                },
-    .{ "write",                 .kw_write               },
-    .{ "linked_to",             .kw_linked_to           },
-    .{ "global",                .kw_global              },
-    .{ "mine",                  .kw_mine                },
-    .{ "this",                  .kw_this                },
-    .{ "params",                .kw_params              },
-    .{ "known",                 .kw_known               },
-    .{ "at",                    .kw_at                  },
-    .{ "exists",                .kw_exists              },
+    .{ "owned_by", .kw_owned_by },
+    .{ "seeded_by", .kw_seeded_by },
+    .{ "create_if_missing", .kw_create_if_missing },
+    .{ "child_of", .kw_child_of },
+    .{ "can", .kw_can },
+    .{ "read", .kw_read },
+    .{ "write", .kw_write },
+    .{ "linked_to", .kw_linked_to },
+    .{ "global", .kw_global },
+    .{ "mine", .kw_mine },
+    .{ "this", .kw_this },
+    .{ "params", .kw_params },
+    .{ "known", .kw_known },
+    .{ "at", .kw_at },
+    .{ "exists", .kw_exists },
     // Authority keywords
-    .{ "held_by",               .kw_held_by             },
-    .{ "initially",             .kw_initially           },
-    .{ "nobody",                .kw_nobody              },
-    .{ "with_timelock",         .kw_with_timelock       },
-    .{ "inheritable",           .kw_inheritable         },
-    .{ "covers",                .kw_covers              },
-    .{ "inherits",              .kw_inherits            },
+    .{ "held_by", .kw_held_by },
+    .{ "initially", .kw_initially },
+    .{ "nobody", .kw_nobody },
+    .{ "with_timelock", .kw_with_timelock },
+    .{ "inheritable", .kw_inheritable },
+    .{ "covers", .kw_covers },
+    .{ "inherits", .kw_inherits },
     // Primitive type names (Part 2.1)
-    .{ "u8",                    .kw_u8                  },
-    .{ "u16",                   .kw_u16                 },
-    .{ "u32",                   .kw_u32                 },
-    .{ "u64",                   .kw_u64                 },
-    .{ "u128",                  .kw_u128                },
-    .{ "u256",                  .kw_u256                },
-    .{ "uint",                  .kw_uint                },
-    .{ "i8",                    .kw_i8                  },
-    .{ "i16",                   .kw_i16                 },
-    .{ "i32",                   .kw_i32                 },
-    .{ "i64",                   .kw_i64                 },
-    .{ "i128",                  .kw_i128                },
-    .{ "i256",                  .kw_i256                },
-    .{ "int",                   .kw_int                 },
-    .{ "bool",                  .kw_bool                },
-    .{ "Account",               .kw_account_type        },
-    .{ "Wallet",                .kw_wallet_type         },
-    .{ "Program",               .kw_program_type        },
-    .{ "System",                .kw_system_acc          },
-    .{ "Hash",                  .kw_hash_type           },
-    .{ "Hash20",                .kw_hash20              },
-    .{ "Commitment",            .kw_commitment          },
-    .{ "byte",                  .kw_byte_type           },
-    .{ "Bytes",                 .kw_bytes_type          },
-    .{ "Bytes32",               .kw_bytes32             },
-    .{ "Bytes64",               .kw_bytes64             },
-    .{ "Signature",             .kw_signature           },
-    .{ "PublicKey",             .kw_pubkey              },
-    .{ "String",                .kw_string_type         },
-    .{ "ShortStr",              .kw_short_str           },
-    .{ "Label",                 .kw_label               },
-    .{ "Timestamp",             .kw_timestamp           },
-    .{ "Duration",              .kw_duration            },
-    .{ "BlockNumber",           .kw_block_number        },
-    .{ "Epoch",                 .kw_epoch               },
-    .{ "Slot",                  .kw_slot                },
-    .{ "price9",                .kw_price9              },
-    .{ "price18",               .kw_price18             },
-    .{ "percent",               .kw_percent             },
-    .{ "Fixed",                 .kw_fixed               },
-    .{ "Result",                .kw_result_type         },
-    .{ "Map",                   .kw_map                 },
-    .{ "EnumMap",               .kw_enum_map            },
-    .{ "List",                  .kw_list                },
-    .{ "Set",                   .kw_set                 },
-    .{ "Array",                 .kw_array               },
+    .{ "u8", .kw_u8 },
+    .{ "u16", .kw_u16 },
+    .{ "u32", .kw_u32 },
+    .{ "u64", .kw_u64 },
+    .{ "u128", .kw_u128 },
+    .{ "u256", .kw_u256 },
+    .{ "uint", .kw_uint },
+    .{ "i8", .kw_i8 },
+    .{ "i16", .kw_i16 },
+    .{ "i32", .kw_i32 },
+    .{ "i64", .kw_i64 },
+    .{ "i128", .kw_i128 },
+    .{ "i256", .kw_i256 },
+    .{ "int", .kw_int },
+    .{ "bool", .kw_bool },
+    .{ "Account", .kw_account_type },
+    .{ "Wallet", .kw_wallet_type },
+    .{ "Program", .kw_program_type },
+    .{ "System", .kw_system_acc },
+    .{ "Hash", .kw_hash_type },
+    .{ "Hash20", .kw_hash20 },
+    .{ "Commitment", .kw_commitment },
+    .{ "byte", .kw_byte_type },
+    .{ "Bytes", .kw_bytes_type },
+    .{ "Bytes32", .kw_bytes32 },
+    .{ "Bytes64", .kw_bytes64 },
+    .{ "Signature", .kw_signature },
+    .{ "PublicKey", .kw_pubkey },
+    .{ "String", .kw_string_type },
+    .{ "ShortStr", .kw_short_str },
+    .{ "Label", .kw_label },
+    .{ "Timestamp", .kw_timestamp },
+    .{ "Duration", .kw_duration },
+    .{ "BlockNumber", .kw_block_number },
+    .{ "Epoch", .kw_epoch },
+    .{ "Slot", .kw_slot },
+    .{ "price9", .kw_price9 },
+    .{ "price18", .kw_price18 },
+    .{ "percent", .kw_percent },
+    .{ "Fixed", .kw_fixed },
+    .{ "Result", .kw_result_type },
+    .{ "Map", .kw_map },
+    .{ "EnumMap", .kw_enum_map },
+    .{ "List", .kw_list },
+    .{ "Set", .kw_set },
+    .{ "Array", .kw_array },
     // Asset operations
-    .{ "send",                  .kw_send                },
-    .{ "to",                    .kw_to                  },
-    .{ "pay",                   .kw_pay                 },
-    .{ "from",                  .kw_from                },
-    .{ "move",                  .kw_move                },
-    .{ "burn",                  .kw_burn                },
-    .{ "split",                 .kw_split               },
-    .{ "wrap",                  .kw_wrap                },
-    .{ "unwrap",                .kw_unwrap              },
-    .{ "merge",                 .kw_merge               },
-    .{ "tell",                  .kw_tell                },
-    .{ "throw",                 .kw_throw               },
-    .{ "schedule",              .kw_schedule            },
-    .{ "remove",                .kw_remove              },
-    .{ "close",                 .kw_close               },
-    .{ "freeze",                .kw_freeze              },
-    .{ "unfreeze",              .kw_unfreeze            },
-    .{ "expand",                .kw_expand              },
-    .{ "transfer_ownership",    .kw_transfer_ownership  },
+    .{ "send", .kw_send },
+    .{ "to", .kw_to },
+    .{ "pay", .kw_pay },
+    .{ "from", .kw_from },
+    .{ "move", .kw_move },
+    .{ "burn", .kw_burn },
+    .{ "split", .kw_split },
+    .{ "wrap", .kw_wrap },
+    .{ "unwrap", .kw_unwrap },
+    .{ "merge", .kw_merge },
+    .{ "tell", .kw_tell },
+    .{ "throw", .kw_throw },
+    .{ "schedule", .kw_schedule },
+    .{ "remove", .kw_remove },
+    .{ "close", .kw_close },
+    .{ "freeze", .kw_freeze },
+    .{ "unfreeze", .kw_unfreeze },
+    .{ "expand", .kw_expand },
+    .{ "transfer_ownership", .kw_transfer_ownership },
     // Duration units
-    .{ "millisecond",           .kw_millisecond         },
-    .{ "milliseconds",          .kw_milliseconds        },
-    .{ "second",                .kw_second              },
-    .{ "seconds",               .kw_seconds             },
-    .{ "minute",                .kw_minute              },
-    .{ "minutes",               .kw_minutes             },
-    .{ "hour",                  .kw_hour                },
-    .{ "hours",                 .kw_hours               },
-    .{ "day",                   .kw_day                 },
-    .{ "days",                  .kw_days                },
-    .{ "week",                  .kw_week                },
-    .{ "weeks",                 .kw_weeks               },
-    .{ "month",                 .kw_month               },
-    .{ "months",                .kw_months              },
-    .{ "year",                  .kw_year                },
-    .{ "years",                 .kw_years               },
+    .{ "millisecond", .kw_millisecond },
+    .{ "milliseconds", .kw_milliseconds },
+    .{ "second", .kw_second },
+    .{ "seconds", .kw_seconds },
+    .{ "minute", .kw_minute },
+    .{ "minutes", .kw_minutes },
+    .{ "hour", .kw_hour },
+    .{ "hours", .kw_hours },
+    .{ "day", .kw_day },
+    .{ "days", .kw_days },
+    .{ "week", .kw_week },
+    .{ "weeks", .kw_weeks },
+    .{ "month", .kw_month },
+    .{ "months", .kw_months },
+    .{ "year", .kw_year },
+    .{ "years", .kw_years },
     // Misc
-    .{ "use",                   .kw_use                 },
-    .{ "define",                .kw_define              },
-    .{ "as",                    .kw_as                  },
-    .{ "let",                   .kw_let                 },
-    .{ "alias",                 .kw_alias               },
-    .{ "gives",                 .kw_gives               },
-    .{ "ok",                    .kw_ok                  },
-    .{ "fail",                  .kw_fail                },
-    .{ "deployer",              .kw_deployer            },
-    .{ "caller",                .kw_caller              },
-    .{ "value",                 .kw_value_kw            },
-    .{ "now",                   .kw_now                 },
-    .{ "current_block",         .kw_current_block       },
-    .{ "gas_remaining",         .kw_gas_remaining       },
-    .{ "indexed",               .kw_indexed             },
-    .{ "since_version",         .kw_since_version       },
-    .{ "parallel",              .kw_parallel            },
-    .{ "where",                 .kw_where               },
-    .{ "follows",               .kw_follows             },
-    .{ "debit",                 .kw_debit               },
-    .{ "credit",                .kw_credit              },
+    .{ "use", .kw_use },
+    .{ "define", .kw_define },
+    .{ "as", .kw_as },
+    .{ "let", .kw_let },
+    .{ "alias", .kw_alias },
+    .{ "gives", .kw_gives },
+    .{ "ok", .kw_ok },
+    .{ "fail", .kw_fail },
+    .{ "deployer", .kw_deployer },
+    .{ "caller", .kw_caller },
+    .{ "value", .kw_value_kw },
+    .{ "now", .kw_now },
+    .{ "current_block", .kw_current_block },
+    .{ "gas_remaining", .kw_gas_remaining },
+    .{ "indexed", .kw_indexed },
+    .{ "since_version", .kw_since_version },
+    .{ "parallel", .kw_parallel },
+    .{ "where", .kw_where },
+    .{ "follows", .kw_follows },
+    .{ "debit", .kw_debit },
+    .{ "credit", .kw_credit },
     // Novel features
-    .{ "conserves",             .kw_conserves           },
-    .{ "sum",                   .kw_sum                 },
-    .{ "count",                 .kw_count_fn            },
-    .{ "max_val",               .kw_max_val             },
-    .{ "at_all_times",          .kw_at_all_times        },
-    .{ "complexity",            .kw_complexity          },
-    .{ "adversary",             .kw_adversary           },
-    .{ "tries",                 .kw_tries               },
-    .{ "attack",                .kw_attack              },
-    .{ "call",                  .kw_call                },
-    .{ "expects",               .kw_expects             },
+    .{ "conserves", .kw_conserves },
+    .{ "sum", .kw_sum },
+    .{ "count", .kw_count_fn },
+    .{ "max_val", .kw_max_val },
+    .{ "at_all_times", .kw_at_all_times },
+    .{ "complexity", .kw_complexity },
+    .{ "adversary", .kw_adversary },
+    .{ "tries", .kw_tries },
+    .{ "attack", .kw_attack },
+    .{ "call", .kw_call },
+    .{ "expects", .kw_expects },
     .{ "conservation_violated", .kw_conservation_violated },
-    .{ "action_blocked",        .kw_action_blocked      },
-    .{ "invariant_broken",      .kw_invariant_broken    },
-    .{ "capability",            .kw_capability          },
-    .{ "global_invariant",      .kw_global_invariant    },
+    .{ "action_blocked", .kw_action_blocked },
+    .{ "invariant_broken", .kw_invariant_broken },
+    .{ "capability", .kw_capability },
+    .{ "global_invariant", .kw_global_invariant },
     // Contract terminator
-    .{ "End",                   .kw_end                 },
+    .{ "End", .kw_end },
     // Fallback / Receive (Spec Part 5.13)
-    .{ "fallback",              .kw_fallback            },
-    .{ "receive",               .kw_receive             },
+    .{ "fallback", .kw_fallback },
+    .{ "receive", .kw_receive },
     // Oracle & VRF
-    .{ "oracle",                .kw_oracle              },
-    .{ "vrf_random",            .kw_vrf_random          },
+    .{ "oracle", .kw_oracle },
+    .{ "vrf_random", .kw_vrf_random },
     // ZK Annotations
-    .{ "zk_proof",              .kw_zk_proof            },
-    .{ "private",               .kw_private             },
-    .{ "verify",                .kw_verify              },
-    .{ "against",               .kw_against             },
+    .{ "zk_proof", .kw_zk_proof },
+    .{ "private", .kw_private },
+    .{ "verify", .kw_verify },
+    .{ "against", .kw_against },
 });
 
 /// Look up whether a source word is a reserved keyword.
@@ -579,15 +621,15 @@ pub fn tokenKindOf(word: []const u8) ?TokenKind {
 /// The ZEPH lexer.  Call `init` then `tokenize`.
 pub const Lexer = struct {
     /// The complete source text.
-    source:  []const u8,
+    source: []const u8,
     /// Current byte offset into `source`.
-    pos:     usize,
+    pos: usize,
     /// Current 1-based line number (updated on each `\n`).
-    line:    u32,
+    line: u32,
     /// Current 1-based column number (byte offset within line).
-    col:     u32,
+    col: u32,
     /// File path shown in diagnostics.
-    file:    []const u8,
+    file: []const u8,
 
     // ── Lifecycle ─────────────────────────────────────────────────────────
 
@@ -596,10 +638,10 @@ pub const Lexer = struct {
     pub fn init(source: []const u8, file: []const u8) Lexer {
         return .{
             .source = source,
-            .pos    = 0,
-            .line   = 1,
-            .col    = 1,
-            .file   = file,
+            .pos = 0,
+            .line = 1,
+            .col = 1,
+            .file = file,
         };
     }
 
@@ -613,9 +655,9 @@ pub const Lexer = struct {
     ///
     /// The caller owns the returned slice; free with `allocator.free(tokens)`.
     pub fn tokenize(
-        self:      *Lexer,
+        self: *Lexer,
         allocator: std.mem.Allocator,
-        diags:     *DiagnosticList,
+        diags: *DiagnosticList,
     ) anyerror![]Token {
         var list: std.ArrayListUnmanaged(Token) = .{};
         errdefer list.deinit(allocator);
@@ -632,9 +674,9 @@ pub const Lexer = struct {
     // ── Internal: top-level token dispatcher ─────────────────────────────
 
     fn nextToken(
-        self:      *Lexer,
+        self: *Lexer,
         allocator: std.mem.Allocator,
-        diags:     *DiagnosticList,
+        diags: *DiagnosticList,
     ) anyerror!Token {
         // Skip whitespace (but track newlines for line/col).
         self.skipWhitespace();
@@ -643,10 +685,10 @@ pub const Lexer = struct {
             return self.makeTokenAt(.eof, self.pos, self.line, self.col);
         }
 
-        const start      = self.pos;
+        const start = self.pos;
         const start_line = self.line;
-        const start_col  = self.col;
-        const ch         = self.source[self.pos];
+        const start_col = self.col;
+        const ch = self.source[self.pos];
 
         // ── Comments ───────────────────────────────────────────────────
         if (ch == '/' and self.pos + 1 < self.source.len) {
@@ -692,11 +734,11 @@ pub const Lexer = struct {
             const c = self.source[self.pos];
             if (c == '\n') {
                 self.line += 1;
-                self.col   = 1;
-                self.pos  += 1;
+                self.col = 1;
+                self.pos += 1;
             } else if (c == ' ' or c == '\t' or c == '\r') {
-                self.col  += 1;
-                self.pos  += 1;
+                self.col += 1;
+                self.pos += 1;
             } else {
                 break;
             }
@@ -706,11 +748,11 @@ pub const Lexer = struct {
     // ── Comments ──────────────────────────────────────────────────────────
 
     fn scanLineComment(
-        self:       *Lexer,
-        start:      usize,
+        self: *Lexer,
+        start: usize,
         start_line: u32,
-        start_col:  u32,
-        kind:       TokenKind,
+        start_col: u32,
+        kind: TokenKind,
     ) Token {
         // Consume to end of line (but not the newline itself).
         while (self.pos < self.source.len and self.source[self.pos] != '\n') {
@@ -721,12 +763,12 @@ pub const Lexer = struct {
     }
 
     fn scanBlockComment(
-        self:       *Lexer,
-        start:      usize,
+        self: *Lexer,
+        start: usize,
         start_line: u32,
-        start_col:  u32,
-        allocator:  std.mem.Allocator,
-        diags:      *DiagnosticList,
+        start_col: u32,
+        allocator: std.mem.Allocator,
+        diags: *DiagnosticList,
     ) anyerror!Token {
         // Consume `/*`.
         self.pos += 2;
@@ -735,18 +777,18 @@ pub const Lexer = struct {
 
         while (self.pos + 1 < self.source.len) {
             if (self.source[self.pos] == '/' and self.source[self.pos + 1] == '*') {
-                depth    += 1;
+                depth += 1;
                 self.pos += 2;
                 self.col += 2;
             } else if (self.source[self.pos] == '*' and self.source[self.pos + 1] == '/') {
-                depth    -= 1;
+                depth -= 1;
                 self.pos += 2;
                 self.col += 2;
                 if (depth == 0) break;
             } else if (self.source[self.pos] == '\n') {
                 self.line += 1;
-                self.col   = 1;
-                self.pos  += 1;
+                self.col = 1;
+                self.pos += 1;
             } else {
                 self.col += 1;
                 self.pos += 1;
@@ -754,8 +796,7 @@ pub const Lexer = struct {
         }
 
         if (depth != 0) {
-            try self.emitDiag(diags, allocator, error.UnterminatedString,
-                start, start_line, start_col, 1, "unterminated block comment");
+            try self.emitDiag(diags, allocator, error.UnterminatedString, start, start_line, start_col, 1, "unterminated block comment");
             return self.makeTokenAt(.error_token, start, start_line, start_col);
         }
 
@@ -765,10 +806,10 @@ pub const Lexer = struct {
     // ── Numbers ───────────────────────────────────────────────────────────
 
     fn scanNumber(
-        self:       *Lexer,
-        start:      usize,
+        self: *Lexer,
+        start: usize,
         start_line: u32,
-        start_col:  u32,
+        start_col: u32,
     ) Token {
         // Check for 0x (hex) or 0b (binary) prefix.
         if (self.source[self.pos] == '0' and self.pos + 1 < self.source.len) {
@@ -824,12 +865,12 @@ pub const Lexer = struct {
     // ── Strings ───────────────────────────────────────────────────────────
 
     fn scanString(
-        self:       *Lexer,
-        start:      usize,
+        self: *Lexer,
+        start: usize,
         start_line: u32,
-        start_col:  u32,
-        allocator:  std.mem.Allocator,
-        diags:      *DiagnosticList,
+        start_col: u32,
+        allocator: std.mem.Allocator,
+        diags: *DiagnosticList,
     ) anyerror!Token {
         self.advance(); // consume opening `"`.
 
@@ -841,8 +882,7 @@ pub const Lexer = struct {
             }
             if (c == '\n') {
                 // Unterminated — do not consume the newline.
-                try self.emitDiag(diags, allocator, error.UnterminatedString,
-                    start, start_line, start_col, 1, "unterminated string literal");
+                try self.emitDiag(diags, allocator, error.UnterminatedString, start, start_line, start_col, 1, "unterminated string literal");
                 return self.makeTokenAt(.error_token, start, start_line, start_col);
             }
             if (c == '\\') {
@@ -855,37 +895,36 @@ pub const Lexer = struct {
         }
 
         // Reached EOF inside a string.
-        try self.emitDiag(diags, allocator, error.UnterminatedString,
-            start, start_line, start_col, 1, "unterminated string literal (unexpected EOF)");
+        try self.emitDiag(diags, allocator, error.UnterminatedString, start, start_line, start_col, 1, "unterminated string literal (unexpected EOF)");
         return self.makeTokenAt(.error_token, start, start_line, start_col);
     }
 
     // ── Identifiers & keywords ────────────────────────────────────────────
 
     fn scanIdentOrKeyword(
-        self:       *Lexer,
-        start:      usize,
+        self: *Lexer,
+        start: usize,
         start_line: u32,
-        start_col:  u32,
+        start_col: u32,
     ) Token {
         while (self.pos < self.source.len and isIdentCont(self.source[self.pos])) {
             self.col += 1;
             self.pos += 1;
         }
         const word = self.source[start..self.pos];
-        const kind  = tokenKindOf(word) orelse .identifier;
+        const kind = tokenKindOf(word) orelse .identifier;
         return self.makeTokenAt(kind, start, start_line, start_col);
     }
 
     // ── Punctuation & operators ───────────────────────────────────────────
 
     fn scanPunct(
-        self:       *Lexer,
-        start:      usize,
+        self: *Lexer,
+        start: usize,
         start_line: u32,
-        start_col:  u32,
-        allocator:  std.mem.Allocator,
-        diags:      *DiagnosticList,
+        start_col: u32,
+        allocator: std.mem.Allocator,
+        diags: *DiagnosticList,
     ) anyerror!Token {
         const ch = self.source[self.pos];
         self.advance();
@@ -898,8 +937,8 @@ pub const Lexer = struct {
                 }
                 return self.makeTokenAt(.colon, start, start_line, start_col);
             },
-            ';' => return self.makeTokenAt(.semicolon,   start, start_line, start_col),
-            ',' => return self.makeTokenAt(.comma,        start, start_line, start_col),
+            ';' => return self.makeTokenAt(.semicolon, start, start_line, start_col),
+            ',' => return self.makeTokenAt(.comma, start, start_line, start_col),
             '.' => {
                 if (self.pos < self.source.len and self.source[self.pos] == '.') {
                     self.advance();
@@ -907,19 +946,19 @@ pub const Lexer = struct {
                 }
                 return self.makeTokenAt(.dot, start, start_line, start_col);
             },
-            '(' => return self.makeTokenAt(.lparen,       start, start_line, start_col),
-            ')' => return self.makeTokenAt(.rparen,       start, start_line, start_col),
-            '[' => return self.makeTokenAt(.lbracket,     start, start_line, start_col),
-            ']' => return self.makeTokenAt(.rbracket,     start, start_line, start_col),
-            '{' => return self.makeTokenAt(.lbrace,       start, start_line, start_col),
-            '}' => return self.makeTokenAt(.rbrace,       start, start_line, start_col),
-            '?' => return self.makeTokenAt(.question,     start, start_line, start_col),
-            '@' => return self.makeTokenAt(.at_sign,      start, start_line, start_col),
-            '#' => return self.makeTokenAt(.hash_sym,     start, start_line, start_col),
-            '|' => return self.makeTokenAt(.pipe,         start, start_line, start_col),
-            '&' => return self.makeTokenAt(.ampersand,    start, start_line, start_col),
-            '~' => return self.makeTokenAt(.tilde,        start, start_line, start_col),
-            '\\' => return self.makeTokenAt(.backslash,   start, start_line, start_col),
+            '(' => return self.makeTokenAt(.lparen, start, start_line, start_col),
+            ')' => return self.makeTokenAt(.rparen, start, start_line, start_col),
+            '[' => return self.makeTokenAt(.lbracket, start, start_line, start_col),
+            ']' => return self.makeTokenAt(.rbracket, start, start_line, start_col),
+            '{' => return self.makeTokenAt(.lbrace, start, start_line, start_col),
+            '}' => return self.makeTokenAt(.rbrace, start, start_line, start_col),
+            '?' => return self.makeTokenAt(.question, start, start_line, start_col),
+            '@' => return self.makeTokenAt(.at_sign, start, start_line, start_col),
+            '#' => return self.makeTokenAt(.hash_sym, start, start_line, start_col),
+            '|' => return self.makeTokenAt(.pipe, start, start_line, start_col),
+            '&' => return self.makeTokenAt(.ampersand, start, start_line, start_col),
+            '~' => return self.makeTokenAt(.tilde, start, start_line, start_col),
+            '\\' => return self.makeTokenAt(.backslash, start, start_line, start_col),
             '-' => {
                 if (self.pos < self.source.len and self.source[self.pos] == '>') {
                     self.advance();
@@ -969,8 +1008,7 @@ pub const Lexer = struct {
             else => {
                 // Unknown character — error recovery.
                 const byte_len: u32 = @intCast(self.pos - start);
-                try self.emitDiag(diags, allocator, error.UnexpectedCharacter,
-                    start, start_line, start_col, byte_len, "unexpected character");
+                try self.emitDiag(diags, allocator, error.UnexpectedCharacter, start, start_line, start_col, byte_len, "unexpected character");
                 return self.makeTokenAt(.error_token, start, start_line, start_col);
             },
         }
@@ -987,13 +1025,13 @@ pub const Lexer = struct {
     /// Build a Token starting at `start` (byte offset) and ending at
     /// `self.pos`, attributed to `start_line` / `start_col`.
     fn makeTokenAt(
-        self:       *const Lexer,
-        kind:       TokenKind,
-        start:      usize,
+        self: *const Lexer,
+        kind: TokenKind,
+        start: usize,
         start_line: u32,
-        start_col:  u32,
+        start_col: u32,
     ) Token {
-        const end      = if (start > self.source.len) self.source.len else self.pos;
+        const end = if (start > self.source.len) self.source.len else self.pos;
         const byte_len: u32 = @intCast(end - start);
         return .{
             .kind = kind,
@@ -1013,25 +1051,25 @@ pub const Lexer = struct {
 
     /// Emit one Diagnostic for a lexical error.
     fn emitDiag(
-        self:       *Lexer,
-        diags:      *DiagnosticList,
-        allocator:  std.mem.Allocator,
-        kind:       CompileError,
-        start:      usize,
+        self: *Lexer,
+        diags: *DiagnosticList,
+        allocator: std.mem.Allocator,
+        kind: CompileError,
+        start: usize,
         start_line: u32,
-        start_col:  u32,
-        len:        u32,
+        start_col: u32,
+        len: u32,
         comptime msg: []const u8,
     ) anyerror!void {
-        const message     = try std.fmt.allocPrint(allocator, msg, .{});
+        const message = try std.fmt.allocPrint(allocator, msg, .{});
         const source_line = self.lineAt(start);
         try diags.add(.{
-            .file        = self.file,
-            .line        = start_line,
-            .col         = start_col,
-            .len         = len,
-            .kind        = kind,
-            .message     = message,
+            .file = self.file,
+            .line = start_line,
+            .col = start_col,
+            .len = len,
+            .kind = kind,
+            .message = message,
             .source_line = source_line,
         });
     }
@@ -1057,8 +1095,8 @@ inline fn isHexDigitOrUnderscore(c: u8) bool {
 /// Valid first character of an identifier or keyword.
 inline fn isIdentStart(c: u8) bool {
     return (c >= 'a' and c <= 'z') or
-           (c >= 'A' and c <= 'Z') or
-           c == '_';
+        (c >= 'A' and c <= 'Z') or
+        c == '_';
 }
 
 /// Valid continuation character of an identifier or keyword.
@@ -1087,10 +1125,10 @@ test "lex basic contract" {
     // Expected: kw_contract, identifier("Foo"), colon, eof
     try std.testing.expectEqual(@as(usize, 4), tokens.len);
     try std.testing.expectEqual(TokenKind.kw_contract, tokens[0].kind);
-    try std.testing.expectEqual(TokenKind.identifier,  tokens[1].kind);
-    try std.testing.expectEqualStrings("Foo",          tokens[1].text);
-    try std.testing.expectEqual(TokenKind.colon,       tokens[2].kind);
-    try std.testing.expectEqual(TokenKind.eof,         tokens[3].kind);
+    try std.testing.expectEqual(TokenKind.identifier, tokens[1].kind);
+    try std.testing.expectEqualStrings("Foo", tokens[1].text);
+    try std.testing.expectEqual(TokenKind.colon, tokens[2].kind);
+    try std.testing.expectEqual(TokenKind.eof, tokens[3].kind);
     // Verify spans are 1-based.
     try std.testing.expectEqual(@as(u32, 1), tokens[0].span.line);
     try std.testing.expectEqual(@as(u32, 1), tokens[0].span.col);
@@ -1101,30 +1139,30 @@ test "lex all keywords" {
 
     const Case = struct { src: []const u8, kind: TokenKind };
     const cases = [_]Case{
-        .{ .src = "version",           .kind = .kw_version     },
-        .{ .src = "action",            .kind = .kw_action       },
-        .{ .src = "when",              .kind = .kw_when         },
-        .{ .src = "yes",               .kind = .kw_yes          },
-        .{ .src = "no",                .kind = .kw_no           },
-        .{ .src = "not",               .kind = .kw_not          },
-        .{ .src = "and",               .kind = .kw_and          },
-        .{ .src = "or",                .kind = .kw_or           },
-        .{ .src = "equals",            .kind = .kw_equals       },
-        .{ .src = "nothing",           .kind = .kw_nothing      },
-        .{ .src = "something",         .kind = .kw_something    },
-        .{ .src = "owned_by",          .kind = .kw_owned_by     },
-        .{ .src = "held_by",           .kind = .kw_held_by      },
-        .{ .src = "u256",              .kind = .kw_u256         },
-        .{ .src = "Account",           .kind = .kw_account_type },
-        .{ .src = "send",              .kind = .kw_send         },
-        .{ .src = "days",              .kind = .kw_days         },
-        .{ .src = "gives",             .kind = .kw_gives        },
-        .{ .src = "caller",            .kind = .kw_caller       },
-        .{ .src = "deployer",          .kind = .kw_deployer     },
-        .{ .src = "freeze",            .kind = .kw_freeze       },
-        .{ .src = "parallel",          .kind = .kw_parallel     },
+        .{ .src = "version", .kind = .kw_version },
+        .{ .src = "action", .kind = .kw_action },
+        .{ .src = "when", .kind = .kw_when },
+        .{ .src = "yes", .kind = .kw_yes },
+        .{ .src = "no", .kind = .kw_no },
+        .{ .src = "not", .kind = .kw_not },
+        .{ .src = "and", .kind = .kw_and },
+        .{ .src = "or", .kind = .kw_or },
+        .{ .src = "equals", .kind = .kw_equals },
+        .{ .src = "nothing", .kind = .kw_nothing },
+        .{ .src = "something", .kind = .kw_something },
+        .{ .src = "owned_by", .kind = .kw_owned_by },
+        .{ .src = "held_by", .kind = .kw_held_by },
+        .{ .src = "u256", .kind = .kw_u256 },
+        .{ .src = "Account", .kind = .kw_account_type },
+        .{ .src = "send", .kind = .kw_send },
+        .{ .src = "days", .kind = .kw_days },
+        .{ .src = "gives", .kind = .kw_gives },
+        .{ .src = "caller", .kind = .kw_caller },
+        .{ .src = "deployer", .kind = .kw_deployer },
+        .{ .src = "freeze", .kind = .kw_freeze },
+        .{ .src = "parallel", .kind = .kw_parallel },
         .{ .src = "create_if_missing", .kind = .kw_create_if_missing },
-        .{ .src = "transfer_ownership",.kind = .kw_transfer_ownership },
+        .{ .src = "transfer_ownership", .kind = .kw_transfer_ownership },
     };
 
     for (cases) |c| {
@@ -1144,7 +1182,7 @@ test "lex integer literals with underscores" {
 
     try std.testing.expectEqual(@as(usize, 2), tokens.len); // literal + eof
     try std.testing.expectEqual(TokenKind.int_literal, tokens[0].kind);
-    try std.testing.expectEqualStrings("1_000_000",    tokens[0].text);
+    try std.testing.expectEqualStrings("1_000_000", tokens[0].text);
 }
 
 test "lex hex address" {
@@ -1157,7 +1195,7 @@ test "lex hex address" {
 
     try std.testing.expectEqual(@as(usize, 2), tokens.len);
     try std.testing.expectEqual(TokenKind.hex_literal, tokens[0].kind);
-    try std.testing.expectEqualStrings(addr,           tokens[0].text);
+    try std.testing.expectEqualStrings(addr, tokens[0].text);
 }
 
 test "lex string" {
@@ -1181,9 +1219,9 @@ test "lex duration" {
 
     try std.testing.expectEqual(@as(usize, 3), tokens.len);
     try std.testing.expectEqual(TokenKind.int_literal, tokens[0].kind);
-    try std.testing.expectEqualStrings("30",           tokens[0].text);
-    try std.testing.expectEqual(TokenKind.kw_days,     tokens[1].kind);
-    try std.testing.expectEqual(TokenKind.eof,         tokens[2].kind);
+    try std.testing.expectEqualStrings("30", tokens[0].text);
+    try std.testing.expectEqual(TokenKind.kw_days, tokens[1].kind);
+    try std.testing.expectEqual(TokenKind.eof, tokens[2].kind);
 }
 
 test "lex annotation" {
@@ -1194,12 +1232,10 @@ test "lex annotation" {
     defer allocator.free(tokens);
 
     try std.testing.expectEqual(@as(usize, 5), tokens.len);
-    try std.testing.expectEqual(TokenKind.hash_sym,    tokens[0].kind);
-    try std.testing.expectEqual(TokenKind.lbracket,    tokens[1].kind);
+    try std.testing.expectEqual(TokenKind.hash_sym, tokens[0].kind);
+    try std.testing.expectEqual(TokenKind.lbracket, tokens[1].kind);
     try std.testing.expectEqual(TokenKind.kw_parallel, tokens[2].kind);
-    try std.testing.expectEqualStrings("parallel",     tokens[2].text);
-    try std.testing.expectEqual(TokenKind.rbracket,    tokens[3].kind);
-    try std.testing.expectEqual(TokenKind.eof,         tokens[4].kind);
+    try std.testing.expectEqualStrings("parallel", tokens[2].text);
+    try std.testing.expectEqual(TokenKind.rbracket, tokens[3].kind);
+    try std.testing.expectEqual(TokenKind.eof, tokens[4].kind);
 }
-
-

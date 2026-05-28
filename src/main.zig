@@ -6,6 +6,7 @@
 // the compilation pipeline, and writes the .fozbin output.
 //
 // SPEC REFERENCE: Part 5 (Contract Anatomy), full pipeline.
+// SPEC REFERENCE: Part 14.5 — Contract Integration Testing.
 //
 // Usage:  forgec <input.foz> [options]
 
@@ -21,6 +22,7 @@ const mir = @import("mir.zig");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const abi = @import("abi.zig");
+const mod_resolver = @import("module_resolver.zig");
 
 const DiagnosticList = errors.DiagnosticList;
 const TypeResolver = types.TypeResolver;
@@ -197,10 +199,38 @@ pub fn compile(
         return null;
     }
 
+    // ── Stage 2b: Module import resolution ───────────────────────────────
+    const source_dir = if (std.fs.path.dirname(file)) |d|
+        try temp_alloc.dupe(u8, d)
+    else
+        try temp_alloc.dupe(u8, ".");
+    var mod_resv = mod_resolver.ModuleResolver.init(temp_alloc, &diagnostics, source_dir);
+    defer mod_resv.deinit();
+    const resolved_all = mod_resv.resolveAll(top_levels) catch |err| {
+        try printDiagnostics(&diagnostics);
+        return err;
+    };
+    const all_top_levels = resolved_all.merged_top_levels;
+    const file_modules = resolved_all.file_modules;
+
     // ── Stage 3: Type resolution ─────────────────────────────────────────
     var resolver = TypeResolver.init(temp_alloc, &diagnostics);
     defer resolver.deinit();
-    try resolver.registerTopLevel(top_levels);
+    // Register file-based module namespaces.
+    {
+        var iter = file_modules.iterator();
+        while (iter.next()) |entry| {
+            const mod = entry.value_ptr.*;
+            try resolver.global_scope.define(mod.module_name, .{
+                .name = mod.module_name,
+                .kind = .module,
+                .type_ = .void_,
+                .span = .{ .line = 0, .col = 0, .len = 0 },
+                .mutable = false,
+            });
+        }
+    }
+    try resolver.registerTopLevel(all_top_levels);
 
     // ── Stage 4: Find components ─────────────────────────────────────────
     var contract_ptr: ?*const ast.ContractDef = null;
@@ -271,16 +301,6 @@ pub fn compile(
         gen.mir_events = mir_module.events;
         const tmp_bin = try gen.generateFromMir(&mir_module);
         binary = try alloc.dupe(u8, tmp_bin);
-    // } else if (std.mem.eql(u8, opts.target, "polkavm")) {
-    //     // ── MIR-based PolkaVM pipeline: AST → MIR → RISC-V bytecode ──
-    //     var lowerer = mir.MirLowerer.init(temp_alloc, &resolver, &diagnostics);
-    //     defer lowerer.deinit();
-    //     const mir_module = try lowerer.lowerAll(contract, asset_slice, invariant_slice);
-
-    //     var gen = CodeGenPolkaVM.init(temp_alloc, &diagnostics, &resolver);
-    //     defer gen.deinit();
-    //     const tmp_bin = try gen.generateFromMir(&mir_module);
-    //     binary = try alloc.dupe(u8, tmp_bin);
     } else {
         // ── MIR-based Zephyria pipeline: AST → MIR → RISC-V bytecode ──
         var lowerer = mir.MirLowerer.init(temp_alloc, &resolver, &diagnostics);
@@ -289,7 +309,7 @@ pub fn compile(
 
         var gen = CodeGen.init(temp_alloc, &diagnostics, &resolver);
         defer gen.deinit();
-        const tmp_bin = try gen.generateFromMir(&mir_module, &checked);
+        const tmp_bin = try gen.generateFromMir(&mir_module);
         binary = try alloc.dupe(u8, tmp_bin);
     }
 
@@ -398,14 +418,18 @@ fn errorCodeFromDiag(d: errors.Diagnostic) u16 {
         error.ImmutableFieldViolation => 29,
         error.InvalidAnnotationArgument => 30,
         error.InvalidHookSignature => 31,
+        error.IllegalInView => 32,
+        error.ImportNotFound => 33,
+        error.ImportCollision => 34,
+        error.CyclicImport => 35,
         // Novel features
-        error.ConservationViolated => 32,
-        error.ComplexityViolated => 33,
-        error.AttackSucceeded => 34,
-        error.AttackBlocked => 35,
+        error.ConservationViolated => 36,
+        error.ComplexityViolated => 37,
+        error.AttackSucceeded => 38,
+        error.AttackBlocked => 39,
         // General
-        error.OutOfMemory => 36,
-        error.InternalError => 37,
+        error.OutOfMemory => 40,
+        error.InternalError => 41,
     };
 }
 
@@ -488,11 +512,8 @@ fn deriveOutputPath(input_path: []const u8, target: []const u8, alloc: std.mem.A
     }
 
     var ext: []const u8 = undefined;
-    // if (std.mem.eql(u8, target, "polkavm")) {
-    //     ext = ".polkavm";
-    // } else if (std.mem.eql(u8, target, "evm")) {
     if (std.mem.eql(u8, target, "evm")) {
-        ext = ".bin"; // EVM usually uses .bin
+        ext = ".bin";
     } else {
         ext = ".fozbin";
     }
@@ -553,44 +574,35 @@ pub fn main() anyerror!void {
     }
     const alloc = gpa.allocator();
 
-    // ── Argument parsing ─────────────────────────────────────────────────
+    // ── Parse arguments ──────────────────────────────────────────────────
     const args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, args);
 
-    const result = parseArgs(args);
-    switch (result) {
-        .exit_ok => return,
+    const arg_res = parseArgs(args);
+    switch (arg_res) {
+        .exit_ok => std.process.exit(0),
         .exit_err => std.process.exit(2),
-        .success => |s| {
-            const input_path = s.input_path;
-            const opts = s.opts;
+        .success => |res| {
+            const input_path = res.input_path;
+            const opts = res.opts;
 
-            // ── Read source file ─────────────────────────────────────────
-            const source = std.fs.cwd().readFileAlloc(alloc, input_path, 10 * 1024 * 1024) catch |err| {
+            // ── Read source ──────────────────────────────────────────────
+            const source = std.fs.cwd().readFileAlloc(alloc, input_path, 1 << 20) catch |err| {
                 std.debug.print("error: cannot read '{s}': {s}\n", .{ input_path, @errorName(err) });
                 std.process.exit(2);
             };
             defer alloc.free(source);
 
-            // ── Derive output path ───────────────────────────────────────
-            // Ensure target is treated as "evm" when --evm is provided
-            const effective_target = if (opts.evm_abi) "evm" else opts.target;
-            const output_path = if (opts.output) |o|
-                try alloc.dupe(u8, o)
-            else
-                try deriveOutputPath(input_path, effective_target, alloc);
-            defer alloc.free(output_path);
-
             // ── Compile ──────────────────────────────────────────────────
-            const compile_result = compile(source, input_path, opts, alloc) catch |err| {
-                std.debug.print("internal compiler error: {s}\n", .{@errorName(err)});
-                std.process.exit(3);
-            };
-
-            if (compile_result) |cr| {
+            const compile_res = try compile(source, input_path, opts, alloc);
+            if (compile_res) |cr| {
                 defer alloc.free(cr.binary);
-                defer if (cr.zeph_abi) |z| alloc.free(z);
-                defer if (cr.evm_abi) |e| alloc.free(e);
+                defer if (cr.zeph_abi) |zabi| alloc.free(zabi);
+                defer if (cr.evm_abi) |eabi| alloc.free(eabi);
+
+                // Determine output path
+                const output_path = if (opts.output) |o| try alloc.dupe(u8, o) else try deriveOutputPath(input_path, opts.target, alloc);
+                defer alloc.free(output_path);
 
                 if (opts.check_only or opts.print_tokens or opts.print_ast or opts.print_access) {
                     return;
@@ -711,6 +723,4 @@ test "compile minimal contract end to end" {
         // Contract name should be "Empty"
         try std.testing.expectEqualSlices(u8, "Empty", cr.binary[8..13]);
     }
-    // If result is null, there were parse/check errors which is also acceptable
-    // for a minimal contract since the parser may require more context
 }

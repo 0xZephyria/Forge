@@ -393,113 +393,118 @@ pub const ZephCustomOp = enum(u32) {
     // ── Storage (dispatch.zig 0x01-0x06) ─────────────────────────────
     /// SPEC: Part 5.2 — Load a state slot.
     /// a0=0x01, a1=key_ptr(32B), a2=result_ptr(32B)
-    STATE_READ           = 0x01,
+    STATE_READ = 0x01,
     /// SPEC: Part 5.2 — Store a state slot.
     /// a0=0x02, a1=key_ptr(32B), a2=value_ptr(32B)
-    STATE_WRITE          = 0x02,
+    STATE_WRITE = 0x02,
     /// SPEC: Part 5.2 — Load per-user derived state slot.
     /// a0=0x03, a1=user_addr_ptr(20B), a2=key_ptr(32B), a3=result_ptr(32B)
-    STATE_READ_DERIVED   = 0x03,
+    STATE_READ_DERIVED = 0x03,
     /// SPEC: Part 5.2 — Store per-user derived state slot.
     /// a0=0x04, a1=user_addr_ptr(20B), a2=key_ptr(32B), a3=value_ptr(32B)
-    STATE_WRITE_DERIVED  = 0x04,
+    STATE_WRITE_DERIVED = 0x04,
     /// SPEC: Part 5.2 — Load global commutative accumulator.
     /// a0=0x05, a1=key_ptr(32B), a2=result_ptr(32B)
-    STATE_READ_GLOBAL    = 0x05,
+    STATE_READ_GLOBAL = 0x05,
     /// SPEC: Part 5.2 — Update global commutative accumulator.
     /// a0=0x06, a1=key_ptr(32B), a2=delta_ptr(32B)
-    STATE_WRITE_GLOBAL   = 0x06,
+    STATE_WRITE_GLOBAL = 0x06,
 
     // ── Assets (dispatch.zig 0x10-0x16) ──────────────────────────────
     /// SPEC: Part 8.4 — Transfer a FORGE native asset.
     /// a0=0x10, a1=asset_id_ptr(32B), a2=from_ptr(20B), a3=to_ptr(20B), a4=amount_ptr(16B)
-    ASSET_TRANSFER       = 0x10,
+    ASSET_TRANSFER = 0x10,
     /// SPEC: Part 8.3 — Query asset balance.
     /// a0=0x11, a1=addr_ptr(20B), a2=result_ptr(32B)
-    ASSET_BALANCE        = 0x11,
+    ASSET_BALANCE = 0x11,
     /// SPEC: Part 8.3 — Create/mint a new asset token.
     /// a0=0x12, a1=asset_type_id, a2=to_ptr(20B), a3=amount_ptr(16B)
-    ASSET_MINT           = 0x12,
+    ASSET_MINT = 0x12,
     /// SPEC: Part 8.3 — Burn asset tokens.
     /// a0=0x13, a1=asset_id_ptr(32B), a2=from_ptr(20B), a3=amount_ptr(16B)
-    ASSET_BURN           = 0x13,
-    // Note: NATIVE_PAY uses ASSET_TRANSFER (0x10) — codegen passes zero asset ID.
+    ASSET_BURN = 0x13,
+    /// SPEC: Part 8.4 — FORGE-native asset send (simplified ABI).
+    /// a0=0x17, a1=asset_value(u64), a2=recipient_ptr(32B)
+    NATIVE_TRANSFER = 0x17,
 
     // ── Authority (dispatch.zig 0x20-0x23) ───────────────────────────
     /// SPEC: Part 7.3 — Check authority role of caller.
     /// a0=0x20, a1=role_hash_ptr(32B), a2=account_ptr(20B) → a0=1 if OK else revert
-    AUTH_CHECK           = 0x20,
+    AUTH_CHECK = 0x20,
     /// SPEC: Part 7.3 — Grant authority role.
     /// a0=0x21, a1=role_hash_ptr(32B), a2=account_ptr(20B)
-    AUTH_GRANT           = 0x21,
+    AUTH_GRANT = 0x21,
     /// SPEC: Part 7.3 — Revoke authority role.
     /// a0=0x22, a1=role_hash_ptr(32B), a2=account_ptr(20B)
-    AUTH_REVOKE          = 0x22,
+    AUTH_REVOKE = 0x22,
 
     // ── Events (dispatch.zig 0x30-0x31) ──────────────────────────────
     /// SPEC: Part 5.9 — Emit a contract event.
     /// a0=0x30, a1=topic_count, a2=topics_ptr, a3=data_ptr, a4=data_len
-    EMIT_EVENT           = 0x30,
+    EMIT_EVENT = 0x30,
     /// SPEC: Part 5.9 — Emit an indexed contract event.
     /// Same layout as EMIT_EVENT but with bloom-filter indexing.
-    EMIT_INDEXED_EVENT   = 0x31,
+    EMIT_INDEXED_EVENT = 0x31,
 
     // ── Cross-contract (dispatch.zig 0x40-0x43) ───────────────────────
     /// SPEC: Part 10.1 — Call another contract.
     /// a0=0x40, a1=to_ptr(20B), a2=selector, a3=calldata_ptr, a4=calldata_len
-    SCHEDULE_CALL        = 0x40,
+    CALL_CONTRACT = 0x40,
+    /// SPEC: Part 10.2 — Schedule a deferred call.
+    /// a0=0x45, a1=to_ptr(32B), a2=delay(u64), a3=calldata_ptr, a4=calldata_len
+    SCHEDULE_CALL = 0x45,
 
     // ── Execution control (dispatch.zig 0x50-0x51) ───────────────────
     /// SPEC: Part 6.6 — Revert transaction with data.
     /// a0=0x51, a1=data_ptr, a2=data_len
-    REVERT               = 0x51,
+    REVERT = 0x51,
 
     // ── Environment (dispatch.zig 0x60-0x6C) ─────────────────────────
     /// SPEC: Part 7.5 — Get msg.sender address.
     /// a0=0x60, a1=result_ptr(20B)
-    GET_CALLER           = 0x60,
+    GET_CALLER = 0x60,
     /// SPEC: Part 7.5 — Get msg.value (native currency attached).
     /// a0=0x61, a1=result_ptr(32B)
-    GET_VALUE            = 0x61,
+    GET_VALUE = 0x61,
     /// SPEC: Part 5.1 — Get this contract's address.
     /// a0=0x64, a1=result_ptr(20B)
-    GET_THIS             = 0x64,
+    GET_THIS = 0x64,
     /// SPEC: Part 14.3 — Get current block number.
     /// a0=0x65 → a0=block_number(u64)
-    GET_BLOCK            = 0x65,
+    GET_BLOCK = 0x65,
     /// SPEC: Part 14.3 — Get current timestamp.
     /// a0=0x66 → a0=timestamp(u64)
-    GET_NOW              = 0x66,
+    GET_NOW = 0x66,
     /// SPEC: Part 14.6 — Get remaining gas.
     /// a0=0x68 → a0=gas_remaining(u64)
-    GET_GAS              = 0x68,
+    GET_GAS = 0x68,
     /// SPEC: Part 14.4 — Get VRF randomness (prevrandao).
     /// a0=0x6C, a1=result_ptr(32B)
-    VRF_RANDOM           = 0x6C,
+    VRF_RANDOM = 0x6C,
 
     // ── Debug (dispatch.zig 0xFF, debug builds only) ──────────────────
     /// SPEC: Internal — Debug log (no-op in release).
     /// a0=0xFF, a1=msg_ptr, a2=msg_len
-    LOG_DIAGNOSTIC       = 0xFF,
+    LOG_DIAGNOSTIC = 0xFF,
 
     // ── Extended (0xA0 range, Forge-specific additions) ────────────────
     /// SPEC: Part 14.2 — Oracle price query.
     /// a0=0xA0, a1=feed_id(u32) → a2=result_ptr(32B)
-    ORACLE_QUERY         = 0xA0,
+    ORACLE_QUERY = 0xA0,
 
     // ── Forge VM extensions (0xB0 range) ──────────────────────────────
     /// SPEC: Part 12.2 — Verify a ZK proof against a named circuit.
     /// a0=0xB0, a1=circuit_id(u32), a2=proof_ptr, a3=proof_len → a0=1 if valid
-    ZK_VERIFY            = 0xB0,
+    ZK_VERIFY = 0xB0,
     /// SPEC: Part 14.6 — Delegate gas payment to a sponsor address.
     /// a0=0xB1, a1=payer_addr_ptr(20B)
-    DELEGATE_GAS         = 0xB1,
+    DELEGATE_GAS = 0xB1,
     /// SPEC: Part 3.10 — Expand account storage by N bytes.
     /// a0=0xB2, a1=account_ptr, a2=extra_bytes(u64)
-    EXPAND_ACCOUNT       = 0xB2,
+    EXPAND_ACCOUNT = 0xB2,
     /// SPEC: Part 3.10 — Close account, refunding lamports to recipient.
     /// a0=0xB3, a1=account_ptr, a2=refund_to_ptr(20B)
-    CLOSE_ACCOUNT        = 0xB3,
+    CLOSE_ACCOUNT = 0xB3,
 };
 
 /// SPEC: Part 5 — Emit a Zephyria syscall.
@@ -768,8 +773,7 @@ pub fn genLoadImmediate64(writer: *BytecodeWriter, rd: Reg, value: u64) anyerror
     try writer.emit(LUI(.t0, hi_hi20));
     try writer.emit(ADDI(.t0, .t0, hi_lo12));
     // Step 2: shift t0 left 32 into rd
-    const slli_32 = encodeI(32, .t0, F3_SLLI, rd, OP_IMM);
-    try writer.emit(slli_32);
+    try writer.emit(SLLI(rd, .t0, 32));
     // Step 3: OR in the lower 32 bits (if non-zero)
     if (lo32 != 0) {
         // lo32 may not fit in i12; use a second LUI+ADDI into t0 then OR
@@ -809,17 +813,18 @@ test "ZEPH() encodes correct syscall ID in a0" {
 test "ZEPH_SET_ID produces correct dispatch IDs" {
     // Verify a selection of syscall IDs against the dispatch.zig table
     const cases = [_]struct { op: ZephCustomOp, id: u12 }{
-        .{ .op = .STATE_READ,    .id = 0x01 },
-        .{ .op = .STATE_WRITE,   .id = 0x02 },
-        .{ .op = .ASSET_TRANSFER,.id = 0x10 },
-        .{ .op = .AUTH_CHECK,    .id = 0x20 },
-        .{ .op = .EMIT_EVENT,    .id = 0x30 },
-        .{ .op = .SCHEDULE_CALL, .id = 0x40 },
-        .{ .op = .REVERT,        .id = 0x51 },
-        .{ .op = .GET_CALLER,    .id = 0x60 },
-        .{ .op = .GET_NOW,       .id = 0x66 },
-        .{ .op = .GET_GAS,       .id = 0x68 },
-        .{ .op = .VRF_RANDOM,    .id = 0x6C },
+        .{ .op = .STATE_READ, .id = 0x01 },
+        .{ .op = .STATE_WRITE, .id = 0x02 },
+        .{ .op = .ASSET_TRANSFER, .id = 0x10 },
+        .{ .op = .AUTH_CHECK, .id = 0x20 },
+        .{ .op = .EMIT_EVENT, .id = 0x30 },
+        .{ .op = .CALL_CONTRACT, .id = 0x40 },
+        .{ .op = .SCHEDULE_CALL, .id = 0x45 },
+        .{ .op = .REVERT, .id = 0x51 },
+        .{ .op = .GET_CALLER, .id = 0x60 },
+        .{ .op = .GET_NOW, .id = 0x66 },
+        .{ .op = .GET_GAS, .id = 0x68 },
+        .{ .op = .VRF_RANDOM, .id = 0x6C },
     };
     for (cases) |c| {
         const instr = ZEPH_SET_ID(c.op);

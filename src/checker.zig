@@ -19,6 +19,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const errors = @import("errors.zig");
 const types = @import("types.zig");
+const modules = @import("modules.zig");
 
 const Span = ast.Span;
 const Expr = ast.Expr;
@@ -263,6 +264,10 @@ pub const Checker = struct {
     allocator: std.mem.Allocator,
     current_file: []const u8,
     forbidden_fields: ?[][]const u8 = null,
+    /// Tracks storage layout version across inheritance chain.
+    storage_version: u32 = 1,
+    /// Set by field_access when the object is a module, consumed by call handler.
+    pending_module_fn: ?struct { module_fn: modules.ModuleFn } = null,
 
     /// Create a new checker bound to a type resolver and diagnostic sink.
     pub fn init(
@@ -277,6 +282,7 @@ pub const Checker = struct {
             .allocator = allocator,
             .current_file = current_file,
             .forbidden_fields = null,
+            .storage_version = 1,
         };
     }
 
@@ -723,6 +729,17 @@ pub const Checker = struct {
                 return .void_;
             },
             .field_access => |fa| {
+                if (fa.object.kind == .identifier) {
+                    const obj_name = fa.object.kind.identifier;
+                    if (scope.lookup(obj_name)) |sym| {
+                        if (sym.kind == .module) {
+                            if (self.resolver.lookupModuleFn(obj_name, fa.field)) |fn_| {
+                                self.pending_module_fn = .{ .module_fn = fn_ };
+                                return modules.toResolvedType(fn_.return_type);
+                            }
+                        }
+                    }
+                }
                 const obj_ty = try self.checkExpr(fa.object, scope);
                 switch (obj_ty) {
                     .struct_ => |info| {
@@ -812,7 +829,53 @@ pub const Checker = struct {
                         return .u256;
                     }
                 }
+                // Resolve the callee first — this may set pending_module_fn.
                 _ = try self.checkExpr(c.callee, scope);
+                // Module function call (e.g., math.sqrt(x))
+                if (self.pending_module_fn) |pending| {
+                    self.pending_module_fn = null;
+                    const fn_info = pending.module_fn;
+                    if (c.args.len != fn_info.params.len) {
+                        const msg = try std.fmt.allocPrint(
+                            self.allocator,
+                            "module function '{s}' expects {d} argument(s), got {d}",
+                            .{ fn_info.name, fn_info.params.len, c.args.len },
+                        );
+                        try self.diagnostics.add(.{
+                            .file = self.current_file,
+                            .line = expr.span.line,
+                            .col = expr.span.col,
+                            .len = expr.span.len,
+                            .kind = CompileError.TypeMismatch,
+                            .message = msg,
+                            .source_line = "",
+                        });
+                    } else {
+                        for (c.args, fn_info.params) |arg, param| {
+                            const arg_ty = try self.checkExpr(arg.value, scope);
+                            const param_ty = modules.toResolvedType(param.type_);
+                            if (!self.resolver.isCompatible(arg_ty, param_ty) and
+                                !self.resolver.isCompatible(param_ty, arg_ty))
+                            {
+                                const msg = try std.fmt.allocPrint(
+                                self.allocator,
+                                "module function '{s}' parameter '{s}' type mismatch",
+                                .{ fn_info.name, param.name },
+                            );
+                                try self.diagnostics.add(.{
+                                    .file = self.current_file,
+                                    .line = arg.value.span.line,
+                                    .col = arg.value.span.col,
+                                    .len = arg.value.span.len,
+                                    .kind = CompileError.TypeMismatch,
+                                    .message = msg,
+                                    .source_line = "",
+                                });
+                            }
+                        }
+                    }
+                    return modules.toResolvedType(fn_info.return_type);
+                }
                 for (c.args) |arg| {
                     _ = try self.checkExpr(arg.value, scope);
                 }
@@ -1043,7 +1106,7 @@ pub const Checker = struct {
                 for (m.arms) |arm| {
                     // Patterns themselves are literals/names, but we should check if any arm body can leak (wait, match_expr body is Stmt)
                     // Actually, match_expr arms have values in Forge.
-                    _ = arm; 
+                    _ = arm;
                 }
                 return false;
             },
@@ -1125,7 +1188,7 @@ pub const Checker = struct {
                     .identifier => |id| if (scope.lookup(id)) |sym| sym.kind == .state_field else false,
                     else => false,
                 };
-                
+
                 if (target_is_mine and self.isPrivateTainted(asg.value, scope)) {
                     const field_name = switch (asg.target.kind) {
                         .field_access => |f| f.field,
@@ -1187,7 +1250,7 @@ pub const Checker = struct {
                     .identifier => |id| if (scope.lookup(id)) |sym| sym.kind == .state_field else false,
                     else => false,
                 };
-                
+
                 if (target_is_mine and self.isPrivateTainted(aug.value, scope)) {
                     const field_name = switch (aug.target.kind) {
                         .field_access => |f| f.field,
@@ -1410,21 +1473,21 @@ pub const Checker = struct {
     fn injectBuiltins(self: *Checker, scope: *SymbolTable, span: Span) anyerror!void {
         _ = self;
         const builtins = [_]struct { name: []const u8, type_: ResolvedType }{
-            .{ .name = "caller",        .type_ = .wallet },
-            .{ .name = "deployer",      .type_ = .account },
-            .{ .name = "value",         .type_ = .u256 },
-            .{ .name = "this",          .type_ = .program },
-            .{ .name = "zero_address",  .type_ = .account },
-            .{ .name = "now",           .type_ = .timestamp },
+            .{ .name = "caller", .type_ = .wallet },
+            .{ .name = "deployer", .type_ = .account },
+            .{ .name = "value", .type_ = .u256 },
+            .{ .name = "this", .type_ = .program },
+            .{ .name = "zero_address", .type_ = .account },
+            .{ .name = "now", .type_ = .timestamp },
             .{ .name = "current_block", .type_ = .block_number },
             .{ .name = "gas_remaining", .type_ = .u64 },
         };
         for (builtins) |b| {
             scope.define(b.name, .{
-                .name    = b.name,
-                .kind    = .parameter,
-                .type_   = b.type_,
-                .span    = span,
+                .name = b.name,
+                .kind = .parameter,
+                .type_ = b.type_,
+                .span = span,
                 .mutable = false,
             }) catch |err| switch (err) {
                 // Silently ignore duplicate — user param with same name shadows builtin
@@ -1669,9 +1732,61 @@ pub const Checker = struct {
                         var found = false;
                         for (contract.events) |contract_event| {
                             if (std.mem.eql(u8, contract_event.name, iface_event.name)) {
-                                if (contract_event.fields.len == iface_event.fields.len) {
-                                    found = true;
+                                if (contract_event.fields.len != iface_event.fields.len) {
+                                    const msg = try std.fmt.allocPrint(
+                                        self.allocator,
+                                        "event '{s}' has {d} fields but interface '{s}' requires {d}",
+                                        .{ contract_event.name, contract_event.fields.len, iface.name, iface_event.fields.len },
+                                    );
+                                    try self.diagnostics.add(.{
+                                        .file = self.current_file,
+                                        .line = contract_event.span.line,
+                                        .col = contract_event.span.col,
+                                        .len = contract_event.span.len,
+                                        .kind = CompileError.TypeMismatch,
+                                        .message = msg,
+                                        .source_line = "",
+                                    });
+                                } else {
+                                    for (contract_event.fields, 0..) |cf, i| {
+                                        const ef = iface_event.fields[i];
+                                        if (!std.mem.eql(u8, cf.name, ef.name)) {
+                                            const msg = try std.fmt.allocPrint(
+                                                self.allocator,
+                                                "event '{s}' field {d}: expected name '{s}' but found '{s}' per interface '{s}'",
+                                                .{ contract_event.name, i, ef.name, cf.name, iface.name },
+                                            );
+                                            try self.diagnostics.add(.{
+                                                .file = self.current_file,
+                                                .line = cf.span.line,
+                                                .col = cf.span.col,
+                                                .len = cf.span.len,
+                                                .kind = CompileError.TypeMismatch,
+                                                .message = msg,
+                                                .source_line = "",
+                                            });
+                                        }
+                                        const ctype = try self.resolver.resolve(cf.type_);
+                                        const etype = try self.resolver.resolve(ef.type_);
+                                        if (!self.resolver.isCompatible(ctype, etype)) {
+                                            const msg = try std.fmt.allocPrint(
+                                                self.allocator,
+                                                "event '{s}' field '{s}' type does not match interface '{s}'",
+                                                .{ contract_event.name, cf.name, iface.name },
+                                            );
+                                            try self.diagnostics.add(.{
+                                                .file = self.current_file,
+                                                .line = cf.span.line,
+                                                .col = cf.span.col,
+                                                .len = cf.span.len,
+                                                .kind = CompileError.TypeMismatch,
+                                                .message = msg,
+                                                .source_line = "",
+                                            });
+                                        }
+                                    }
                                 }
+                                found = true;
                                 break;
                             }
                         }
@@ -1696,6 +1811,42 @@ pub const Checker = struct {
                         var found = false;
                         for (contract.errors_) |contract_error| {
                             if (std.mem.eql(u8, contract_error.name, iface_error.name)) {
+                                if (contract_error.fields.len != iface_error.fields.len) {
+                                    const msg = try std.fmt.allocPrint(
+                                        self.allocator,
+                                        "error '{s}' has {d} fields but interface '{s}' requires {d}",
+                                        .{ contract_error.name, contract_error.fields.len, iface.name, iface_error.fields.len },
+                                    );
+                                    try self.diagnostics.add(.{
+                                        .file = self.current_file,
+                                        .line = contract_error.span.line,
+                                        .col = contract_error.span.col,
+                                        .len = contract_error.span.len,
+                                        .kind = CompileError.TypeMismatch,
+                                        .message = msg,
+                                        .source_line = "",
+                                    });
+                                } else {
+                                    for (contract_error.fields, 0..) |cf, i| {
+                                        const ef = iface_error.fields[i];
+                                        if (!std.mem.eql(u8, cf.name, ef.name)) {
+                                            const msg = try std.fmt.allocPrint(
+                                                self.allocator,
+                                                "error '{s}' field {d}: expected name '{s}' but found '{s}' per interface '{s}'",
+                                                .{ contract_error.name, i, ef.name, cf.name, iface.name },
+                                            );
+                                            try self.diagnostics.add(.{
+                                                .file = self.current_file,
+                                                .line = cf.span.line,
+                                                .col = cf.span.col,
+                                                .len = cf.span.len,
+                                                .kind = CompileError.TypeMismatch,
+                                                .message = msg,
+                                                .source_line = "",
+                                            });
+                                        }
+                                    }
+                                }
                                 found = true;
                                 break;
                             }
@@ -1739,7 +1890,7 @@ pub const Checker = struct {
                 const msg = try std.fmt.allocPrint(
                     self.allocator,
                     "contract '{s}' inherits from '{s}' which is not declared in this file",
-                    .{contract.name, parent_name},
+                    .{ contract.name, parent_name },
                 );
                 try self.diagnostics.add(.{
                     .file = self.current_file,
@@ -1754,9 +1905,42 @@ pub const Checker = struct {
             }
             const parent_contract = parent_opt.?;
 
+            // Track storage layout version across inheritance chain
+            self.storage_version += 1;
+
+            // Recursively resolve grandparent scope first
             try self.resolveInheritedScope(&parent_contract, scope, depth + 1);
 
+            // Collect parent's immutable fields for override checking
+            const parent_immutable = if (parent_contract.upgrade) |upg| upg.immutable_fields else &[_][]const u8{};
+
+            // Merge parent's state fields, marking as inherited
             for (parent_contract.state) |sf| {
+                // Check if child is trying to override an immutable parent field
+                for (parent_immutable) |imm_name| {
+                    if (std.mem.eql(u8, sf.name, imm_name)) {
+                        // Check if child also defines this field
+                        for (contract.state) |child_sf| {
+                            if (std.mem.eql(u8, child_sf.name, sf.name)) {
+                                const msg = try std.fmt.allocPrint(
+                                    self.allocator,
+                                    "cannot override immutable parent field '{s}'",
+                                    .{sf.name},
+                                );
+                                try self.diagnostics.add(.{
+                                    .file = self.current_file,
+                                    .line = child_sf.span.line,
+                                    .col = child_sf.span.col,
+                                    .len = child_sf.span.len,
+                                    .kind = CompileError.DuplicateDeclaration,
+                                    .message = msg,
+                                    .source_line = "",
+                                });
+                            }
+                        }
+                    }
+                }
+
                 const resolved = try self.resolver.resolve(sf.type_);
                 scope.define(sf.name, .{
                     .name = sf.name,
@@ -1764,25 +1948,31 @@ pub const Checker = struct {
                     .type_ = resolved,
                     .span = sf.span,
                     .mutable = true,
+                    .inherited = true,
                 }) catch |err| switch (err) {
                     error.DuplicateDeclaration => {},
                     else => return err,
                 };
             }
 
+            // Propagate inheritable authorities with holder forwarding
             for (parent_contract.authorities) |au| {
+                if (!au.inheritable) continue;
+
                 scope.define(au.name, .{
                     .name = au.name,
                     .kind = .authority,
                     .type_ = .void_,
                     .span = au.span,
                     .mutable = false,
+                    .inherited = true,
                 }) catch |err| switch (err) {
                     error.DuplicateDeclaration => {},
                     else => return err,
                 };
             }
 
+            // Inherit actions from parent (always, unless child overrides)
             for (parent_contract.actions) |ac| {
                 const resolved = if (ac.return_type) |rt| try self.resolver.resolve(rt) else ResolvedType.void_;
                 scope.define(ac.name, .{
@@ -1791,12 +1981,14 @@ pub const Checker = struct {
                     .type_ = resolved,
                     .span = ac.span,
                     .mutable = false,
+                    .inherited = true,
                 }) catch |err| switch (err) {
                     error.DuplicateDeclaration => {},
                     else => return err,
                 };
             }
 
+            // Inherit views from parent
             for (parent_contract.views) |vw| {
                 const resolved = if (vw.return_type) |rt| try self.resolver.resolve(rt) else ResolvedType.void_;
                 scope.define(vw.name, .{
@@ -1805,12 +1997,14 @@ pub const Checker = struct {
                     .type_ = resolved,
                     .span = vw.span,
                     .mutable = false,
+                    .inherited = true,
                 }) catch |err| switch (err) {
                     error.DuplicateDeclaration => {},
                     else => return err,
                 };
             }
 
+            // Inherit events from parent
             for (parent_contract.events) |ev| {
                 scope.define(ev.name, .{
                     .name = ev.name,
@@ -1818,12 +2012,14 @@ pub const Checker = struct {
                     .type_ = .void_,
                     .span = ev.span,
                     .mutable = false,
+                    .inherited = true,
                 }) catch |err| switch (err) {
                     error.DuplicateDeclaration => {},
                     else => return err,
                 };
             }
 
+            // Inherit guards from parent
             for (parent_contract.guards) |gd| {
                 scope.define(gd.name, .{
                     .name = gd.name,
@@ -1831,6 +2027,7 @@ pub const Checker = struct {
                     .type_ = .void_,
                     .span = gd.span,
                     .mutable = false,
+                    .inherited = true,
                 }) catch |err| switch (err) {
                     error.DuplicateDeclaration => {},
                     else => return err,
@@ -1948,8 +2145,31 @@ pub const Checker = struct {
                     .mutable = false,
                 });
             }
+            // Wire LinearTracker for view bodies — views must NOT consume linear assets
+            var linear_tracker = LinearTracker.init(self.allocator, self.current_file);
+            defer linear_tracker.deinit();
             for (view.body) |stmt| {
                 try self.checkStmt(&stmt, &view_scope, contract);
+                try self.trackLinearInStmt(&stmt, &linear_tracker);
+            }
+            // Verify no linear assets were consumed in the view (read-only enforcement)
+            var consumed_it = linear_tracker.consumed.iterator();
+            while (consumed_it.next()) |entry| {
+                const name = entry.key_ptr.*;
+                const msg = try std.fmt.allocPrint(
+                    self.allocator,
+                    "view '{s}' consumes linear asset '{s}' — views are read-only",
+                    .{ view.name, name },
+                );
+                try self.diagnostics.add(.{
+                    .file = self.current_file,
+                    .line = view.span.line,
+                    .col = view.span.col,
+                    .len = view.span.len,
+                    .kind = CompileError.IllegalInView,
+                    .message = msg,
+                    .source_line = "",
+                });
             }
         }
         // Check pure functions
@@ -2992,11 +3212,7 @@ const ConservationChecker = struct {
                 for (only.body) |s| try self.collectStatementDeltas(&s, deltas);
             },
             // Statements that cannot mutate state fields.
-            .let_bind, .call_stmt, .give_back, .stop, .skip,
-            .need, .ensure, .panic, .tell, .throw, .attempt,
-            .pay, .send, .move_asset, .remove, .expand, .close,
-            .freeze, .unfreeze, .schedule, .guard_apply,
-            .transfer_ownership => {},
+            .let_bind, .call_stmt, .give_back, .stop, .skip, .need, .ensure, .panic, .tell, .throw, .attempt, .pay, .send, .move_asset, .remove, .expand, .close, .freeze, .unfreeze, .schedule, .guard_apply, .transfer_ownership => {},
             // Match — recurse arms.
             .match => |m| {
                 for (m.arms) |arm| {
@@ -3032,10 +3248,10 @@ const ConservationChecker = struct {
 
         const violated = switch (equation.op) {
             .equals => lhs_delta != rhs_delta,
-            .gte    => lhs_delta < rhs_delta,
-            .lte    => lhs_delta > rhs_delta,
-            .gt     => lhs_delta <= rhs_delta,
-            .lt     => lhs_delta >= rhs_delta,
+            .gte => lhs_delta < rhs_delta,
+            .lte => lhs_delta > rhs_delta,
+            .gt => lhs_delta <= rhs_delta,
+            .lt => lhs_delta >= rhs_delta,
         };
 
         if (violated) {
@@ -3414,7 +3630,8 @@ fn makeEmptyContract(name: []const u8) ContractDef {
         .invariants = &.{},
         .conserves = &.{},
         .adversary_blocks = &.{},
-        .fallback = null, .receive_ = null,
+        .fallback = null,
+        .receive_ = null,
         .span = .{ .line = 1, .col = 1, .len = 12 },
     };
 }
@@ -3443,31 +3660,25 @@ test "linear asset consumed by send is not an error" {
         .name = "source_asset",
         .kind = .constant,
         .type_ = .{ .linear = inner_ptr },
-        .span = Span{ .line=1, .col=1, .len=10 },
+        .span = Span{ .line = 1, .col = 1, .len = 10 },
         .mutable = false,
     });
 
     var contract = makeEmptyContract("TestContract");
 
-    var init_expr = Expr{ .kind = .{ .identifier = "source_asset" }, .span = Span{ .line=1, .col=1, .len=12 } };
-    var asset_expr = Expr{ .kind = .{ .identifier = "token" }, .span = Span{ .line=2, .col=1, .len=5 } };
-    var recipient_expr = Expr{ .kind = .{ .builtin = .zero_address }, .span = Span{ .line=2, .col=10, .len=12 } };
+    var init_expr = Expr{ .kind = .{ .identifier = "source_asset" }, .span = Span{ .line = 1, .col = 1, .len = 12 } };
+    var asset_expr = Expr{ .kind = .{ .identifier = "token" }, .span = Span{ .line = 2, .col = 1, .len = 5 } };
+    var recipient_expr = Expr{ .kind = .{ .builtin = .zero_address }, .span = Span{ .line = 2, .col = 10, .len = 12 } };
 
     var body = try alloc.alloc(Stmt, 2);
-    body[0] = Stmt{
-        .kind = .{ .let_bind = .{
-            .name = "token",
-            .declared_type = .{ .named = "LinearToken" },
-            .init = &init_expr,
-            .mutable = false,
-            .span = Span{ .line=1, .col=1, .len=10 },
-        }},
-        .span = Span{ .line=1, .col=1, .len=10 }
-    };
-    body[1] = Stmt{
-        .kind = .{ .send = .{ .asset = &asset_expr, .recipient = &recipient_expr } },
-        .span = Span{ .line=2, .col=1, .len=20 }
-    };
+    body[0] = Stmt{ .kind = .{ .let_bind = .{
+        .name = "token",
+        .declared_type = .{ .named = "LinearToken" },
+        .init = &init_expr,
+        .mutable = false,
+        .span = Span{ .line = 1, .col = 1, .len = 10 },
+    } }, .span = Span{ .line = 1, .col = 1, .len = 10 } };
+    body[1] = Stmt{ .kind = .{ .send = .{ .asset = &asset_expr, .recipient = &recipient_expr } }, .span = Span{ .line = 2, .col = 1, .len = 20 } };
 
     const action = ast.ActionDecl{
         .name = "do_send",
@@ -3479,9 +3690,9 @@ test "linear asset consumed by send is not an error" {
         .accounts = &.{},
         .body = body,
         .complexity_class = null,
-        .span = Span{ .line=1, .col=1, .len=30 },
+        .span = Span{ .line = 1, .col = 1, .len = 30 },
     };
-    
+
     contract.actions = try alloc.alloc(ast.ActionDecl, 1);
     contract.actions[0] = action;
 
@@ -3514,25 +3725,22 @@ test "linear asset dropped without send is an error" {
         .name = "source_asset",
         .kind = .constant,
         .type_ = .{ .linear = inner_ptr },
-        .span = Span{ .line=1, .col=1, .len=10 },
+        .span = Span{ .line = 1, .col = 1, .len = 10 },
         .mutable = false,
     });
 
     var contract = makeEmptyContract("TestContract");
 
-    var init_expr = Expr{ .kind = .{ .identifier = "source_asset" }, .span = Span{ .line=1, .col=1, .len=12 } };
+    var init_expr = Expr{ .kind = .{ .identifier = "source_asset" }, .span = Span{ .line = 1, .col = 1, .len = 12 } };
 
     var body = try alloc.alloc(Stmt, 1);
-    body[0] = Stmt{
-        .kind = .{ .let_bind = .{
-            .name = "token",
-            .declared_type = .{ .named = "LinearToken" },
-            .init = &init_expr,
-            .mutable = false,
-            .span = Span{ .line=1, .col=1, .len=10 },
-        }},
-        .span = Span{ .line=1, .col=1, .len=10 }
-    };
+    body[0] = Stmt{ .kind = .{ .let_bind = .{
+        .name = "token",
+        .declared_type = .{ .named = "LinearToken" },
+        .init = &init_expr,
+        .mutable = false,
+        .span = Span{ .line = 1, .col = 1, .len = 10 },
+    } }, .span = Span{ .line = 1, .col = 1, .len = 10 } };
 
     const action = ast.ActionDecl{
         .name = "do_drop",
@@ -3544,7 +3752,7 @@ test "linear asset dropped without send is an error" {
         .accounts = &.{},
         .body = body,
         .complexity_class = null,
-        .span = Span{ .line=1, .col=1, .len=30 },
+        .span = Span{ .line = 1, .col = 1, .len = 30 },
     };
     contract.actions = try alloc.alloc(ast.ActionDecl, 1);
     contract.actions[0] = action;
@@ -3579,35 +3787,26 @@ test "linear asset consumed twice is an error" {
         .name = "source_asset",
         .kind = .constant,
         .type_ = .{ .linear = inner_ptr },
-        .span = Span{ .line=1, .col=1, .len=10 },
+        .span = Span{ .line = 1, .col = 1, .len = 10 },
         .mutable = false,
     });
 
     var contract = makeEmptyContract("TestContract");
 
-    var init_expr = Expr{ .kind = .{ .identifier = "source_asset" }, .span = Span{ .line=1, .col=1, .len=12 } };
-    var asset_expr = Expr{ .kind = .{ .identifier = "token" }, .span = Span{ .line=2, .col=1, .len=5 } };
-    var recipient_expr = Expr{ .kind = .{ .builtin = .zero_address }, .span = Span{ .line=2, .col=10, .len=12 } };
+    var init_expr = Expr{ .kind = .{ .identifier = "source_asset" }, .span = Span{ .line = 1, .col = 1, .len = 12 } };
+    var asset_expr = Expr{ .kind = .{ .identifier = "token" }, .span = Span{ .line = 2, .col = 1, .len = 5 } };
+    var recipient_expr = Expr{ .kind = .{ .builtin = .zero_address }, .span = Span{ .line = 2, .col = 10, .len = 12 } };
 
     var body = try alloc.alloc(Stmt, 3);
-    body[0] = Stmt{
-        .kind = .{ .let_bind = .{
-            .name = "token",
-            .declared_type = .{ .named = "LinearToken" },
-            .init = &init_expr,
-            .mutable = false,
-            .span = Span{ .line=1, .col=1, .len=10 },
-        }},
-        .span = Span{ .line=1, .col=1, .len=10 }
-    };
-    body[1] = Stmt{
-        .kind = .{ .send = .{ .asset = &asset_expr, .recipient = &recipient_expr } },
-        .span = Span{ .line=2, .col=1, .len=20 }
-    };
-    body[2] = Stmt{
-        .kind = .{ .send = .{ .asset = &asset_expr, .recipient = &recipient_expr } },
-        .span = Span{ .line=3, .col=1, .len=20 }
-    };
+    body[0] = Stmt{ .kind = .{ .let_bind = .{
+        .name = "token",
+        .declared_type = .{ .named = "LinearToken" },
+        .init = &init_expr,
+        .mutable = false,
+        .span = Span{ .line = 1, .col = 1, .len = 10 },
+    } }, .span = Span{ .line = 1, .col = 1, .len = 10 } };
+    body[1] = Stmt{ .kind = .{ .send = .{ .asset = &asset_expr, .recipient = &recipient_expr } }, .span = Span{ .line = 2, .col = 1, .len = 20 } };
+    body[2] = Stmt{ .kind = .{ .send = .{ .asset = &asset_expr, .recipient = &recipient_expr } }, .span = Span{ .line = 3, .col = 1, .len = 20 } };
 
     const action = ast.ActionDecl{
         .name = "do_send_twice",
@@ -3619,7 +3818,7 @@ test "linear asset consumed twice is an error" {
         .accounts = &.{},
         .body = body,
         .complexity_class = null,
-        .span = Span{ .line=1, .col=1, .len=30 },
+        .span = Span{ .line = 1, .col = 1, .len = 30 },
     };
     contract.actions = try alloc.alloc(ast.ActionDecl, 1);
     contract.actions[0] = action;
@@ -3654,25 +3853,22 @@ test "views do not enforce linear tracking" {
         .name = "source_asset",
         .kind = .constant,
         .type_ = .{ .linear = inner_ptr },
-        .span = Span{ .line=1, .col=1, .len=10 },
+        .span = Span{ .line = 1, .col = 1, .len = 10 },
         .mutable = false,
     });
 
     var contract = makeEmptyContract("TestContract");
 
-    var init_expr = Expr{ .kind = .{ .identifier = "source_asset" }, .span = Span{ .line=1, .col=1, .len=12 } };
+    var init_expr = Expr{ .kind = .{ .identifier = "source_asset" }, .span = Span{ .line = 1, .col = 1, .len = 12 } };
 
     var body = try alloc.alloc(Stmt, 1);
-    body[0] = Stmt{
-        .kind = .{ .let_bind = .{
-            .name = "token",
-            .declared_type = .{ .named = "LinearToken" },
-            .init = &init_expr,
-            .mutable = false,
-            .span = Span{ .line=1, .col=1, .len=10 },
-        }},
-        .span = Span{ .line=1, .col=1, .len=10 }
-    };
+    body[0] = Stmt{ .kind = .{ .let_bind = .{
+        .name = "token",
+        .declared_type = .{ .named = "LinearToken" },
+        .init = &init_expr,
+        .mutable = false,
+        .span = Span{ .line = 1, .col = 1, .len = 10 },
+    } }, .span = Span{ .line = 1, .col = 1, .len = 10 } };
 
     const view_decl = ast.ViewDecl{
         .name = "read_asset",
@@ -3682,7 +3878,7 @@ test "views do not enforce linear tracking" {
         .return_type = null,
         .accounts = &.{},
         .body = body,
-        .span = Span{ .line=1, .col=1, .len=30 },
+        .span = Span{ .line = 1, .col = 1, .len = 30 },
     };
     contract.views = try alloc.alloc(ast.ViewDecl, 1);
     contract.views[0] = view_decl;
@@ -3853,23 +4049,111 @@ test "resolveInheritedScope depth limit prevents stack overflow" {
     var resolver = TypeResolver.init(allocator, &diags);
     defer resolver.deinit();
 
-    const names = [_][]const u8{"C0", "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10", "C11", "C12", "C13", "C14", "C15", "C16", "C17", "C18", "C19"};
-    
+    const names = [_][]const u8{ "C0", "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10", "C11", "C12", "C13", "C14", "C15", "C16", "C17", "C18", "C19" };
+
     var contract_array: [20]ast.ContractDef = undefined;
     var tops_list: [20]ast.TopLevel = undefined;
-    
+
     for (0..20) |i| {
         contract_array[i] = makeEmptyContract(names[i]);
         if (i > 0) {
-            contract_array[i].inherits = names[i-1];
+            contract_array[i].inherits = names[i - 1];
         }
         tops_list[i] = .{ .contract = contract_array[i] };
     }
-    
+
     try resolver.registerTopLevel(&tops_list);
 
     var checker = Checker.init(&resolver, &diags, allocator, "test.foz");
 
     const result = checker.checkContract(&contract_array[19]);
     try std.testing.expectError(error.InternalError, result);
+}
+
+test "use std.math registers module and field_access resolves function" {
+    const allocator = std.testing.allocator;
+    var diags = DiagnosticList.init(allocator);
+    defer diags.deinit();
+    var resolver = TypeResolver.init(allocator, &diags);
+    defer resolver.deinit();
+
+    // Simulate `use std.math`
+    var path_storage: [2][]const u8 = .{ "std", "math" };
+    const use_top = TopLevel{ .use_import = .{
+        .path = path_storage[0..],
+        .alias = null,
+        .span = .{ .line = 2, .col = 1, .len = 15 },
+    } };
+    try resolver.registerTopLevel(&.{use_top});
+
+    // "math" should now be a module symbol
+    const math_sym = resolver.global_scope.lookup("math") orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    try std.testing.expectEqual(SymbolKind.module, math_sym.kind);
+
+    // lookupModuleFn should find sqrt
+    const sqrt_fn = resolver.lookupModuleFn("math", "sqrt") orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    try std.testing.expectEqualStrings("sqrt", sqrt_fn.name);
+    try std.testing.expectEqual(@as(usize, 1), sqrt_fn.params.len);
+
+    // lookupModuleFn should return null for nonexistent function
+    try std.testing.expect(resolver.lookupModuleFn("math", "nonexistent") == null);
+}
+
+test "use std.crypto registers crypto module and functions" {
+    const allocator = std.testing.allocator;
+    var diags = DiagnosticList.init(allocator);
+    defer diags.deinit();
+    var resolver = TypeResolver.init(allocator, &diags);
+    defer resolver.deinit();
+
+    var crypto_path: [2][]const u8 = .{ "std", "crypto" };
+    const use_top = TopLevel{ .use_import = .{
+        .path = crypto_path[0..],
+        .alias = null,
+        .span = .{ .line = 2, .col = 1, .len = 16 },
+    } };
+    try resolver.registerTopLevel(&.{use_top});
+
+    const crypto_sym = resolver.global_scope.lookup("crypto") orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    try std.testing.expectEqual(SymbolKind.module, crypto_sym.kind);
+
+    const bls_fn = resolver.lookupModuleFn("crypto", "bls_verify") orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    try std.testing.expectEqualStrings("bls_verify", bls_fn.name);
+    try std.testing.expectEqual(@as(usize, 3), bls_fn.params.len);
+
+    const keccak_fn = resolver.lookupModuleFn("crypto", "keccak") orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    try std.testing.expectEqualStrings("keccak", keccak_fn.name);
+}
+
+test "use std.unknown does not register a module" {
+    const allocator = std.testing.allocator;
+    var diags = DiagnosticList.init(allocator);
+    defer diags.deinit();
+    var resolver = TypeResolver.init(allocator, &diags);
+    defer resolver.deinit();
+
+    var unknown_path: [2][]const u8 = .{ "std", "unknown" };
+    const use_top = TopLevel{ .use_import = .{
+        .path = unknown_path[0..],
+        .alias = null,
+        .span = .{ .line = 2, .col = 1, .len = 16 },
+    } };
+    try resolver.registerTopLevel(&.{use_top});
+
+    try std.testing.expect(resolver.global_scope.lookup("unknown") == null);
 }

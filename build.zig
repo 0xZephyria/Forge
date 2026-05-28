@@ -1,41 +1,64 @@
 // ============================================================================
-// Forge Compiler -- Build Script (Zig 0.15.2)
+// Forge Compiler -- Build Script (Zig 0.15)
 // ============================================================================
 //
 // Targets:
-//   zig build             -- build the forgec compiler binary
-//   zig build test        -- run all unit tests across all source files
-//   zig build vmtest      -- compile + run every .foz contract through ForgeVM
-//   zig build vmtest -- contracts/Foo.foz -- run one specific contract
-//   zig build check       -- semantic-only check on contracts/ directory
-//   zig build run -- <args> -- build and run forgec with given arguments
+//   zig build                  -- Build the forgec compiler binary
+//   zig build test             -- Run all unit tests across all source files
+//   zig build check            -- Perform semantic-only check on contracts
+//   zig build run -- <args>    -- Build and run forgec with given arguments
 //
 // Options:
-//   -Dtarget=<triple>     -- cross-compile target
-//   -Doptimize=<mode>     -- Debug, ReleaseSafe, ReleaseFast, ReleaseSmall
-//   -Dtest_filter=<str>   -- filter test names
+//   -Dtarget=<triple>          -- Cross-compile target
+//   -Doptimize=<mode>          -- Debug, ReleaseSafe, ReleaseFast, ReleaseSmall
+//   -Dtest_filter=<str>        -- Filter test names
+//
 
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    // ── Build options ────────────────────────────────────────────────────
+    // ── Standard Build Options ───────────────────────────────────────────
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Option to filter test names during "zig build test"
     const test_filter_opt = b.option(
         []const u8,
         "test_filter",
         "Filter test names (substring match)",
     );
 
-    // ── Root module for the forgec executable ─────────────────────────────
+    // ── Zephyria VM Module ────────────────────────────────────────────────
+    // Registers the core ZVM logic as a modular import so both the compiler
+    // unit tests and other verification executables can load it.
+    const zvm_vm = b.createModule(.{
+        .root_source_file = b.path("vm/vm.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // ── Freestanding WebAssembly ZVM Module ──────────────────────────────
+    // Configures ZVM module for target CPU wasm32 and OS freestanding.
+    const zvm_wasm_mod = b.createModule(.{
+        .root_source_file = b.path("vm/vm.zig"),
+        .target = b.resolveTargetQuery(.{
+            .cpu_arch = .wasm32,
+            .os_tag = .freestanding,
+        }),
+        .optimize = .ReleaseSmall,
+    });
+    _ = zvm_wasm_mod;
+
+    // ── Root Module for Forge Compiler ──────────────────────────────────
+    // Registers the main CLI executable module and binds the ZVM as an import.
     const root_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
+    root_mod.addImport("zephyria_vm", zvm_vm);
 
-    // Optimization-specific settings
+    // Apply fast-path compilation options on ReleaseFast builds
     if (optimize == .ReleaseFast) {
         root_mod.single_threaded = true;
         root_mod.strip = true;
@@ -48,33 +71,8 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
-    // ── Wasm: forge.wasm ──────────────────────────────────────────────────
-    const wasm_mod = b.createModule(.{
-        .root_source_file = b.path("src/wasm.zig"),
-        .target = b.resolveTargetQuery(.{
-            .cpu_arch = .wasm32,
-            .os_tag = .freestanding,
-        }),
-        .optimize = .ReleaseSmall,
-    });
-
-    const wasm = b.addExecutable(.{
-        .name = "forge",
-        .root_module = wasm_mod,
-    });
-    wasm.entry = .disabled;
-    wasm.rdynamic = true; // Export all public functions
-
-    // Install the Wasm file to root `out/` directory to make it easy to find
-    const install_wasm = b.addInstallArtifact(wasm, .{
-        .dest_dir = .{ .override = .{ .custom = "../out" } },
-    });
-    b.getInstallStep().dependOn(&install_wasm.step);
-
-    const wasm_step = b.step("wasm", "Build the WebAssembly compiler module");
-    wasm_step.dependOn(&install_wasm.step);
-
-    // ── Run step ─────────────────────────────────────────────────────────
+    // ── Run Step ─────────────────────────────────────────────────────────
+    // Allows building and executing the compiler in one go via 'zig build run -- <args>'
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
@@ -83,8 +81,8 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the ZEPH compiler");
     run_step.dependOn(&run_cmd.step);
 
-    // ── Test step ────────────────────────────────────────────────────────
-    // Run tests in every source file that contains unit tests.
+    // ── Unit Testing Step ────────────────────────────────────────────────
+    // Executes unit tests within each component of the compiler.
     const test_step = b.step("test", "Run all unit tests");
 
     const test_sources = [_][]const u8{
@@ -96,22 +94,15 @@ pub fn build(b: *std.Build) void {
         "src/checker.zig",
         "src/riscv.zig",
         "src/codegen.zig",
-        // "src/codegen_polkavm.zig",
         "src/codegen_evm.zig",
         "src/u256.zig",
         "src/main.zig",
         "src/wasm.zig",
         // Zephyria VM unit tests
-        "zephyria/vm/vm.zig",
-        "zephyria/vm/loader/zephbin_loader.zig",
-        "zephyria/vm/core/decoder.zig",
-        "zephyria/vm/core/executor.zig",
-        "zephyria/vm/gas/meter.zig",
-        "zephyria/vm/memory/sandbox.zig",
-        "zephyria/vm/syscall/dispatch.zig",
+        "vm/vm.zig",
     };
 
-    // Build test filter array from the option
+    // Construct the filter array if specified
     const filters: []const []const u8 = if (test_filter_opt) |f|
         &.{f}
     else
@@ -124,59 +115,22 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
 
+        // Binds the ZVM module into the unit testing contexts
+        test_mod.addImport("zephyria_vm", zvm_vm);
+
         const t = b.addTest(.{
             .root_module = test_mod,
             .filters = filters,
         });
 
         const run_t = b.addRunArtifact(t);
+        // Force the sandboxed interpreter for VM execution inside tests
+        run_t.setEnvironmentVariable("FORGE_NO_AOT", "1");
         test_step.dependOn(&run_t.step);
     }
 
-    // ── VM Test step ──────────────────────────────────────────────────────
-    // Compiles all .foz contracts and runs them through the Zephyria VM.
-    // This is the end-to-end integration test suite (like `evm-test` for EVM).
-    //
-    // IMPORTANT: vm.zig uses bare relative @imports for all its sub-files.
-    // In Zig 0.15, every source file must belong to exactly ONE module.
-    // Therefore we register vm.zig as a single 'zephyria_vm' module and let
-    // it resolve its children itself — we must NOT declare separate modules
-    // for executor.zig, sandbox.zig etc. because vm.zig already owns them.
-    const zvm_vm = b.createModule(.{
-        .root_source_file = b.path("zephyria/vm/vm.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const vmtest_mod = b.createModule(.{
-        .root_source_file = b.path("src/vmrun.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    // zephyria_vm is the single entry point; zephbin_loader and syscall_dispatch
-    // are accessed through vm_mod.zephbin_loader / vm_mod.syscall_dispatch re-exports.
-    vmtest_mod.addImport("zephyria_vm", zvm_vm);
-
-
-    const vmtest_exe = b.addExecutable(.{
-        .name = "forge-vmtest",
-        .root_module = vmtest_mod,
-    });
-    b.installArtifact(vmtest_exe);
-
-    const vmtest_run = b.addRunArtifact(vmtest_exe);
-    vmtest_run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        vmtest_run.addArgs(args);
-    }
-    const vmtest_step = b.step(
-        "vmtest",
-        "Compile .foz contracts and run them through the Zephyria VM",
-    );
-    vmtest_step.dependOn(&vmtest_run.step);
-
-    // ── Check step ───────────────────────────────────────────────────────
-    // Runs forgec --check-only on all .foz files in contracts/ if present.
+    // ── Check Step ────────────────────────────────────────────────────────
+    // Traverses the contracts directory and runs '--check-only' on all .foz files
     const check_step = b.step("check", "Type-check .foz files in contracts/");
 
     if (std.fs.cwd().openDir("contracts", .{ .iterate = true })) |*dir| {
@@ -195,4 +149,3 @@ pub fn build(b: *std.Build) void {
         // contracts/ directory doesn't exist — check step is a no-op
     }
 }
-

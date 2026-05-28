@@ -135,23 +135,23 @@ pub const EventLog = struct {
 /// SPEC: Part 5 — Host environment for in-test execution.
 /// Holds storage, event log, caller address, block metadata.
 pub const MockHostEnv = struct {
-    storage:      MockStorage,
-    events:       EventLog,
+    storage: MockStorage,
+    events: EventLog,
     /// Simulated msg.sender (20-byte address, zero-padded).
-    caller:       [20]u8,
+    caller: [20]u8,
     /// Simulated msg.value in smallest unit.
-    call_value:   u64,
+    call_value: u64,
     /// Current simulated block number.
     block_number: u64,
     /// Current simulated timestamp (Unix seconds).
-    timestamp:    u64,
+    timestamp: u64,
     /// Remaining gas (decremented by instructions).
     gas_remaining: u64,
     /// True if a REVERT syscall was received.
-    reverted:     bool,
+    reverted: bool,
     /// Revert message, if any.
-    revert_msg:   [256]u8,
-    revert_len:   u32,
+    revert_msg: [256]u8,
+    revert_len: u32,
 
     allocator: std.mem.Allocator,
 
@@ -162,17 +162,17 @@ pub const MockHostEnv = struct {
         caller[18] = 0xDE;
         caller[19] = 0x01;
         return .{
-            .storage      = MockStorage.init(allocator),
-            .events       = EventLog.init(allocator),
-            .caller       = caller,
-            .call_value   = 0,
+            .storage = MockStorage.init(allocator),
+            .events = EventLog.init(allocator),
+            .caller = caller,
+            .call_value = 0,
             .block_number = 1,
-            .timestamp    = 1_700_000_000,
+            .timestamp = 1_700_000_000,
             .gas_remaining = 10_000_000,
-            .reverted     = false,
-            .revert_msg   = [_]u8{0} ** 256,
-            .revert_len   = 0,
-            .allocator    = allocator,
+            .reverted = false,
+            .revert_msg = [_]u8{0} ** 256,
+            .revert_len = 0,
+            .allocator = allocator,
         };
     }
 
@@ -234,7 +234,7 @@ pub const Interpreter = struct {
     max_instrs: u64,
 
     const MEMORY_SIZE: usize = 64 * 1024; // 64 KiB test sandbox
-    const STACK_BASE: u64    = MEMORY_SIZE - 8; // stack grows downward
+    const STACK_BASE: u64 = MEMORY_SIZE - 8; // stack grows downward
 
     /// SPEC: Internal — initialise interpreter for one test invocation.
     pub fn init(
@@ -250,13 +250,13 @@ pub const Interpreter = struct {
         // gp (x3) = base of data section (mapped at 0 in test sandbox)
         regs.set(3, 0);
         return .{
-            .regs        = regs,
-            .pc          = 0,
-            .code        = code,
-            .memory      = memory,
-            .host        = host,
+            .regs = regs,
+            .pc = 0,
+            .code = code,
+            .memory = memory,
+            .host = host,
             .instr_count = 0,
-            .max_instrs  = 5_000_000,
+            .max_instrs = 5_000_000,
         };
     }
 
@@ -281,36 +281,36 @@ pub const Interpreter = struct {
                 return .halt;
             },
             0x33 => { // R-type: ADD/SUB/MUL/DIV/REM/AND/OR/XOR/SLL/SRL/SRA
-                const rd:     u5 = @truncate(raw >> 7);
+                const rd: u5 = @truncate(raw >> 7);
                 const funct3: u3 = @truncate(raw >> 12);
-                const rs1:    u5 = @truncate(raw >> 15);
-                const rs2:    u5 = @truncate(raw >> 20);
+                const rs1: u5 = @truncate(raw >> 15);
+                const rs2: u5 = @truncate(raw >> 20);
                 const funct7: u7 = @truncate(raw >> 25);
                 const v1 = self.regs.get(rs1);
                 const v2 = self.regs.get(rs2);
                 const result: u64 = switch (funct7) {
                     0x00 => switch (funct3) {
-                        0x0 => v1 +% v2,                              // ADD
-                        0x4 => v1 ^ v2,                              // XOR
-                        0x6 => v1 | v2,                              // OR
-                        0x7 => v1 & v2,                              // AND
-                        0x1 => v1 << @truncate(v2 & 63),            // SLL
-                        0x5 => v1 >> @truncate(v2 & 63),            // SRL
+                        0x0 => v1 +% v2, // ADD
+                        0x4 => v1 ^ v2, // XOR
+                        0x6 => v1 | v2, // OR
+                        0x7 => v1 & v2, // AND
+                        0x1 => v1 << @truncate(v2 & 63), // SLL
+                        0x5 => v1 >> @truncate(v2 & 63), // SRL
                         0x2 => if (@as(i64, @bitCast(v1)) < @as(i64, @bitCast(v2))) 1 else 0, // SLT
-                        0x3 => if (v1 < v2) 1 else 0,               // SLTU
+                        0x3 => if (v1 < v2) 1 else 0, // SLTU
                         else => 0,
                     },
                     0x20 => switch (funct3) {
-                        0x0 => v1 -% v2,                             // SUB
+                        0x0 => v1 -% v2, // SUB
                         0x5 => @as(u64, @bitCast(@as(i64, @bitCast(v1)) >> @truncate(v2 & 63))), // SRA
                         else => 0,
                     },
                     0x01 => switch (funct3) { // M extension
-                        0x0 => v1 *% v2,                             // MUL
+                        0x0 => v1 *% v2, // MUL
                         0x4 => if (v2 != 0) v1 / v2 else std.math.maxInt(u64), // DIV (signed TBD)
                         0x5 => if (v2 != 0) v1 / v2 else std.math.maxInt(u64), // DIVU
-                        0x6 => if (v2 != 0) v1 % v2 else v1,        // REM
-                        0x7 => if (v2 != 0) v1 % v2 else v1,        // REMU
+                        0x6 => if (v2 != 0) v1 % v2 else v1, // REM
+                        0x7 => if (v2 != 0) v1 % v2 else v1, // REMU
                         else => 0,
                     },
                     else => 0,
@@ -320,19 +320,19 @@ pub const Interpreter = struct {
                 return .ok;
             },
             0x13 => { // I-type: ADDI / SLTI / ANDI / ORI / XORI / SLLI / SRLI / SRAI
-                const rd:     u5 = @truncate(raw >> 7);
+                const rd: u5 = @truncate(raw >> 7);
                 const funct3: u3 = @truncate(raw >> 12);
-                const rs1:    u5 = @truncate(raw >> 15);
+                const rs1: u5 = @truncate(raw >> 15);
                 const imm_raw: i12 = @truncate(@as(i32, @bitCast(raw)) >> 20);
                 const imm: i64 = imm_raw;
                 const v1 = self.regs.get(rs1);
                 const result: u64 = switch (funct3) {
-                    0x0 => @bitCast(@as(i64, @bitCast(v1)) +% imm),  // ADDI
+                    0x0 => @bitCast(@as(i64, @bitCast(v1)) +% imm), // ADDI
                     0x2 => if (@as(i64, @bitCast(v1)) < imm) 1 else 0, // SLTI
                     0x3 => if (v1 < @as(u64, @bitCast(imm))) 1 else 0, // SLTIU
-                    0x4 => v1 ^ @as(u64, @bitCast(imm)),              // XORI
-                    0x6 => v1 | @as(u64, @bitCast(imm)),              // ORI
-                    0x7 => v1 & @as(u64, @bitCast(imm)),              // ANDI
+                    0x4 => v1 ^ @as(u64, @bitCast(imm)), // XORI
+                    0x6 => v1 | @as(u64, @bitCast(imm)), // ORI
+                    0x7 => v1 & @as(u64, @bitCast(imm)), // ANDI
                     0x1 => v1 << @truncate(@as(u64, @bitCast(imm)) & 63), // SLLI (RV64: 6-bit shamt)
                     0x5 => blk: { // SRLI / SRAI
                         const shamt: u6 = @truncate(@as(u64, @bitCast(imm)));
@@ -349,14 +349,14 @@ pub const Interpreter = struct {
                 return .ok;
             },
             0x37 => { // LUI
-                const rd:  u5  = @truncate(raw >> 7);
+                const rd: u5 = @truncate(raw >> 7);
                 const imm: u32 = raw & 0xFFFFF000;
                 self.regs.set(rd, @as(u64, @bitCast(@as(i64, @as(i32, @bitCast(imm))))));
                 self.pc += 4;
                 return .ok;
             },
             0x17 => { // AUIPC
-                const rd:  u5  = @truncate(raw >> 7);
+                const rd: u5 = @truncate(raw >> 7);
                 const imm: u32 = raw & 0xFFFFF000;
                 const offset: i64 = @as(i32, @bitCast(imm));
                 self.regs.set(rd, @as(u64, @bitCast(@as(i64, @bitCast(self.pc)) +% offset)));
@@ -364,15 +364,15 @@ pub const Interpreter = struct {
                 return .ok;
             },
             0x6F => { // JAL
-                const rd:  u5  = @truncate(raw >> 7);
+                const rd: u5 = @truncate(raw >> 7);
                 const imm = decodeJ(raw);
                 self.regs.set(rd, self.pc + 4);
                 self.pc = @as(u64, @bitCast(@as(i64, @bitCast(self.pc)) +% imm));
                 return .jump;
             },
             0x67 => { // JALR
-                const rd:  u5  = @truncate(raw >> 7);
-                const rs1: u5  = @truncate(raw >> 15);
+                const rd: u5 = @truncate(raw >> 7);
+                const rs1: u5 = @truncate(raw >> 15);
                 const imm: i12 = @truncate(@as(i32, @bitCast(raw)) >> 20);
                 const target = (@as(i64, @bitCast(self.regs.get(rs1))) +% @as(i64, imm)) & ~@as(i64, 1);
                 const ret_addr = self.pc + 4;
@@ -384,18 +384,18 @@ pub const Interpreter = struct {
             },
             0x63 => { // Branch
                 const funct3: u3 = @truncate(raw >> 12);
-                const rs1:    u5 = @truncate(raw >> 15);
-                const rs2:    u5 = @truncate(raw >> 20);
+                const rs1: u5 = @truncate(raw >> 15);
+                const rs2: u5 = @truncate(raw >> 20);
                 const imm = decodeB(raw);
                 const v1 = self.regs.get(rs1);
                 const v2 = self.regs.get(rs2);
                 const taken: bool = switch (funct3) {
-                    0x0 => v1 == v2,                                  // BEQ
-                    0x1 => v1 != v2,                                  // BNE
+                    0x0 => v1 == v2, // BEQ
+                    0x1 => v1 != v2, // BNE
                     0x4 => @as(i64, @bitCast(v1)) < @as(i64, @bitCast(v2)), // BLT
-                    0x5 => @as(i64, @bitCast(v1)) >= @as(i64, @bitCast(v2)),// BGE
-                    0x6 => v1 < v2,                                   // BLTU
-                    0x7 => v1 >= v2,                                  // BGEU
+                    0x5 => @as(i64, @bitCast(v1)) >= @as(i64, @bitCast(v2)), // BGE
+                    0x6 => v1 < v2, // BLTU
+                    0x7 => v1 >= v2, // BGEU
                     else => false,
                 };
                 if (taken) {
@@ -406,10 +406,10 @@ pub const Interpreter = struct {
                 return .ok;
             },
             0x03 => { // Load: LB / LH / LW / LD / LBU / LHU / LWU
-                const rd:     u5  = @truncate(raw >> 7);
-                const funct3: u3  = @truncate(raw >> 12);
-                const rs1:    u5  = @truncate(raw >> 15);
-                const imm:    i12 = @truncate(@as(i32, @bitCast(raw)) >> 20);
+                const rd: u5 = @truncate(raw >> 7);
+                const funct3: u3 = @truncate(raw >> 12);
+                const rs1: u5 = @truncate(raw >> 15);
+                const imm: i12 = @truncate(@as(i32, @bitCast(raw)) >> 20);
                 const addr = @as(u64, @bitCast(@as(i64, @bitCast(self.regs.get(rs1))) +% @as(i64, imm)));
                 const result: u64 = self.memLoad(addr, funct3);
                 self.regs.set(rd, result);
@@ -418,11 +418,11 @@ pub const Interpreter = struct {
             },
             0x23 => { // Store: SB / SH / SW / SD
                 const funct3: u3 = @truncate(raw >> 12);
-                const rs1:    u5 = @truncate(raw >> 15);
-                const rs2:    u5 = @truncate(raw >> 20);
+                const rs1: u5 = @truncate(raw >> 15);
+                const rs2: u5 = @truncate(raw >> 20);
                 const imm_lo: i5 = @truncate(@as(i32, @bitCast(raw)) >> 7);
                 const imm_hi: i7 = @truncate(@as(i32, @bitCast(raw)) >> 25);
-                const imm: i12   = @as(i12, imm_hi) << 5 | @as(i12, imm_lo);
+                const imm: i12 = @as(i12, imm_hi) << 5 | @as(i12, imm_lo);
                 const addr = @as(u64, @bitCast(@as(i64, @bitCast(self.regs.get(rs1))) +% @as(i64, imm)));
                 self.memStore(addr, self.regs.get(rs2), funct3);
                 self.pc += 4;
@@ -459,13 +459,13 @@ pub const Interpreter = struct {
             0x30 => { // EMIT_EVENT: a1=topic_count, a2=topics_ptr, a3=data_ptr, a4=data_len
                 const topic_count: u8 = @truncate(self.regs.get(11));
                 const topics_ptr: u64 = self.regs.get(12);
-                const data_ptr:   u64 = self.regs.get(13);
-                const data_len:   u32 = @truncate(self.regs.get(14));
+                const data_ptr: u64 = self.regs.get(13);
+                const data_len: u32 = @truncate(self.regs.get(14));
                 var ev = MockEvent{
-                    .topics      = [_]u8{0} ** 128,
+                    .topics = [_]u8{0} ** 128,
                     .topic_count = topic_count,
-                    .data        = [_]u8{0} ** 256,
-                    .data_len    = @min(data_len, 256),
+                    .data = [_]u8{0} ** 256,
+                    .data_len = @min(data_len, 256),
                 };
                 const copy_topics = @min(@as(usize, topic_count) * 32, 128);
                 self.readMemSlice(topics_ptr, ev.topics[0..copy_topics]);
@@ -516,13 +516,13 @@ pub const Interpreter = struct {
     fn memLoad(self: *const Interpreter, addr: u64, funct3: u3) u64 {
         const idx = addrToIdx(addr, 1) orelse return 0;
         return switch (funct3) {
-            0x0 => @as(u64, @bitCast(@as(i64, @as(i8, @bitCast(self.memory[idx]))))),   // LB
+            0x0 => @as(u64, @bitCast(@as(i64, @as(i8, @bitCast(self.memory[idx]))))), // LB
             0x1 => @as(u64, @bitCast(@as(i64, @as(i16, @bitCast(std.mem.readInt(u16, self.memory[idx..][0..2], .little)))))), // LH
             0x2 => @as(u64, @bitCast(@as(i64, @as(i32, @bitCast(std.mem.readInt(u32, self.memory[idx..][0..4], .little)))))), // LW
-            0x3 => std.mem.readInt(u64, self.memory[idx..][0..8], .little),               // LD
-            0x4 => self.memory[idx],                                                       // LBU
-            0x5 => std.mem.readInt(u16, self.memory[idx..][0..2], .little),               // LHU
-            0x6 => std.mem.readInt(u32, self.memory[idx..][0..4], .little),               // LWU
+            0x3 => std.mem.readInt(u64, self.memory[idx..][0..8], .little), // LD
+            0x4 => self.memory[idx], // LBU
+            0x5 => std.mem.readInt(u16, self.memory[idx..][0..2], .little), // LHU
+            0x6 => std.mem.readInt(u32, self.memory[idx..][0..4], .little), // LWU
             else => 0,
         };
     }
@@ -530,10 +530,10 @@ pub const Interpreter = struct {
     fn memStore(self: *Interpreter, addr: u64, val: u64, funct3: u3) void {
         const idx = addrToIdx(addr, 1) orelse return;
         switch (funct3) {
-            0x0 => self.memory[idx] = @truncate(val),                                     // SB
+            0x0 => self.memory[idx] = @truncate(val), // SB
             0x1 => std.mem.writeInt(u16, self.memory[idx..][0..2], @truncate(val), .little), // SH
             0x2 => std.mem.writeInt(u32, self.memory[idx..][0..4], @truncate(val), .little), // SW
-            0x3 => std.mem.writeInt(u64, self.memory[idx..][0..8], val, .little),         // SD
+            0x3 => std.mem.writeInt(u64, self.memory[idx..][0..8], val, .little), // SD
             else => {},
         }
     }
@@ -565,18 +565,18 @@ pub const Interpreter = struct {
     // ── Instruction decoders ──────────────────────────────────────────────
 
     fn decodeJ(raw: u32) i64 {
-        const bit_20:     i64 = @intCast((raw >> 31) & 0x1);
-        const bits_10_1:  i64 = @intCast((raw >> 21) & 0x3FF);
-        const bit_11:     i64 = @intCast((raw >> 20) & 0x1);
+        const bit_20: i64 = @intCast((raw >> 31) & 0x1);
+        const bits_10_1: i64 = @intCast((raw >> 21) & 0x3FF);
+        const bit_11: i64 = @intCast((raw >> 20) & 0x1);
         const bits_19_12: i64 = @intCast((raw >> 12) & 0xFF);
         return (bit_20 << 20) | (bits_19_12 << 12) | (bit_11 << 11) | (bits_10_1 << 1);
     }
 
     fn decodeB(raw: u32) i64 {
-        const bit_12:    i64 = @intCast((raw >> 31) & 0x1);
-        const bit_11:    i64 = @intCast((raw >> 7) & 0x1);
+        const bit_12: i64 = @intCast((raw >> 31) & 0x1);
+        const bit_11: i64 = @intCast((raw >> 7) & 0x1);
         const bits_10_5: i64 = @intCast((raw >> 25) & 0x3F);
-        const bits_4_1:  i64 = @intCast((raw >> 8) & 0xF);
+        const bits_4_1: i64 = @intCast((raw >> 8) & 0xF);
         return (bit_12 << 12) | (bit_11 << 11) | (bits_10_5 << 5) | (bits_4_1 << 1);
     }
 };
@@ -642,11 +642,11 @@ pub const TestRunner = struct {
         const src = std.fs.cwd().readFileAlloc(self.allocator, path, 1024 * 1024) catch |err| {
             const msg = try std.fmt.allocPrint(self.allocator, "cannot read file: {}", .{err});
             return FileResult{
-                .file_path     = path,
+                .file_path = path,
                 .compile_error = msg,
-                .tests         = try self.allocator.alloc(TestResult, 0),
-                .passed        = 0,
-                .failed        = 1,
+                .tests = try self.allocator.alloc(TestResult, 0),
+                .passed = 0,
+                .failed = 1,
             };
         };
         defer self.allocator.free(src);
@@ -659,11 +659,11 @@ pub const TestRunner = struct {
         var tok_list = lex.tokenize(self.allocator) catch |err| {
             const msg = try std.fmt.allocPrint(self.allocator, "lex error: {}", .{err});
             return FileResult{
-                .file_path     = path,
+                .file_path = path,
                 .compile_error = msg,
-                .tests         = try self.allocator.alloc(TestResult, 0),
-                .passed        = 0,
-                .failed        = 1,
+                .tests = try self.allocator.alloc(TestResult, 0),
+                .passed = 0,
+                .failed = 1,
             };
         };
         defer tok_list.deinit(self.allocator);
@@ -672,11 +672,11 @@ pub const TestRunner = struct {
         const program = prs.parse() catch |err| {
             const msg = try std.fmt.allocPrint(self.allocator, "parse error: {}", .{err});
             return FileResult{
-                .file_path     = path,
+                .file_path = path,
                 .compile_error = msg,
-                .tests         = try self.allocator.alloc(TestResult, 0),
-                .passed        = 0,
-                .failed        = 1,
+                .tests = try self.allocator.alloc(TestResult, 0),
+                .passed = 0,
+                .failed = 1,
             };
         };
         defer program.deinit(self.allocator);
@@ -692,11 +692,11 @@ pub const TestRunner = struct {
         if (contract_def == null) {
             const msg = try self.allocator.dupe(u8, "no contract found in test file");
             return FileResult{
-                .file_path     = path,
+                .file_path = path,
                 .compile_error = msg,
-                .tests         = try self.allocator.alloc(TestResult, 0),
-                .passed        = 0,
-                .failed        = 1,
+                .tests = try self.allocator.alloc(TestResult, 0),
+                .passed = 0,
+                .failed = 1,
             };
         }
 
@@ -708,11 +708,11 @@ pub const TestRunner = struct {
         const checked = chk.checkContract(contract_def.?) catch |err| {
             const msg = try std.fmt.allocPrint(self.allocator, "type error: {}", .{err});
             return FileResult{
-                .file_path     = path,
+                .file_path = path,
                 .compile_error = msg,
-                .tests         = try self.allocator.alloc(TestResult, 0),
-                .passed        = 0,
-                .failed        = 1,
+                .tests = try self.allocator.alloc(TestResult, 0),
+                .passed = 0,
+                .failed = 1,
             };
         };
 
@@ -721,11 +721,11 @@ pub const TestRunner = struct {
         const binary = gen.generate(contract_def.?, &checked) catch |err| {
             const msg = try std.fmt.allocPrint(self.allocator, "codegen error: {}", .{err});
             return FileResult{
-                .file_path     = path,
+                .file_path = path,
                 .compile_error = msg,
-                .tests         = try self.allocator.alloc(TestResult, 0),
-                .passed        = 0,
-                .failed        = 1,
+                .tests = try self.allocator.alloc(TestResult, 0),
+                .passed = 0,
+                .failed = 1,
             };
         };
         defer self.allocator.free(binary);
@@ -744,38 +744,41 @@ pub const TestRunner = struct {
         var passed: u32 = 0;
         var failed: u32 = 0;
         for (owned_tests) |t| {
-            if (t.passed) { passed += 1; } else { failed += 1; }
+            if (t.passed) {
+                passed += 1;
+            } else {
+                failed += 1;
+            }
         }
 
         return FileResult{
-            .file_path     = path,
+            .file_path = path,
             .compile_error = null,
-            .tests         = owned_tests,
-            .passed        = passed,
-            .failed        = failed,
+            .tests = owned_tests,
+            .passed = passed,
+            .failed = failed,
         };
     }
 
     /// SPEC: Internal — run a single named test action from compiled binary.
     fn runTest(
-        self:       *TestRunner,
-        test_name:  []const u8,
-        binary:     []const u8,
+        self: *TestRunner,
+        test_name: []const u8,
+        binary: []const u8,
         action_name: []const u8,
     ) anyerror!TestResult {
         _ = action_name; // selector lookup goes here in a more complete impl
 
         // Skip the 64-byte header and find the bytecode section.
-        // For now we run from the start of bytecode (after access list).
-        // A complete version would look up the selector in the dispatch table.
+        // Layout: [64 header][data_section][bytecode]
         const header = std.mem.bytesAsValue(codegen.ZephBinHeader, binary[0..@sizeOf(codegen.ZephBinHeader)]);
-        const bc_offset = @sizeOf(codegen.ZephBinHeader) + header.access_list_len;
-        const bc_end    = bc_offset + header.bytecode_len;
+        const bc_offset = @sizeOf(codegen.ZephBinHeader) + header.data_section_len;
+        const bc_end = bc_offset + header.bytecode_len;
         if (bc_end > binary.len) {
             return TestResult{
-                .name        = test_name,
-                .passed      = false,
-                .gas_used    = 0,
+                .name = test_name,
+                .passed = false,
+                .gas_used = 0,
                 .failure_msg = try self.allocator.dupe(u8, "binary truncated"),
                 .event_count = 0,
             };
@@ -798,7 +801,7 @@ pub const TestRunner = struct {
                         const did_revert = try interp.handleEcall();
                         if (did_revert) break :blk true;
                     },
-                    .halt  => break :blk true,
+                    .halt => break :blk true,
                     .@"error" => break :blk true,
                 }
             }
@@ -812,9 +815,9 @@ pub const TestRunner = struct {
         } else null;
 
         return TestResult{
-            .name        = test_name,
-            .passed      = passed,
-            .gas_used    = interp.instr_count,
+            .name = test_name,
+            .passed = passed,
+            .gas_used = interp.instr_count,
             .failure_msg = failure_msg,
             .event_count = @intCast(host.events.events.items.len),
         };
@@ -859,8 +862,7 @@ pub const TestRunner = struct {
         for (result.tests, 0..) |t, i| {
             if (i > 0) w.print(",", .{}) catch return;
             const msg = t.failure_msg orelse "";
-            w.print("{{\"name\":\"{s}\",\"passed\":{},\"gas\":{d},\"events\":{d},\"msg\":\"{s}\"}}",
-                .{ t.name, t.passed, t.gas_used, t.event_count, msg }) catch return;
+            w.print("{{\"name\":\"{s}\",\"passed\":{},\"gas\":{d},\"events\":{d},\"msg\":\"{s}\"}}", .{ t.name, t.passed, t.gas_used, t.event_count, msg }) catch return;
         }
         w.print("],\"passed\":{d},\"failed\":{d}}}\n", .{ result.passed, result.failed }) catch return;
     }
@@ -881,7 +883,7 @@ test "MockStorage load returns zeros for missing key" {
 test "MockStorage store and load round-trip" {
     var st = MockStorage.init(std.testing.allocator);
     defer st.deinit();
-    const key  = [_]u8{0xAB} ** 32;
+    const key = [_]u8{0xAB} ** 32;
     const value = [_]u8{0xCD} ** 32;
     try st.store(&key, &value);
     const loaded = st.load(&key);
@@ -921,23 +923,23 @@ test "Interpreter STORAGE_LOAD ecall" {
     //   ADDI a2, zero, 32  (result ptr = mem[32])
     //   ECALL
     //   JALR zero, ra, 0   (halt)
-    const ADDI_a0_1  = @as(u32, 0x00100513); // ADDI a0, zero, 1
-    const ADDI_a1_0  = @as(u32, 0x00000593); // ADDI a1, zero, 0
+    const ADDI_a0_1 = @as(u32, 0x00100513); // ADDI a0, zero, 1
+    const ADDI_a1_0 = @as(u32, 0x00000593); // ADDI a1, zero, 0
     const ADDI_a2_32 = @as(u32, 0x02000613); // ADDI a2, zero, 32
-    const ECALL      = @as(u32, 0x00000073);
-    const HALT       = @as(u32, 0x00008067);
+    const ECALL = @as(u32, 0x00000073);
+    const HALT = @as(u32, 0x00008067);
 
     var code_buf: [20]u8 = undefined;
-    std.mem.writeInt(u32, code_buf[0..4],  ADDI_a0_1,  .little);
-    std.mem.writeInt(u32, code_buf[4..8],  ADDI_a1_0,  .little);
+    std.mem.writeInt(u32, code_buf[0..4], ADDI_a0_1, .little);
+    std.mem.writeInt(u32, code_buf[4..8], ADDI_a1_0, .little);
     std.mem.writeInt(u32, code_buf[8..12], ADDI_a2_32, .little);
-    std.mem.writeInt(u32, code_buf[12..16], ECALL,     .little);
-    std.mem.writeInt(u32, code_buf[16..20], HALT,      .little);
+    std.mem.writeInt(u32, code_buf[12..16], ECALL, .little);
+    std.mem.writeInt(u32, code_buf[16..20], HALT, .little);
 
     var host = MockHostEnv.init(allocator);
     defer host.deinit();
     // Pre-seed storage
-    const key   = [_]u8{0} ** 32;
+    const key = [_]u8{0} ** 32;
     const stored = [_]u8{0xBE} ** 32;
     try host.storage.store(&key, &stored);
 

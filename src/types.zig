@@ -12,6 +12,7 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const errors = @import("errors.zig");
+const modules = @import("modules.zig");
 
 const TypeExpr = ast.TypeExpr;
 const Span = ast.Span;
@@ -157,6 +158,8 @@ pub const SymbolKind = enum {
     struct_type,
     enum_type,
     asset,
+    /// A namespace for an imported module (e.g. `math` from `use std.math`).
+    module,
 };
 
 /// A single symbol recorded in the symbol table.
@@ -167,6 +170,8 @@ pub const Symbol = struct {
     span: Span,
     mutable: bool,
     is_private: bool = false,
+    /// True if this symbol was inherited from a parent contract.
+    inherited: bool = false,
 };
 
 /// A hierarchical symbol table with parent-chain lookup.
@@ -235,6 +240,8 @@ pub const TypeResolver = struct {
     interface_defs: std.StringHashMap(ast.InterfaceDef),
     /// SPEC: Novel Idea 6 — Track capability type names for linear resolution.
     capability_names: std.StringHashMap(void),
+    /// Stores resolved modules (e.g. from `use std.math`) for lookup by name.
+    module_map: std.StringHashMap(modules.Module),
     allocator: std.mem.Allocator,
     diagnostics: *DiagnosticList,
 
@@ -249,6 +256,7 @@ pub const TypeResolver = struct {
             .asset_defs = std.StringHashMap(ast.AssetDef).init(allocator),
             .interface_defs = std.StringHashMap(ast.InterfaceDef).init(allocator),
             .capability_names = std.StringHashMap(void).init(allocator),
+            .module_map = std.StringHashMap(modules.Module).init(allocator),
             .allocator = allocator,
             .diagnostics = diagnostics,
         };
@@ -276,6 +284,7 @@ pub const TypeResolver = struct {
         self.asset_defs.deinit();
         self.interface_defs.deinit();
         self.capability_names.deinit();
+        self.module_map.deinit();
     }
 
     pub fn lookupInterface(self: *const TypeResolver, name: []const u8) ?ast.InterfaceDef {
@@ -740,17 +749,28 @@ pub const TypeResolver = struct {
                     });
                 },
                 .version => {},
-                .use_import => {},
+                .use_import => |ui| {
+                    if (modules.resolveBuiltin(ui.path)) |mod| {
+                        try self.module_map.put(mod.name, mod);
+                        try self.global_scope.define(mod.name, .{
+                            .name = mod.name,
+                            .kind = .module,
+                            .type_ = .void_,
+                            .span = ui.span,
+                            .mutable = false,
+                        });
+                    }
+                },
                 .interface_def => |iface| {
                     // Store the interface definition for later conformance checking.
                     try self.interface_defs.put(iface.name, iface);
                     // Also register the name in the global scope so the type system
                     // can resolve `implements InterfaceName` references.
                     try self.global_scope.define(iface.name, .{
-                        .name    = iface.name,
-                        .kind    = .type_alias,
-                        .type_   = .void_,
-                        .span    = iface.span,
+                        .name = iface.name,
+                        .kind = .type_alias,
+                        .type_ = .void_,
+                        .span = iface.span,
                         .mutable = false,
                     });
                 },
@@ -777,6 +797,21 @@ pub const TypeResolver = struct {
                 .global_invariant => {},
             }
         }
+    }
+
+    /// Look up a function exported by a module.
+    /// Returns null if the module doesn't exist or doesn't export that function.
+    pub fn lookupModuleFn(self: *const TypeResolver, module_name: []const u8, fn_name: []const u8) ?modules.ModuleFn {
+        const mod = self.module_map.get(module_name) orelse return null;
+        for (mod.exports) |exp| {
+            switch (exp) {
+                .function => |fn_| {
+                    if (std.mem.eql(u8, fn_.name, fn_name)) return fn_;
+                },
+                else => {},
+            }
+        }
+        return null;
     }
 };
 

@@ -255,7 +255,7 @@ pub const MirOp = union(enum) {
 
     // ── Cross-contract / scheduled ─────────────────────────────────────────
     /// SPEC: Part 10.2 — Schedule a deferred call.
-    schedule_call: struct { delay: Reg, calldata: Reg, calldata_len: Reg },
+    schedule_call: struct { recipient: Reg, calldata: Reg, delay: Reg },
     /// SPEC: Part 10.1 — Call another contract's action.
     call_external: struct { dst: Reg, target: Reg, selector: Selector, args: []const Reg },
 
@@ -320,11 +320,11 @@ pub const FuncKind = enum {
     receive,
     guard,
     helper,
-    asset_hook,        // SPEC: Part 8.3 — before/after transfer hooks
-    computed,          // SPEC: Part 5.2 — derived field logic
+    asset_hook, // SPEC: Part 8.3 — before/after transfer hooks
+    computed, // SPEC: Part 5.2 — derived field logic
     invariant_handler, // SPEC: Novel Idea 5 — on_violation blocks
-    attack_spec,       // SPEC: Novel Idea 3 — adversary tries: blocks
-    migration_logic,   // SPEC: Part 13 — upgrade: migrate_fn logic
+    attack_spec, // SPEC: Novel Idea 3 — adversary tries: blocks
+    migration_logic, // SPEC: Part 13 — upgrade: migrate_fn logic
 };
 
 /// SPEC: Part 5 — A function parameter in MIR form.
@@ -1083,7 +1083,7 @@ pub const MirLowerer = struct {
             .enum_variant => |ev| {
                 const interned = try self.data.intern(ev.variant_name);
                 const tag_id = interned.offset;
-                
+
                 const cond = self.freshReg();
                 try self.emit(.{ .enum_match = .{ .dst = cond, .subject = subject, .tag_id = tag_id } }, span);
                 const fallthrough = self.freshLabel();
@@ -1101,23 +1101,23 @@ pub const MirLowerer = struct {
             .range => |r| {
                 const lo = try self.lowerExpr(r.lo);
                 const hi = try self.lowerExpr(r.hi);
-                
+
                 const gte = self.freshReg();
                 try self.emit(.{ .ge = .{ .dst = gte, .lhs = subject, .rhs = lo } }, span);
-                
+
                 const lte = self.freshReg();
                 try self.emit(.{ .le = .{ .dst = lte, .lhs = subject, .rhs = hi } }, span);
-                
+
                 const cond = self.freshReg();
                 try self.emit(.{ .bool_and = .{ .dst = cond, .lhs = gte, .rhs = lte } }, span);
-                
+
                 const fallthrough = self.freshLabel();
                 try self.emit(.{ .branch = .{ .cond = cond, .then_ = fallthrough, .else_ = fail_label } }, span);
                 try self.emit(.{ .label = .{ .id = fallthrough } }, span);
             },
             else => {
                 try self.emit(.{ .jump = .{ .target = fail_label } }, span);
-            }
+            },
         }
     }
 
@@ -1168,7 +1168,7 @@ pub const MirLowerer = struct {
                 for (m.arms) |arm| {
                     const fail_label = self.freshLabel();
                     try self.lowerPattern(&arm.pattern, subject, fail_label, span);
-                    
+
                     for (arm.body) |body_stmt| {
                         try self.lowerStmt(&body_stmt);
                     }
@@ -1245,7 +1245,7 @@ pub const MirLowerer = struct {
                 const loop_top = self.freshLabel();
                 const loop_body = self.freshLabel();
                 const loop_end = self.freshLabel();
-                
+
                 // Initialize counter to 0
                 const counter = self.freshReg();
                 try self.emit(.{ .const_i256 = .{ .dst = counter, .bytes = [_]u8{0} ** 32 } }, span);
@@ -1254,7 +1254,7 @@ pub const MirLowerer = struct {
                 defer _ = self.loop_stack.pop();
 
                 try self.emit(.{ .label = .{ .id = loop_top } }, span);
-                
+
                 // Check if counter < count
                 const cond = self.freshReg();
                 try self.emit(.{ .lt = .{ .dst = cond, .lhs = counter, .rhs = count } }, span);
@@ -1263,19 +1263,19 @@ pub const MirLowerer = struct {
                     .then_ = loop_body,
                     .else_ = loop_end,
                 } }, span);
-                
+
                 try self.emit(.{ .label = .{ .id = loop_body } }, span);
                 for (r.body) |body_stmt| {
                     try self.lowerStmt(&body_stmt);
                 }
-                
+
                 // Increment counter
                 const one = self.freshReg();
                 var one_bytes = [_]u8{0} ** 32;
                 one_bytes[31] = 1;
                 try self.emit(.{ .const_i256 = .{ .dst = one, .bytes = one_bytes } }, span);
                 try self.emit(.{ .add = .{ .dst = counter, .lhs = counter, .rhs = one } }, span);
-                
+
                 try self.emit(.{ .jump = .{ .target = loop_top } }, span);
                 try self.emit(.{ .label = .{ .id = loop_end } }, span);
             },
@@ -1285,7 +1285,7 @@ pub const MirLowerer = struct {
                 const loop_top = self.freshLabel();
                 const loop_body = self.freshLabel();
                 const loop_end = self.freshLabel();
-                
+
                 try self.loop_stack.append(self.allocator, .{ .cont_label = loop_top, .end_label = loop_end });
                 defer _ = self.loop_stack.pop();
 
@@ -1521,11 +1521,34 @@ pub const MirLowerer = struct {
             // ── schedule ──────────────────────────────────────────────────
             .schedule => |sch| {
                 const delay = try self.lowerExpr(sch.after);
-                const calldata = try self.lowerExpr(sch.call);
+                // Extract recipient and calldata from the call expression
+                var recipient: Reg = undefined;
+                var calldata: Reg = undefined;
+                if (sch.call.kind == .call) {
+                    const c = sch.call.kind.call;
+                    if (c.callee.kind == .field_access) {
+                        const fa = c.callee.kind.field_access;
+                        recipient = try self.lowerExpr(fa.object);
+                        const sel = fnvHash32(fa.field);
+                        const sel_reg = self.freshReg();
+                        var sel_bytes: [32]u8 = [_]u8{0} ** 32;
+                        std.mem.writeInt(u32, sel_bytes[0..4], sel, .little);
+                        try self.emit(.{ .const_i256 = .{ .dst = sel_reg, .bytes = sel_bytes } }, span);
+                        calldata = sel_reg;
+                    } else {
+                        const dst = try self.lowerCall(c.callee, c.args, span);
+                        recipient = dst;
+                        calldata = dst;
+                    }
+                } else {
+                    const dst = try self.lowerExpr(sch.call);
+                    recipient = dst;
+                    calldata = dst;
+                }
                 try self.emit(.{ .schedule_call = .{
-                    .delay = delay,
+                    .recipient = recipient,
                     .calldata = calldata,
-                    .calldata_len = 0,
+                    .delay = delay,
                 } }, span);
             },
 
@@ -2067,9 +2090,9 @@ pub const MirLowerer = struct {
         // Emit a trailing return if not already present.
         const needs_ret = self.instrs.items.len == 0 or
             switch (self.instrs.items[self.instrs.items.len - 1].op) {
-            .ret => false,
-            else => true,
-        };
+                .ret => false,
+                else => true,
+            };
         if (needs_ret) {
             try self.emit(.{ .ret = .{ .value = null } }, .{ .line = 0, .col = 0, .len = 0 });
         }
