@@ -29,7 +29,9 @@ zephyria
 
 # Folders
 skills/
-
+vm/
+node_data/
+artifacts/
 
 # Artifacts
 gaps_implementation_plan.md
@@ -47,3 +49,4 @@ out/
 FORGE_DOCS.md
 FORGE_DOCUMENTATION_GUIDE.md
 main
+issues.txt

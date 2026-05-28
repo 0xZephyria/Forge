@@ -72,164 +72,164 @@ const U256 = @import("u256.zig").U256;
 /// All EVM opcodes up to and including Cancun (EIP-4844, EIP-1153, EIP-5656).
 pub const Op = enum(u8) {
     // ── Arithmetic ─────────────────────────────────────────────────────────
-    STOP        = 0x00,
-    ADD         = 0x01,
-    MUL         = 0x02,
-    SUB         = 0x03,
-    DIV         = 0x04,
-    SDIV        = 0x05,
-    MOD         = 0x06,
-    SMOD        = 0x07,
-    ADDMOD      = 0x08,
-    MULMOD      = 0x09,
-    EXP         = 0x0A,
-    SIGNEXTEND  = 0x0B,
+    STOP = 0x00,
+    ADD = 0x01,
+    MUL = 0x02,
+    SUB = 0x03,
+    DIV = 0x04,
+    SDIV = 0x05,
+    MOD = 0x06,
+    SMOD = 0x07,
+    ADDMOD = 0x08,
+    MULMOD = 0x09,
+    EXP = 0x0A,
+    SIGNEXTEND = 0x0B,
     // ── Comparison & bitwise ───────────────────────────────────────────────
-    LT          = 0x10,
-    GT          = 0x11,
-    SLT         = 0x12,
-    SGT         = 0x13,
-    EQ          = 0x14,
-    ISZERO      = 0x15,
-    AND         = 0x16,
-    OR          = 0x17,
-    XOR         = 0x18,
-    NOT         = 0x19,
-    BYTE        = 0x1A,
-    SHL         = 0x1B,  // Constantinople+
-    SHR         = 0x1C,  // Constantinople+
-    SAR         = 0x1D,  // Constantinople+
+    LT = 0x10,
+    GT = 0x11,
+    SLT = 0x12,
+    SGT = 0x13,
+    EQ = 0x14,
+    ISZERO = 0x15,
+    AND = 0x16,
+    OR = 0x17,
+    XOR = 0x18,
+    NOT = 0x19,
+    BYTE = 0x1A,
+    SHL = 0x1B, // Constantinople+
+    SHR = 0x1C, // Constantinople+
+    SAR = 0x1D, // Constantinople+
     // ── Hash ──────────────────────────────────────────────────────────────
-    KECCAK256   = 0x20,
+    KECCAK256 = 0x20,
     // ── Context ───────────────────────────────────────────────────────────
-    ADDRESS     = 0x30,
-    BALANCE     = 0x31,
-    ORIGIN      = 0x32,
-    CALLER      = 0x33,
-    CALLVALUE   = 0x34,
+    ADDRESS = 0x30,
+    BALANCE = 0x31,
+    ORIGIN = 0x32,
+    CALLER = 0x33,
+    CALLVALUE = 0x34,
     CALLDATALOAD = 0x35,
     CALLDATASIZE = 0x36,
     CALLDATACOPY = 0x37,
-    CODESIZE    = 0x38,
-    CODECOPY    = 0x39,
-    GASPRICE    = 0x3A,
+    CODESIZE = 0x38,
+    CODECOPY = 0x39,
+    GASPRICE = 0x3A,
     EXTCODESIZE = 0x3B,
     EXTCODECOPY = 0x3C,
     RETURNDATASIZE = 0x3D,
     RETURNDATACOPY = 0x3E,
     EXTCODEHASH = 0x3F,
     // ── Block ─────────────────────────────────────────────────────────────
-    BLOCKHASH   = 0x40,
-    COINBASE    = 0x41,
-    TIMESTAMP   = 0x42,
-    NUMBER      = 0x43,
-    PREVRANDAO  = 0x44,
-    GASLIMIT    = 0x45,
-    CHAINID     = 0x46,
+    BLOCKHASH = 0x40,
+    COINBASE = 0x41,
+    TIMESTAMP = 0x42,
+    NUMBER = 0x43,
+    PREVRANDAO = 0x44,
+    GASLIMIT = 0x45,
+    CHAINID = 0x46,
     SELFBALANCE = 0x47,
-    BASEFEE     = 0x48,
-    BLOBHASH    = 0x49,  // Cancun
-    BLOBBASEFEE = 0x4A,  // Cancun
+    BASEFEE = 0x48,
+    BLOBHASH = 0x49, // Cancun
+    BLOBBASEFEE = 0x4A, // Cancun
     // ── Memory / Storage ──────────────────────────────────────────────────
-    POP         = 0x50,
-    MLOAD       = 0x51,
-    MSTORE      = 0x52,
-    MSTORE8     = 0x53,
-    SLOAD       = 0x54,
-    SSTORE      = 0x55,
-    JUMP        = 0x56,
-    JUMPI       = 0x57,
-    PC          = 0x58,
-    MSIZE       = 0x59,
-    GAS         = 0x5A,
-    JUMPDEST    = 0x5B,
-    TLOAD       = 0x5C,  // Cancun (EIP-1153)
-    TSTORE      = 0x5D,  // Cancun (EIP-1153)
-    MCOPY       = 0x5E,  // Cancun (EIP-5656)
+    POP = 0x50,
+    MLOAD = 0x51,
+    MSTORE = 0x52,
+    MSTORE8 = 0x53,
+    SLOAD = 0x54,
+    SSTORE = 0x55,
+    JUMP = 0x56,
+    JUMPI = 0x57,
+    PC = 0x58,
+    MSIZE = 0x59,
+    GAS = 0x5A,
+    JUMPDEST = 0x5B,
+    TLOAD = 0x5C, // Cancun (EIP-1153)
+    TSTORE = 0x5D, // Cancun (EIP-1153)
+    MCOPY = 0x5E, // Cancun (EIP-5656)
     // ── PUSH ──────────────────────────────────────────────────────────────
-    PUSH0       = 0x5F,  // Shanghai+
-    PUSH1       = 0x60,
-    PUSH2       = 0x61,
-    PUSH3       = 0x62,
-    PUSH4       = 0x63,
-    PUSH5       = 0x64,
-    PUSH6       = 0x65,
-    PUSH7       = 0x66,
-    PUSH8       = 0x67,
-    PUSH9       = 0x68,
-    PUSH10      = 0x69,
-    PUSH11      = 0x6A,
-    PUSH12      = 0x6B,
-    PUSH13      = 0x6C,
-    PUSH14      = 0x6D,
-    PUSH15      = 0x6E,
-    PUSH16      = 0x6F,
-    PUSH17      = 0x70,
-    PUSH18      = 0x71,
-    PUSH19      = 0x72,
-    PUSH20      = 0x73,
-    PUSH21      = 0x74,
-    PUSH22      = 0x75,
-    PUSH23      = 0x76,
-    PUSH24      = 0x77,
-    PUSH25      = 0x78,
-    PUSH26      = 0x79,
-    PUSH27      = 0x7A,
-    PUSH28      = 0x7B,
-    PUSH29      = 0x7C,
-    PUSH30      = 0x7D,
-    PUSH31      = 0x7E,
-    PUSH32      = 0x7F,
+    PUSH0 = 0x5F, // Shanghai+
+    PUSH1 = 0x60,
+    PUSH2 = 0x61,
+    PUSH3 = 0x62,
+    PUSH4 = 0x63,
+    PUSH5 = 0x64,
+    PUSH6 = 0x65,
+    PUSH7 = 0x66,
+    PUSH8 = 0x67,
+    PUSH9 = 0x68,
+    PUSH10 = 0x69,
+    PUSH11 = 0x6A,
+    PUSH12 = 0x6B,
+    PUSH13 = 0x6C,
+    PUSH14 = 0x6D,
+    PUSH15 = 0x6E,
+    PUSH16 = 0x6F,
+    PUSH17 = 0x70,
+    PUSH18 = 0x71,
+    PUSH19 = 0x72,
+    PUSH20 = 0x73,
+    PUSH21 = 0x74,
+    PUSH22 = 0x75,
+    PUSH23 = 0x76,
+    PUSH24 = 0x77,
+    PUSH25 = 0x78,
+    PUSH26 = 0x79,
+    PUSH27 = 0x7A,
+    PUSH28 = 0x7B,
+    PUSH29 = 0x7C,
+    PUSH30 = 0x7D,
+    PUSH31 = 0x7E,
+    PUSH32 = 0x7F,
     // ── DUP ───────────────────────────────────────────────────────────────
-    DUP1        = 0x80,
-    DUP2        = 0x81,
-    DUP3        = 0x82,
-    DUP4        = 0x83,
-    DUP5        = 0x84,
-    DUP6        = 0x85,
-    DUP7        = 0x86,
-    DUP8        = 0x87,
-    DUP9        = 0x88,
-    DUP10       = 0x89,
-    DUP11       = 0x8A,
-    DUP12       = 0x8B,
-    DUP13       = 0x8C,
-    DUP14       = 0x8D,
-    DUP15       = 0x8E,
-    DUP16       = 0x8F,
+    DUP1 = 0x80,
+    DUP2 = 0x81,
+    DUP3 = 0x82,
+    DUP4 = 0x83,
+    DUP5 = 0x84,
+    DUP6 = 0x85,
+    DUP7 = 0x86,
+    DUP8 = 0x87,
+    DUP9 = 0x88,
+    DUP10 = 0x89,
+    DUP11 = 0x8A,
+    DUP12 = 0x8B,
+    DUP13 = 0x8C,
+    DUP14 = 0x8D,
+    DUP15 = 0x8E,
+    DUP16 = 0x8F,
     // ── SWAP ──────────────────────────────────────────────────────────────
-    SWAP1       = 0x90,
-    SWAP2       = 0x91,
-    SWAP3       = 0x92,
-    SWAP4       = 0x93,
-    SWAP5       = 0x94,
-    SWAP6       = 0x95,
-    SWAP7       = 0x96,
-    SWAP8       = 0x97,
-    SWAP9       = 0x98,
-    SWAP10      = 0x99,
-    SWAP11      = 0x9A,
-    SWAP12      = 0x9B,
-    SWAP13      = 0x9C,
-    SWAP14      = 0x9D,
-    SWAP15      = 0x9E,
-    SWAP16      = 0x9F,
+    SWAP1 = 0x90,
+    SWAP2 = 0x91,
+    SWAP3 = 0x92,
+    SWAP4 = 0x93,
+    SWAP5 = 0x94,
+    SWAP6 = 0x95,
+    SWAP7 = 0x96,
+    SWAP8 = 0x97,
+    SWAP9 = 0x98,
+    SWAP10 = 0x99,
+    SWAP11 = 0x9A,
+    SWAP12 = 0x9B,
+    SWAP13 = 0x9C,
+    SWAP14 = 0x9D,
+    SWAP15 = 0x9E,
+    SWAP16 = 0x9F,
     // ── LOG ───────────────────────────────────────────────────────────────
-    LOG0        = 0xA0,
-    LOG1        = 0xA1,
-    LOG2        = 0xA2,
-    LOG3        = 0xA3,
-    LOG4        = 0xA4,
+    LOG0 = 0xA0,
+    LOG1 = 0xA1,
+    LOG2 = 0xA2,
+    LOG3 = 0xA3,
+    LOG4 = 0xA4,
     // ── System ────────────────────────────────────────────────────────────
-    CREATE      = 0xF0,
-    CALL        = 0xF1,
-    CALLCODE    = 0xF2,
-    RETURN      = 0xF3,
+    CREATE = 0xF0,
+    CALL = 0xF1,
+    CALLCODE = 0xF2,
+    RETURN = 0xF3,
     DELEGATECALL = 0xF4,
-    CREATE2     = 0xF5,
-    STATICCALL  = 0xFA,
-    REVERT      = 0xFD,
-    INVALID     = 0xFE,
+    CREATE2 = 0xF5,
+    STATICCALL = 0xFA,
+    REVERT = 0xFD,
+    INVALID = 0xFE,
     SELFDESTRUCT = 0xFF,
 };
 
@@ -352,7 +352,7 @@ pub const EVMWriter = struct {
     /// Patch a 2-byte big-endian absolute jump target at a previously-recorded
     /// operand offset.
     pub fn patchU16(self: *EVMWriter, patch_offset: u32, target: u32) void {
-        self.buf.items[patch_offset]     = @intCast((target >> 8) & 0xFF);
+        self.buf.items[patch_offset] = @intCast((target >> 8) & 0xFF);
         self.buf.items[patch_offset + 1] = @intCast(target & 0xFF);
     }
 
@@ -395,47 +395,52 @@ pub fn evmSelector(sig: []const u8) u32 {
 /// Used to build function signature strings for selector computation.
 pub fn evmAbiType(ty: ResolvedType) []const u8 {
     return switch (ty) {
-        .u8       => "uint8",
-        .u16      => "uint16",
-        .u32      => "uint32",
-        .u64      => "uint64",
-        .u128     => "uint128",
-        .u256     => "uint256",
-        .i8       => "int8",
-        .i16      => "int16",
-        .i32      => "int32",
-        .i64      => "int64",
-        .i128     => "int128",
-        .i256     => "int256",
+        .u8 => "uint8",
+        .u16 => "uint16",
+        .u32 => "uint32",
+        .u64 => "uint64",
+        .u128 => "uint128",
+        .u256 => "uint256",
+        .i8 => "int8",
+        .i16 => "int16",
+        .i32 => "int32",
+        .i64 => "int64",
+        .i128 => "int128",
+        .i256 => "int256",
         .fixed_point => "uint256",
-        .bool     => "bool",
+        .bool => "bool",
         .account, .wallet, .program, .system_acc => "address",
         .hash, .commitment => "bytes32",
-        .bytes_n  => |n| switch (n) {
-            1  => "bytes1",  2  => "bytes2",  4  => "bytes4",
-            8  => "bytes8",  16 => "bytes16", 20 => "bytes20",
-            32 => "bytes32", 64 => "bytes32", // bytes64 capped to bytes32
+        .bytes_n => |n| switch (n) {
+            1 => "bytes1",
+            2 => "bytes2",
+            4 => "bytes4",
+            8 => "bytes8",
+            16 => "bytes16",
+            20 => "bytes20",
+            32 => "bytes32",
+            64 => "bytes32", // bytes64 capped to bytes32
             else => "bytes32",
         },
-        .bytes    => "bytes",
+        .bytes => "bytes",
         .signature => "bytes",
-        .pubkey   => "bytes",
+        .pubkey => "bytes",
         .string, .short_str => "string",
         .timestamp, .duration, .block_number => "uint64",
-        .asset    => "address",
-        .list     => "bytes",
-        .set      => "bytes",
+        .asset => "address",
+        .list => "bytes",
+        .set => "bytes",
         .map, .enum_map => "bytes",
-        .array    => "bytes",
-        .tuple    => "bytes",
-        .struct_  => "bytes",
-        .enum_    => "uint8",
-        .maybe    => "bytes",
-        .result   => "bytes",
-        .linear   => "bytes",
+        .array => "bytes",
+        .tuple => "bytes",
+        .struct_ => "bytes",
+        .enum_ => "uint8",
+        .maybe => "bytes",
+        .result => "bytes",
+        .linear => "bytes",
         .capability => "bytes",
-        .proof    => "bytes",
-        .void_    => "",
+        .proof => "bytes",
+        .void_ => "",
     };
 }
 
@@ -497,7 +502,7 @@ pub fn buildEventSig(
 /// Static types: 32 bytes. Dynamic types (bytes, string, array): 0 = dynamic.
 pub fn abiStaticSize(ty: ResolvedType) u32 {
     return switch (ty) {
-        .bytes, .string, .short_str => 0,  // dynamic
+        .bytes, .string, .short_str => 0, // dynamic
         .list, .set, .map, .enum_map, .array, .tuple, .struct_, .result => 0,
         else => 32,
     };
@@ -554,7 +559,7 @@ pub const LocalVar = struct {
 /// Complete EVM code generator. Converts a Mid-Level IR (MIR) module into
 /// EVM initcode (deploy + runtime combined).
 /// This is the unified backend entry point for all EVM-compatible networks.
-/// 
+///
 /// SPEC REFERENCE: Part 5 (Contract Anatomy), Part 14 (EVM ABI compatibility)
 pub const EVMCodeGen = struct {
     allocator: std.mem.Allocator,
@@ -711,7 +716,7 @@ pub const EVMCodeGen = struct {
         defer dispatch_entries.deinit(self.allocator);
 
         for (mir.functions) |*func| {
-             const is_dispatchable = switch (func.kind) {
+            const is_dispatchable = switch (func.kind) {
                 .action, .view, .pure => true,
                 else => false,
             };
@@ -741,8 +746,14 @@ pub const EVMCodeGen = struct {
         var fallback_func: ?*const mir_mod.MirFunction = null;
 
         for (mir.functions) |*func| {
-            if (func.kind == .receive) { has_receive = true; receive_func = func; }
-            if (func.kind == .fallback) { has_fallback = true; fallback_func = func; }
+            if (func.kind == .receive) {
+                has_receive = true;
+                receive_func = func;
+            }
+            if (func.kind == .fallback) {
+                has_fallback = true;
+                fallback_func = func;
+            }
         }
 
         if (has_receive) {
@@ -750,10 +761,10 @@ pub const EVMCodeGen = struct {
             try w.op(.ISZERO);
             const bypass_receive_patch = try w.push2Placeholder();
             try w.op(.JUMPI);
-            
+
             const base_mem = selector_base_mem.get(receive_func.?.selector).?;
             try self.mirEmitFuncBody(receive_func.?, &w, false, base_mem);
-            
+
             const bypass_dest = w.offset();
             w.patchU16(bypass_receive_patch, bypass_dest);
             try w.op(.JUMPDEST);
@@ -793,11 +804,7 @@ pub const EVMCodeGen = struct {
                 try w.op(.MSTORE);
             }
 
-            try self.mirEmitFuncBodyWithInternals(
-                func, &w, false, false,
-                &internal_offsets, &internal_patches,
-                base_mem, selector_base_mem, mir
-            );
+            try self.mirEmitFuncBodyWithInternals(func, &w, false, false, &internal_offsets, &internal_patches, base_mem, selector_base_mem, mir);
         }
 
         for (mir.functions) |*func| {
@@ -817,11 +824,7 @@ pub const EVMCodeGen = struct {
             }
 
             const base_mem = selector_base_mem.get(func.selector).?;
-            try self.mirEmitFuncBodyWithInternals(
-                func, &w, false, true,
-                &internal_offsets, &internal_patches,
-                base_mem, selector_base_mem, mir
-            );
+            try self.mirEmitFuncBodyWithInternals(func, &w, false, true, &internal_offsets, &internal_patches, base_mem, selector_base_mem, mir);
         }
 
         return w.toOwnedSlice();
@@ -861,17 +864,17 @@ pub const EVMCodeGen = struct {
             if (instr.op == .call_internal) {
                 const ci = instr.op.call_internal;
                 const target_base_mem = selector_base_mem.get(ci.selector) orelse 0x80;
-                
+
                 for (ci.args, 0..) |arg, ai| {
                     try w.pushU32(rctx.memOf(arg));
                     try w.op(.MLOAD);
                     try w.pushU32(@intCast(target_base_mem + @as(u32, @intCast(ai)) * 32));
                     try w.op(.MSTORE);
                 }
-                
+
                 const ret_addr_offset = w.offset() + 7;
                 try w.push2(@intCast(ret_addr_offset));
-                
+
                 if (internal_offsets.get(ci.selector)) |target| {
                     try w.push2(@intCast(target));
                 } else {
@@ -882,7 +885,7 @@ pub const EVMCodeGen = struct {
                 }
                 try w.op(.JUMP);
                 try w.op(.JUMPDEST);
-                
+
                 try w.pushU32(rctx.memOf(ci.dst));
                 try w.op(.MSTORE);
                 continue;
@@ -963,7 +966,6 @@ pub const EVMCodeGen = struct {
         is_initcode: bool,
         is_internal: bool,
     ) anyerror!void {
-
         switch (instr.op) {
 
             // ── Constants ─────────────────────────────────────────────────
@@ -1452,7 +1454,7 @@ pub const EVMCodeGen = struct {
 
                 // Push data size and offset.
                 try w.pushU32(mem_off); // data size
-                try w.push0();          // data offset
+                try w.push0(); // data offset
 
                 // Push indexed topics (reverse order for EVM stack).
                 var ti = topic_regs.items.len;
@@ -1514,17 +1516,17 @@ pub const EVMCodeGen = struct {
             // ── Native transfer ───────────────────────────────────────────
             .pay => |p| {
                 // CALL(gas, to, value, inOff, inLen, outOff, outLen)
-                try w.op(.GAS);                           // gas
-                try w.pushU32(rctx.memOf(p.recipient));   // to
+                try w.op(.GAS); // gas
+                try w.pushU32(rctx.memOf(p.recipient)); // to
                 try w.op(.MLOAD);
-                try w.pushU32(rctx.memOf(p.amount));      // value
+                try w.pushU32(rctx.memOf(p.amount)); // value
                 try w.op(.MLOAD);
-                try w.push0();                            // inOff
-                try w.push0();                            // inLen
-                try w.push0();                            // outOff
-                try w.push0();                            // outLen
+                try w.push0(); // inOff
+                try w.push0(); // inLen
+                try w.push0(); // outOff
+                try w.push0(); // outLen
                 try w.op(.CALL);
-                try w.op(.POP);                           // pop success
+                try w.op(.POP); // pop success
             },
 
             // ── Caller / context builtins ─────────────────────────────────
@@ -1678,7 +1680,8 @@ pub const EVMCodeGen = struct {
             .collection_len,
             .collection_get,
             // SPEC: Part 9.2 — enum_match: tag comparison lowered to eq by checker.
-            .enum_match => {},
+            .enum_match,
+            => {},
         }
     }
 
@@ -1752,7 +1755,6 @@ pub const EVMCodeGen = struct {
     }
 };
 
-
 // ============================================================================
 // Section 9 — Utility Functions
 // ============================================================================
@@ -1779,24 +1781,33 @@ fn scaleFixedPoint(lit: []const u8, decimals: u8) U256 {
     var in_frac = false;
     for (lit) |c| {
         if (c == '_') continue;
-        if (c == '.') { in_frac = true; continue; }
+        if (c == '.') {
+            in_frac = true;
+            continue;
+        }
         if (!in_frac) {
-            if (int_len < int_buf.len) { int_buf[int_len] = c; int_len += 1; }
+            if (int_len < int_buf.len) {
+                int_buf[int_len] = c;
+                int_len += 1;
+            }
         } else {
-            if (frac_len < frac_buf.len) { frac_buf[frac_len] = c; frac_len += 1; }
+            if (frac_len < frac_buf.len) {
+                frac_buf[frac_len] = c;
+                frac_len += 1;
+            }
         }
     }
-    
+
     // Convert integer part
     const int_str = if (int_len > 0) int_buf[0..int_len] else "0";
     var result = U256.parseDecimal(int_str) catch U256.zero;
-    
+
     // Scale up by number of decimals
     var i: u8 = 0;
     while (i < decimals) : (i += 1) {
         result = result.mul10().result;
     }
-    
+
     // Convert fractional part if any, scaled appropriately
     var frac_val = U256.zero;
     if (frac_len > 0) {
@@ -1806,7 +1817,7 @@ fn scaleFixedPoint(lit: []const u8, decimals: u8) U256 {
         frac_val = U256.parseDecimal(padded[0..decimals]) catch U256.zero;
         result = result.add(frac_val).result;
     }
-    
+
     return result;
 }
 
@@ -1871,7 +1882,7 @@ test "EVMWriter pushU256BE minimal push width" {
     var w = EVMWriter.init(alloc);
     defer w.deinit();
     var be: [32]u8 = [_]u8{0} ** 32;
-    be[31] = 0xFF;  // only one significant byte
+    be[31] = 0xFF; // only one significant byte
     try w.pushU256BE(be);
     // Should emit PUSH1 0xFF
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x60, 0xFF }, w.bytes());
@@ -1898,19 +1909,19 @@ test "evmSelector balanceOf matches Solidity" {
 }
 
 test "evmAbiType all primitive types" {
-    try std.testing.expectEqualStrings("uint8",    evmAbiType(.u8));
-    try std.testing.expectEqualStrings("uint256",  evmAbiType(.u256));
-    try std.testing.expectEqualStrings("int8",     evmAbiType(.i8));
-    try std.testing.expectEqualStrings("int256",   evmAbiType(.i256));
-    try std.testing.expectEqualStrings("bool",     evmAbiType(.bool));
-    try std.testing.expectEqualStrings("address",  evmAbiType(.wallet));
-    try std.testing.expectEqualStrings("address",  evmAbiType(.account));
-    try std.testing.expectEqualStrings("bytes32",  evmAbiType(.hash));
-    try std.testing.expectEqualStrings("bytes",    evmAbiType(.bytes));
-    try std.testing.expectEqualStrings("string",   evmAbiType(.string));
-    try std.testing.expectEqualStrings("uint64",   evmAbiType(.timestamp));
-    try std.testing.expectEqualStrings("uint64",   evmAbiType(.duration));
-    try std.testing.expectEqualStrings("uint8",    evmAbiType(.{ .enum_ = @constCast(&types.EnumInfo{ .name = "X", .variants = &.{} }) }));
+    try std.testing.expectEqualStrings("uint8", evmAbiType(.u8));
+    try std.testing.expectEqualStrings("uint256", evmAbiType(.u256));
+    try std.testing.expectEqualStrings("int8", evmAbiType(.i8));
+    try std.testing.expectEqualStrings("int256", evmAbiType(.i256));
+    try std.testing.expectEqualStrings("bool", evmAbiType(.bool));
+    try std.testing.expectEqualStrings("address", evmAbiType(.wallet));
+    try std.testing.expectEqualStrings("address", evmAbiType(.account));
+    try std.testing.expectEqualStrings("bytes32", evmAbiType(.hash));
+    try std.testing.expectEqualStrings("bytes", evmAbiType(.bytes));
+    try std.testing.expectEqualStrings("string", evmAbiType(.string));
+    try std.testing.expectEqualStrings("uint64", evmAbiType(.timestamp));
+    try std.testing.expectEqualStrings("uint64", evmAbiType(.duration));
+    try std.testing.expectEqualStrings("uint8", evmAbiType(.{ .enum_ = @constCast(&types.EnumInfo{ .name = "X", .variants = &.{} }) }));
 }
 
 test "buildFuncSig with no params" {
@@ -1933,8 +1944,8 @@ test "buildFuncSig transfer(address,uint256)" {
     defer resolver.deinit();
 
     const params = [_]ast.Param{
-        .{ .name = "to",     .declared_type = .wallet, .is_private = false, .span = .{ .line = 1, .col = 1, .len = 2 } },
-        .{ .name = "amount", .declared_type = .u256,   .is_private = false, .span = .{ .line = 1, .col = 5, .len = 6 } },
+        .{ .name = "to", .declared_type = .wallet, .is_private = false, .span = .{ .line = 1, .col = 1, .len = 2 } },
+        .{ .name = "amount", .declared_type = .u256, .is_private = false, .span = .{ .line = 1, .col = 5, .len = 6 } },
     };
     const sig = try buildFuncSig("transfer", &params, &resolver, alloc);
     defer alloc.free(sig);
@@ -1949,8 +1960,8 @@ test "buildSelector produces correct 4-byte ERC-20 transfer selector" {
     defer resolver.deinit();
 
     const params = [_]ast.Param{
-        .{ .name = "to",     .declared_type = .wallet, .is_private = false, .span = .{ .line = 1, .col = 1, .len = 2 } },
-        .{ .name = "amount", .declared_type = .u256,   .is_private = false, .span = .{ .line = 1, .col = 5, .len = 6 } },
+        .{ .name = "to", .declared_type = .wallet, .is_private = false, .span = .{ .line = 1, .col = 1, .len = 2 } },
+        .{ .name = "amount", .declared_type = .u256, .is_private = false, .span = .{ .line = 1, .col = 5, .len = 6 } },
     };
     const sel = try buildSelector("transfer", &params, &resolver, alloc);
     try std.testing.expectEqual(@as(u32, 0xa9059cbb), sel);

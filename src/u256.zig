@@ -23,16 +23,16 @@ pub const U256 = struct {
         for (src) |char| {
             if (char == '_') continue;
             if (char < '0' or char > '9') return error.InvalidCharacter;
-            
+
             const digit: u64 = char - '0';
-            
+
             const mul_res = result.mul10();
             if (mul_res.overflow) return error.Overflow;
-            
+
             const digit_u256 = U256{ .limbs = .{ digit, 0, 0, 0 } };
             const add_res = mul_res.result.add(digit_u256);
             if (add_res.overflow) return error.Overflow;
-            
+
             result = add_res.result;
         }
         return result;
@@ -43,7 +43,7 @@ pub const U256 = struct {
         var result = U256.zero;
         for (src) |char| {
             if (char == '_') continue;
-            
+
             const digit: u64 = switch (char) {
                 '0'...'9' => char - '0',
                 'a'...'f' => char - 'a' + 10,
@@ -54,14 +54,14 @@ pub const U256 = struct {
             // Shift left by 4
             var new_limbs = [4]u64{ 0, 0, 0, 0 };
             var overflow_bits: u64 = 0;
-            
+
             inline for (0..4) |i| {
                 const limb = result.limbs[i];
                 new_limbs[i] = (limb << 4) | overflow_bits;
                 overflow_bits = limb >> 60; // top 4 bits
             }
             if (overflow_bits != 0) return error.Overflow;
-            
+
             new_limbs[0] |= digit;
             result = .{ .limbs = new_limbs };
         }
@@ -92,14 +92,14 @@ pub const U256 = struct {
     pub fn add(a: U256, b: U256) struct { result: U256, overflow: bool } {
         var res = U256.zero;
         var carry: u1 = 0;
-        
+
         inline for (0..4) |i| {
             const add1 = @addWithOverflow(a.limbs[i], b.limbs[i]);
             const add2 = @addWithOverflow(add1[0], carry);
             res.limbs[i] = add2[0];
             carry = add1[1] | add2[1];
         }
-        
+
         return .{ .result = res, .overflow = carry != 0 };
     }
 
@@ -124,7 +124,7 @@ pub const U256 = struct {
         const has_overflow2 = overflow2 != 0;
 
         const add_res = res8.add(res2);
-        
+
         return .{
             .result = add_res.result,
             .overflow = has_overflow8 or has_overflow2 or add_res.overflow,
@@ -134,9 +134,9 @@ pub const U256 = struct {
     /// SPEC: Part 2.1 — Check if two U256 values are equal.
     pub fn eql(a: U256, b: U256) bool {
         return a.limbs[0] == b.limbs[0] and
-               a.limbs[1] == b.limbs[1] and
-               a.limbs[2] == b.limbs[2] and
-               a.limbs[3] == b.limbs[3];
+            a.limbs[1] == b.limbs[1] and
+            a.limbs[2] == b.limbs[2] and
+            a.limbs[3] == b.limbs[3];
     }
 
     /// SPEC: Part 2.1 — Check if U256 is zero.
@@ -234,20 +234,20 @@ test "parseDecimal invalid character" {
 }
 
 test "fitsU64 and fitsU32" {
-    const v1 = U256{ .limbs = .{0xFFFFFFFF, 0, 0, 0} };
+    const v1 = U256{ .limbs = .{ 0xFFFFFFFF, 0, 0, 0 } };
     try std.testing.expect(v1.fitsU32() == true);
 
-    const v2 = U256{ .limbs = .{0x1_0000_0000, 0, 0, 0} };
+    const v2 = U256{ .limbs = .{ 0x1_0000_0000, 0, 0, 0 } };
     try std.testing.expect(v2.fitsU32() == false);
 
-    const v3 = U256{ .limbs = .{0, 1, 0, 0} };
+    const v3 = U256{ .limbs = .{ 0, 1, 0, 0 } };
     try std.testing.expect(v3.fitsU64() == false);
 }
 
 test "add with carry" {
-    const a = U256{ .limbs = .{0xFFFFFFFFFFFFFFFF, 0, 0, 0} };
+    const a = U256{ .limbs = .{ 0xFFFFFFFFFFFFFFFF, 0, 0, 0 } };
     const res1 = a.add(U256.one);
-    try std.testing.expect(res1.result.eql(U256{ .limbs = .{0, 1, 0, 0} }));
+    try std.testing.expect(res1.result.eql(U256{ .limbs = .{ 0, 1, 0, 0 } }));
     try std.testing.expect(res1.overflow == false);
 
     const res2 = U256.max.add(U256.one);

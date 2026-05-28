@@ -33,9 +33,9 @@ pub const Span = struct {
     /// 1-based line number in the source file.
     line: u32,
     /// 1-based UTF-8 column number (byte offset within line).
-    col:  u32,
+    col: u32,
     /// Byte length of the node's textual representation.
-    len:  u32,
+    len: u32,
 };
 
 // ============================================================================
@@ -48,12 +48,22 @@ pub const Span = struct {
 /// the parser; free with `freeAll` at the end of the compilation pipeline.
 pub const TypeExpr = union(enum) {
     // ── Unsigned integers ─────────────────────────────────────────────────
-    u8, u16, u32, u64, u128, u256,
+    u8,
+    u16,
+    u32,
+    u64,
+    u128,
+    u256,
     /// `uint` — alias for `u256`, default for all token math.
     uint,
 
     // ── Signed integers ───────────────────────────────────────────────────
-    i8, i16, i32, i64, i128, i256,
+    i8,
+    i16,
+    i32,
+    i64,
+    i128,
+    i256,
     /// `int` — alias for `i256`.
     int,
 
@@ -167,17 +177,17 @@ pub const ExprKind = union(enum) {
     // ── Literals ──────────────────────────────────────────────────────────
     /// Integer or `u256` literal — stored as the raw digit string from source
     /// to preserve precision (e.g. `"115792089237316195..."``).
-    int_lit:    []const u8,
+    int_lit: []const u8,
     /// Fixed-point / float literal (e.g. `"1_234.567890"`).
-    float_lit:  []const u8,
+    float_lit: []const u8,
     /// `yes` or `no` boolean literal.
-    bool_lit:   bool,
+    bool_lit: bool,
     /// A double-quoted UTF-8 string literal.
     string_lit: []const u8,
     /// The `nothing` keyword (empty optional).
     nothing,
     /// `something(expr)` — wrapping a value in an optional.
-    something:  *Expr,
+    something: *Expr,
 
     // ── Name resolution ───────────────────────────────────────────────────
     /// A bare identifier or qualified name (e.g. `x`, `mine`, `params.user`).
@@ -203,7 +213,7 @@ pub const ExprKind = union(enum) {
     /// Struct literal: `TypeName { field = val, ... }`.
     struct_lit: struct { type_name: []const u8, fields: []FieldInit },
     /// Tuple literal: `(a, b, c)`.
-    tuple_lit:  []*Expr,
+    tuple_lit: []*Expr,
 
     // ── Pattern matching ──────────────────────────────────────────────────
     /// `match subject: arm1 arm2 ...` used as an expression (e.g. in let).
@@ -237,16 +247,16 @@ pub const ExprKind = union(enum) {
 /// A function/action call argument — may be positional or named.
 pub const Argument = struct {
     /// If `null`, this is a positional argument; otherwise it is named.
-    name:  ?[]const u8,
+    name: ?[]const u8,
     value: *Expr,
-    span:  Span,
+    span: Span,
 };
 
 /// One field initialiser inside a struct literal: `fieldName = expr`.
 pub const FieldInit = struct {
-    name:  []const u8,
+    name: []const u8,
     value: *Expr,
-    span:  Span,
+    span: Span,
 };
 
 // ── Binary operators ─────────────────────────────────────────────────────────
@@ -324,36 +334,36 @@ pub const Pattern = union(enum) {
     /// `_` — matches anything, binds nothing.
     wildcard,
     /// A literal value (`42`, `yes`, `"hello"`, `nothing`).
-    literal:  *Expr,
+    literal: *Expr,
     /// A named binding (`x`) — matches anything, binds to the given name.
-    binding:  []const u8,
+    binding: []const u8,
     /// `nothing` — matches the absent optional.
     nothing,
     /// `something(binding)` — matches a present optional, binds inner value.
     something: []const u8,
     /// `ok(binding)` — matches the success arm of a Result.
-    ok:        []const u8,
+    ok: []const u8,
     /// `fail(binding)` or `fail(ErrorVariant(bindings))`.
-    fail:      PatternFail,
+    fail: PatternFail,
     /// `EnumType.Variant` or `EnumType.Variant { field = binding, ... }`.
     enum_variant: PackedEnumVariant,
     /// Range pattern: `lo .. hi` (inclusive).
-    range:    struct { lo: *Expr, hi: *Expr },
+    range: struct { lo: *Expr, hi: *Expr },
     /// Tuple pattern: `(p1, p2, ...)`.
-    tuple:    []Pattern,
+    tuple: []Pattern,
 };
 
 /// Data carried in a `fail(...)` pattern.
 pub const PatternFail = struct {
     /// Optional concrete error variant name; `null` means catch-all `fail(x)`.
-    variant:  ?[]const u8,
+    variant: ?[]const u8,
     /// Variable name(s) bound to the error's fields.
     bindings: [][]const u8,
 };
 
 /// An enum variant pattern, optionally with field bindings.
 pub const PackedEnumVariant = struct {
-    type_name:    []const u8,
+    type_name: []const u8,
     variant_name: []const u8,
     /// Named bindings for variant fields, e.g. `{ price = p }`.
     field_bindings: []FieldBinding,
@@ -361,7 +371,7 @@ pub const PackedEnumVariant = struct {
 
 /// A single named field binding inside a pattern.
 pub const FieldBinding = struct {
-    field:   []const u8,
+    field: []const u8,
     binding: []const u8,
 };
 
@@ -369,8 +379,8 @@ pub const FieldBinding = struct {
 pub const MatchArm = struct {
     pattern: Pattern,
     /// Arm body — one or more statements.
-    body:    []Stmt,
-    span:    Span,
+    body: []Stmt,
+    span: Span,
 };
 
 // ============================================================================
@@ -387,35 +397,35 @@ pub const Stmt = struct {
 pub const StmtKind = union(enum) {
     // ── Bindings ──────────────────────────────────────────────────────────
     /// `let x is Type = expr`  or  `let x = expr` (type inferred).
-    let_bind:   LetBind,
+    let_bind: LetBind,
     /// `target = expr` — simple assignment.
-    assign:     Assign,
+    assign: Assign,
     /// `target += expr` / `-=` / `*=` / … — augmented assignment.
     aug_assign: AugAssign,
 
     // ── Control flow ──────────────────────────────────────────────────────
     /// `when cond: … otherwise when cond: … otherwise: …`
-    when:       WhenStmt,
+    when: WhenStmt,
     /// `match subject: arm …`
-    match:      MatchStmt,
+    match: MatchStmt,
     /// `each (k, v) in collection: …`
-    each:       EachLoop,
+    each: EachLoop,
     /// `repeat N times: …`
-    repeat:     RepeatLoop,
+    repeat: RepeatLoop,
     /// `while cond: …`
-    while_:     WhileLoop,
+    while_: WhileLoop,
 
     // ── Assertions ────────────────────────────────────────────────────────
     /// `need cond else "message"` or `need cond else TypedError(…)`.
-    need:       NeedStmt,
+    need: NeedStmt,
     /// `ensure cond else "message"` — post-condition check.
-    ensure:     EnsureStmt,
+    ensure: EnsureStmt,
     /// `panic "message"` — unconditional abort.
-    panic:      PanicStmt,
+    panic: PanicStmt,
 
     // ── Early exit ────────────────────────────────────────────────────────
     /// `give back expr` — return a value.
-    give_back:  *Expr,
+    give_back: *Expr,
     /// `stop` — break out of a loop.
     stop,
     /// `skip` — continue to next loop iteration.
@@ -423,49 +433,49 @@ pub const StmtKind = union(enum) {
 
     // ── Events & errors ───────────────────────────────────────────────────
     /// `tell EventName(args…)` — emit an event.
-    tell:       TellStmt,
+    tell: TellStmt,
     /// `throw ErrorType(args…)`.
-    throw:      ThrowStmt,
+    throw: ThrowStmt,
     /// `attempt: … on_error E: … always_after: …`
-    attempt:    AttemptStmt,
+    attempt: AttemptStmt,
 
     // ── ZK / Privacy ──────────────────────────────────────────────────────
     /// `verify proof_expr against commitment_expr` — evaluate off-chain ZK proofs.
-    verify:     VerifyStmt,
+    verify: VerifyStmt,
 
     // ── Expression statement ──────────────────────────────────────────────
     /// A bare call expression used as a statement (return value discarded).
-    call_stmt:  *Expr,
+    call_stmt: *Expr,
 
     // ── State mutation ────────────────────────────────────────────────────
     /// `remove mine.map[key]` — delete a map entry.
-    remove:     *Expr,
+    remove: *Expr,
     /// `pay account amount` — transfer native currency.
-    pay:        PayStmt,
+    pay: PayStmt,
     /// `send asset to account` — transfer a linear asset.
-    send:       SendStmt,
+    send: SendStmt,
     /// `move asset into mine.field` — store a linear asset in state.
     move_asset: MoveStmt,
 
     // ── Account lifecycle ─────────────────────────────────────────────────
     /// `expand account by N bytes` — grow account storage.
-    expand:     ExpandStmt,
+    expand: ExpandStmt,
     /// `close account refund_lamports_to wallet` — destroy an account.
-    close:      CloseStmt,
+    close: CloseStmt,
     /// `freeze account` — prevent all transfers from/to an account.
-    freeze:     FreezeStmt,
+    freeze: FreezeStmt,
     /// `unfreeze account`.
-    unfreeze:   UnfreezeStmt,
+    unfreeze: UnfreezeStmt,
 
     // ── Cross-contract ────────────────────────────────────────────────────
     /// `schedule call after duration` — deferred cross-program call.
-    schedule:   ScheduleStmt,
+    schedule: ScheduleStmt,
 
     // ── Access control ────────────────────────────────────────────────────
     /// `guard guardName` — apply a named guard at this point.
     guard_apply: []const u8,
     /// `only authorityName` / `only [a, b, c]` / `only auth1 or auth2`.
-    only:       OnlyStmt,
+    only: OnlyStmt,
 
     // ── Ownership ────────────────────────────────────────────────────────
     /// `transfer_ownership(account, to: new_owner)`.
@@ -477,20 +487,20 @@ pub const StmtKind = union(enum) {
 /// `let x is Type = expr` or `let x = expr`.
 pub const LetBind = struct {
     /// The name being introduced.
-    name:         []const u8,
+    name: []const u8,
     /// Optional declared type.  `null` means inferred.
     declared_type: ?TypeExpr,
     /// The initialiser expression.
-    init:         *Expr,
+    init: *Expr,
     /// `readonly` / `let` immutability.
-    mutable:      bool,
-    span:         Span,
+    mutable: bool,
+    span: Span,
 };
 
 /// `target = value`.
 pub const Assign = struct {
     target: *Expr,
-    value:  *Expr,
+    value: *Expr,
 };
 
 /// The augmented-assignment operator.
@@ -510,20 +520,20 @@ pub const AugOp = enum {
 /// `target op= value`.
 pub const AugAssign = struct {
     target: *Expr,
-    op:     AugOp,
-    value:  *Expr,
+    op: AugOp,
+    value: *Expr,
 };
 
 /// `when cond: body … [otherwise when cond: body …] [otherwise: body]`.
 pub const WhenStmt = struct {
     /// The primary condition.
-    cond:       *Expr,
+    cond: *Expr,
     /// Statements for the true branch.
-    then_body:  []Stmt,
+    then_body: []Stmt,
     /// Zero or more `otherwise when` branches.
-    else_ifs:   []ElseIf,
+    else_ifs: []ElseIf,
     /// Optional final `otherwise:` branch.
-    else_body:  ?[]Stmt,
+    else_body: ?[]Stmt,
 };
 
 /// A single `otherwise when cond: body` clause.
@@ -536,18 +546,18 @@ pub const ElseIf = struct {
 /// `match subject: arm …`
 pub const MatchStmt = struct {
     subject: *Expr,
-    arms:    []MatchArm,
+    arms: []MatchArm,
 };
 
 /// `each item in collection: body`  or  `each (k, v) in collection: body`.
 pub const EachLoop = struct {
     /// Variable(s) bound per iteration.  Single name or destructure tuple.
-    binding:    EachBinding,
+    binding: EachBinding,
     /// The collection expression.
     collection: *Expr,
     /// Optional `#[max_iterations N]` annotation.
-    max_iters:  ?u64,
-    body:       []Stmt,
+    max_iters: ?u64,
+    body: []Stmt,
 };
 
 /// Binding form used in `each`.
@@ -555,28 +565,28 @@ pub const EachBinding = union(enum) {
     /// Single variable: `each x in …`
     single: []const u8,
     /// Tuple destructure: `each (k, v) in …`  or  `each (i, x) in …indexed`
-    pair:   struct { first: []const u8, second: []const u8 },
+    pair: struct { first: []const u8, second: []const u8 },
 };
 
 /// `repeat N times: body`
 pub const RepeatLoop = struct {
-    count:     *Expr,
+    count: *Expr,
     max_iters: ?u64,
-    body:      []Stmt,
+    body: []Stmt,
 };
 
 /// `while cond: body`
 pub const WhileLoop = struct {
-    cond:      *Expr,
+    cond: *Expr,
     max_iters: ?u64,
-    body:      []Stmt,
+    body: []Stmt,
 };
 
 /// `need cond else <else_clause>`
 pub const NeedStmt = struct {
-    cond:  *Expr,
+    cond: *Expr,
     else_: NeedElse,
-    span:  Span,
+    span: Span,
 };
 
 /// The failure branch of a `need` or `ensure` statement.
@@ -590,15 +600,15 @@ pub const NeedElse = union(enum) {
 /// A typed error thrown in `need X else ErrorType(a, b)` or `throw ErrorType(a, b)`.
 pub const TypedErrorCall = struct {
     error_type: []const u8,
-    args:       []Argument,
-    span:       Span,
+    args: []Argument,
+    span: Span,
 };
 
 /// `ensure cond else <else_clause>` — post-condition assertion.
 pub const EnsureStmt = struct {
-    cond:  *Expr,
+    cond: *Expr,
     else_: NeedElse,
-    span:  Span,
+    span: Span,
 };
 
 /// `panic "message"` — unconditional runtime abort.
@@ -609,8 +619,8 @@ pub const PanicStmt = struct {
 /// `tell EventName(args…)` — emit a contract event.
 pub const TellStmt = struct {
     event_name: []const u8,
-    args:       []Argument,
-    span:       Span,
+    args: []Argument,
+    span: Span,
 };
 
 /// `throw ErrorType(args…)`.
@@ -620,8 +630,8 @@ pub const ThrowStmt = struct {
 
 /// `attempt: body on_error EType(binds): handler … [always_after: cleanup]`
 pub const AttemptStmt = struct {
-    body:        []Stmt,
-    on_error:    []OnErrorClause,
+    body: []Stmt,
+    on_error: []OnErrorClause,
     /// Optional `always_after:` cleanup block (runs regardless of success/failure).
     always_body: ?[]Stmt,
 };
@@ -631,38 +641,38 @@ pub const OnErrorClause = struct {
     /// `null` = catch-all `on_error _:`
     error_type: ?[]const u8,
     /// Bound variable names from the error fields.
-    bindings:   [][]const u8,
-    body:       []Stmt,
-    span:       Span,
+    bindings: [][]const u8,
+    body: []Stmt,
+    span: Span,
 };
 
 /// `pay account amount` — transfer native ZPH.
 pub const PayStmt = struct {
     recipient: *Expr,
-    amount:    *Expr,
+    amount: *Expr,
 };
 
 /// `send asset to account` — consume a linear asset by transferring it.
 pub const SendStmt = struct {
-    asset:     *Expr,
+    asset: *Expr,
     recipient: *Expr,
 };
 
 /// `move asset into mine.field` — store a linear asset into contract state.
 pub const MoveStmt = struct {
     asset: *Expr,
-    dest:  *Expr,
+    dest: *Expr,
 };
 
 /// `expand account by N bytes`.
 pub const ExpandStmt = struct {
     account: *Expr,
-    bytes:   *Expr,
+    bytes: *Expr,
 };
 
 /// `close account refund_lamports_to wallet`.
 pub const CloseStmt = struct {
-    account:   *Expr,
+    account: *Expr,
     refund_to: *Expr,
 };
 
@@ -679,16 +689,16 @@ pub const UnfreezeStmt = struct {
 /// `schedule call after duration` — deferred invocation (Part 10.2).
 pub const ScheduleStmt = struct {
     /// The call expression to be scheduled.
-    call:  *Expr,
+    call: *Expr,
     after: *Expr,
-    span:  Span,
+    span: Span,
 };
 
 /// `only auth` / `only auth1 or auth2` / `only [addr, addr]`.
 pub const OnlyStmt = struct {
     requirement: OnlyRequirement,
-    body:        []Stmt,
-    span:        Span,
+    body: []Stmt,
+    span: Span,
 };
 
 /// The subject of an `only` guard.
@@ -696,7 +706,7 @@ pub const OnlyRequirement = union(enum) {
     /// `only admin_authority` — single named authority.
     authority: []const u8,
     /// `only auth1 or auth2` — either authority accepts.
-    either:    struct { left: []const u8, right: []const u8 },
+    either: struct { left: []const u8, right: []const u8 },
     /// `only [addr1, addr2, addr3]` — hardcoded address allowlist.
     address_list: [][]const u8,
     /// `only authority.any_signer` — any signer of a multisig authority.
@@ -705,9 +715,9 @@ pub const OnlyRequirement = union(enum) {
 
 /// `transfer_ownership(account, to: new_owner)`.
 pub const TransferOwnershipStmt = struct {
-    account:   *Expr,
+    account: *Expr,
     new_owner: *Expr,
-    span:      Span,
+    span: Span,
 };
 
 // ============================================================================
@@ -748,11 +758,11 @@ pub const Annotation = struct {
 
 /// A typed function / action parameter: `name is Type`.
 pub const Param = struct {
-    name:         []const u8,
+    name: []const u8,
     declared_type: TypeExpr,
     /// `true` when annotated with `#[private]` (ZK input).
-    is_private:   bool,
-    span:         Span,
+    is_private: bool,
+    span: Span,
 };
 
 // ============================================================================
@@ -801,35 +811,35 @@ pub const CapabilityAccess = enum {
 /// A seed component: string literal, address, or expression.
 pub const SeedComponent = union(enum) {
     string_lit: []const u8,
-    param_ref:  []const u8,
-    expr:       *Expr,
+    param_ref: []const u8,
+    expr: *Expr,
 };
 
 /// A full account declaration inside an `accounts:` block.
 pub const AccountDecl = struct {
     /// The local name used inside this contract (e.g. `mine`, `user_vault`).
-    name:              []const u8,
+    name: []const u8,
     /// Built-in kind (Data, Vault, Asset, …).
-    kind:              AccountKind,
+    kind: AccountKind,
     /// Optional generic type parameter (e.g. the token type for a Vault).
-    type_param:        ?TypeExpr,
+    type_param: ?TypeExpr,
     /// Ownership model.
-    ownership:         AccountOwnership,
+    ownership: AccountOwnership,
     /// PDA seed components for derived accounts.
-    seeds:             []SeedComponent,
+    seeds: []SeedComponent,
     /// `readonly` — compiler prevents any write to this account.
-    readonly:          bool,
+    readonly: bool,
     /// Declared capability list (what fields may be read/written).
-    capabilities:      []CapabilityClause,
+    capabilities: []CapabilityClause,
     /// `create_if_missing` — VM creates this account if absent.
     create_if_missing: bool,
     /// `initial_size N bytes` — storage pre-allocated at creation.
-    initial_size:      ?u64,
+    initial_size: ?u64,
     /// `at known.X` — a statically-known globally-deployed account address.
-    known_address:     ?[]const u8,
+    known_address: ?[]const u8,
     /// `child_of accountName` — parent-child relationship.
-    child_of:          ?[]const u8,
-    span:              Span,
+    child_of: ?[]const u8,
+    span: Span,
 };
 
 // ============================================================================
@@ -847,8 +857,8 @@ pub const AuthorityHolderKind = enum {
 
 /// Configuration for a multisig authority (`held_by Multisig { … }`).
 pub const MultisigConfig = struct {
-    signers:     []*Expr,
-    required:    u32,
+    signers: []*Expr,
+    required: u32,
     time_window: ?*Expr,
 };
 
@@ -856,32 +866,32 @@ pub const MultisigConfig = struct {
 pub const DaoConfig = struct {
     governance_program: []const u8,
     proposal_threshold: ?*Expr,
-    quorum:             ?*Expr,
+    quorum: ?*Expr,
 };
 
 /// A single authority declaration inside an `authorities:` block.
 pub const AuthorityDecl = struct {
     /// The local name (e.g. `mint_authority`).
-    name:           []const u8,
+    name: []const u8,
     /// The authority kind (e.g. `MintAuthority`).
-    kind:           []const u8,
+    kind: []const u8,
     /// The holder type enum.
-    holder_type:    AuthorityHolderKind,
+    holder_type: AuthorityHolderKind,
     /// Initial holder: an expression, `deployer`, `nobody`, etc.
     initial_holder: ?*Expr,
     /// Optional timelock duration.
-    timelock:       ?*Expr,
+    timelock: ?*Expr,
     /// Present when `held_by Multisig { … }`.
-    multisig_cfg:   ?MultisigConfig,
+    multisig_cfg: ?MultisigConfig,
     /// Present when `held_by DAO { … }`.
-    dao_cfg:        ?DaoConfig,
+    dao_cfg: ?DaoConfig,
     /// List of action names this authority covers (`covers: [a, b]`).
-    covers:         [][]const u8,
+    covers: [][]const u8,
     /// `inherits_from parentAuthority`.
-    inherits_from:  ?[]const u8,
+    inherits_from: ?[]const u8,
     /// `inheritable` — sub-contracts can inherit this authority.
-    inheritable:    bool,
-    span:           Span,
+    inheritable: bool,
+    span: Span,
 };
 
 // ============================================================================
@@ -890,36 +900,36 @@ pub const AuthorityDecl = struct {
 
 /// A single field in the `has:` (state) block: `name is Type`.
 pub const StateField = struct {
-    name:         []const u8,
-    type_:        TypeExpr,
+    name: []const u8,
+    type_: TypeExpr,
     /// Optional `in namespace` sub-namespace tag.
-    namespace:    ?[]const u8,
-    span:         Span,
+    namespace: ?[]const u8,
+    span: Span,
 };
 
 /// A `computed:` field — derived from state, not stored directly.
 pub const ComputedField = struct {
-    name:    []const u8,
-    type_:   TypeExpr,
+    name: []const u8,
+    type_: TypeExpr,
     /// The expression evaluated to produce the computed value.
-    expr:    *Expr,
-    span:    Span,
+    expr: *Expr,
+    span: Span,
 };
 
 /// A field in the `config:` block — runtime-configurable constant.
 pub const ConfigField = struct {
-    name:         []const u8,
-    type_:        TypeExpr,
-    default_val:  ?*Expr,
-    span:         Span,
+    name: []const u8,
+    type_: TypeExpr,
+    default_val: ?*Expr,
+    span: Span,
 };
 
 /// A top-level constant: `define NAME as value`.
 pub const ConstDecl = struct {
-    name:  []const u8,
+    name: []const u8,
     type_: ?TypeExpr,
     value: *Expr,
-    span:  Span,
+    span: Span,
 };
 
 // ============================================================================
@@ -942,123 +952,123 @@ pub const Visibility = enum {
 
 /// An action declaration (state-changing function).
 pub const ActionDecl = struct {
-    name:        []const u8,
-    visibility:  Visibility,
+    name: []const u8,
+    visibility: Visibility,
     /// Generic type parameters, e.g. `[T where T follows Transferable]`.
     type_params: []TypeParam,
-    params:      []Param,
+    params: []Param,
     return_type: ?TypeExpr,
     annotations: []Annotation,
     /// Local account declarations inside the action.
-    accounts:    []AccountDecl,
-    body:        []Stmt,
+    accounts: []AccountDecl,
+    body: []Stmt,
     /// SPEC: Novel Idea 2 — Gas Complexity Class Annotations.
     complexity_class: ?ComplexityClass,
-    span:        Span,
+    span: Span,
 };
 
 /// A view declaration (read-only function).
 pub const ViewDecl = struct {
-    name:        []const u8,
-    visibility:  Visibility,
+    name: []const u8,
+    visibility: Visibility,
     type_params: []TypeParam,
-    params:      []Param,
+    params: []Param,
     return_type: ?TypeExpr,
     /// Local account declarations.
-    accounts:    []AccountDecl,
-    body:        []Stmt,
-    span:        Span,
+    accounts: []AccountDecl,
+    body: []Stmt,
+    span: Span,
 };
 
 /// A pure function (no state access).
 pub const PureDecl = struct {
-    name:        []const u8,
+    name: []const u8,
     type_params: []TypeParam,
-    params:      []Param,
+    params: []Param,
     return_type: ?TypeExpr,
-    body:        []Stmt,
-    span:        Span,
+    body: []Stmt,
+    span: Span,
 };
 
 /// A generic type parameter with optional constraint: `T where T follows I`.
 pub const TypeParam = struct {
-    name:       []const u8,
+    name: []const u8,
     /// Interface constraint (`where T follows InterfaceName`), or `null`.
     constraint: ?[]const u8,
 };
 
 /// An internal helper declaration (`helper` keyword — within-only by default).
 pub const HelperDecl = struct {
-    name:        []const u8,
-    params:      []Param,
+    name: []const u8,
+    params: []Param,
     return_type: ?TypeExpr,
-    body:        []Stmt,
-    span:        Span,
+    body: []Stmt,
+    span: Span,
 };
 
 /// A guard declaration: `guard name(params): body`.
 pub const GuardDecl = struct {
-    name:   []const u8,
+    name: []const u8,
     params: []Param,
-    body:   []Stmt,
-    span:   Span,
+    body: []Stmt,
+    span: Span,
 };
 
 /// An event declaration: `event Name(field is Type indexed, ...)`.
 pub const EventDecl = struct {
-    name:   []const u8,
+    name: []const u8,
     fields: []EventField,
-    span:   Span,
+    span: Span,
 };
 
 /// One field in an event declaration.
 pub const EventField = struct {
-    name:    []const u8,
-    type_:   TypeExpr,
+    name: []const u8,
+    type_: TypeExpr,
     /// `indexed` — this field is searchable in the event log.
     indexed: bool,
-    span:    Span,
+    span: Span,
 };
 
 /// A contract-level error declaration: `error Name(field is Type, ...)`.
 pub const ErrorDecl = struct {
-    name:   []const u8,
+    name: []const u8,
     fields: []ErrorField,
-    span:   Span,
+    span: Span,
 };
 
 /// One field in an error declaration.
 pub const ErrorField = struct {
-    name:  []const u8,
+    name: []const u8,
     type_: TypeExpr,
-    span:  Span,
+    span: Span,
 };
 
 /// The `setup` (constructor) block of a contract.
 pub const SetupBlock = struct {
     params: []Param,
-    body:   []Stmt,
-    span:   Span,
+    body: []Stmt,
+    span: Span,
 };
 
 /// A contract-level invariant (for formal verification / fuzzing).
 pub const InvariantDecl = struct {
-    name:  []const u8,
-    cond:  *Expr,
-    span:  Span,
+    name: []const u8,
+    cond: *Expr,
+    span: Span,
 };
 
 /// The `upgrade:` block — declares upgrade policy (Part 13).
 pub const UpgradeBlock = struct {
     /// The authority that can authorise upgrades.
-    authority:  []const u8,
+    authority: []const u8,
     /// Optional migration function name.
     migrate_fn: ?[]const u8,
     /// Optional version guard expression.
-    version:    ?*Expr,
+    version: ?*Expr,
     /// SPEC: Part 13 — Fields that must not be removed during upgrade.
     immutable_fields: [][]const u8,
-    span:       Span,
+    span: Span,
 };
 
 // ============================================================================
@@ -1070,8 +1080,8 @@ pub const AssetTransferHook = struct {
     /// `before_transfer` or `after_transfer`.
     when: AssetHookWhen,
     params: []Param,
-    body:   []Stmt,
-    span:   Span,
+    body: []Stmt,
+    span: Span,
 };
 
 /// When a transfer hook fires.
@@ -1082,23 +1092,23 @@ pub const AssetHookWhen = enum {
 
 /// A top-level `asset Name { … }` declaration.
 pub const AssetDef = struct {
-    name:             []const u8,
+    name: []const u8,
     /// `name:` display name (e.g. `"Zephyria Token"`).
-    display_name:     ?[]const u8,
+    display_name: ?[]const u8,
     /// `symbol:` short ticker (e.g. `"ZEPH"`).
-    symbol:           ?[]const u8,
+    symbol: ?[]const u8,
     /// `decimals:` N decimal places.
-    decimals:         ?u8,
+    decimals: ?u8,
     /// `max_supply:` hard cap on total tokens.
-    max_supply:       ?*Expr,
+    max_supply: ?*Expr,
     /// Authorities declared for this asset (mint, freeze, burn, etc.).
-    authorities:      []AuthorityDecl,
+    authorities: []AuthorityDecl,
     /// Optional before/after transfer hooks.
-    before_transfer:  ?AssetTransferHook,
-    after_transfer:   ?AssetTransferHook,
+    before_transfer: ?AssetTransferHook,
+    after_transfer: ?AssetTransferHook,
     /// `metadata_per_token: yes` — each token ID has its own metadata (NFT).
     metadata_per_token: bool,
-    span:             Span,
+    span: Span,
 };
 
 // ============================================================================
@@ -1108,41 +1118,40 @@ pub const AssetDef = struct {
 /// A declaration inside an interface body.
 pub const InterfaceMember = union(enum) {
     action: InterfaceAction,
-    view:   InterfaceView,
-    event:  EventDecl,
-    error_:  ErrorDecl,
+    view: InterfaceView,
+    event: EventDecl,
+    error_: ErrorDecl,
 };
 
 /// An action signature inside an interface (no body).
 pub const InterfaceAction = struct {
-    name:        []const u8,
-    params:      []Param,
+    name: []const u8,
+    params: []Param,
     return_type: ?TypeExpr,
-    span:        Span,
+    span: Span,
 };
 
 /// A view signature inside an interface.
 pub const InterfaceView = struct {
-    name:        []const u8,
-    params:      []Param,
+    name: []const u8,
+    params: []Param,
     return_type: ?TypeExpr,
-    span:        Span,
+    span: Span,
 };
 
 /// A top-level `interface Name { … }` declaration.
 pub const InterfaceDef = struct {
-    name:    []const u8,
+    name: []const u8,
     members: []InterfaceMember,
-    span:    Span,
+    span: Span,
 };
-
 
 // ── ZK / Privacy ────────────────────────────────────────────────────────────
 
 pub const VerifyStmt = struct {
-    proof:      *Expr,
+    proof: *Expr,
     commitment: *Expr,
-    span:       Span,
+    span: Span,
 };
 
 // ============================================================================
@@ -1152,34 +1161,34 @@ pub const VerifyStmt = struct {
 /// `use module.path` import statement.
 pub const UseImport = struct {
     /// Dot-separated path, e.g. `["standard", "math"]`.
-    path:  [][]const u8,
+    path: [][]const u8,
     /// Optional local alias: `use standard.math as sm`.
     alias: ?[]const u8,
-    span:  Span,
+    span: Span,
 };
 
 /// Every top-level construct that can appear in a `.foz` file.
 pub const TopLevel = union(enum) {
     /// `version N` — must be the first declaration.
-    version:       u32,
+    version: u32,
     /// `use module.path` — import.
-    use_import:    UseImport,
+    use_import: UseImport,
     /// `define NAME as value` — top-level constant.
-    constant:      ConstDecl,
+    constant: ConstDecl,
     /// `asset Name { … }` — asset definition.
-    asset_def:     AssetDef,
+    asset_def: AssetDef,
     /// `interface Name { … }` — interface definition.
     interface_def: InterfaceDef,
     /// `contract Name { … }` — the primary construct.
-    contract:      ContractDef,
+    contract: ContractDef,
     /// `record Name { … }` — named tuple type alias.
-    record_def:    RecordDef,
+    record_def: RecordDef,
     /// `struct Name { … }` — user-defined struct type.
-    struct_def:    StructDef,
+    struct_def: StructDef,
     /// `enum Name { … }` — user-defined enum type.
-    enum_def:      EnumDef,
+    enum_def: EnumDef,
     /// `alias NewName = ExistingType`.
-    type_alias:    TypeAliasDef,
+    type_alias: TypeAliasDef,
     /// `capability Name<T>:` — capability token type (Novel Idea 6).
     capability_def: CapabilityDef,
     /// `global invariant Name:` — cross-contract invariant (Novel Idea 5).
@@ -1190,41 +1199,41 @@ pub const TopLevel = union(enum) {
 
 /// `record Name { field is Type, ... }` — named tuple.
 pub const RecordDef = struct {
-    name:   []const u8,
+    name: []const u8,
     fields: []RecordField,
-    span:   Span,
+    span: Span,
 };
 
 /// A single field in a record or struct.
 pub const RecordField = struct {
-    name:    []const u8,
-    type_:   TypeExpr,
+    name: []const u8,
+    type_: TypeExpr,
     /// Optional default value.
     default: ?*Expr,
-    span:    Span,
+    span: Span,
 };
 
 /// `struct Name { field is Type, ... }` — value type struct.
 pub const StructDef = struct {
-    name:        []const u8,
+    name: []const u8,
     type_params: []TypeParam,
-    fields:      []RecordField,
-    span:        Span,
+    fields: []RecordField,
+    span: Span,
 };
 
 /// `enum Name { Variant, Variant { field is Type }, ... }`.
 pub const EnumDef = struct {
-    name:     []const u8,
+    name: []const u8,
     variants: []EnumVariant,
-    span:     Span,
+    span: Span,
 };
 
 /// One variant of an enum (simple or with associated data).
 pub const EnumVariant = struct {
-    name:   []const u8,
+    name: []const u8,
     /// Empty slice = no associated data.
     fields: []RecordField,
-    span:   Span,
+    span: Span,
 };
 
 /// `alias NewName = ExistingType`.
@@ -1364,54 +1373,54 @@ pub const CapabilityDef = struct {
 /// The complete AST node for a `contract Name { … }` declaration.
 pub const ContractDef = struct {
     /// Contract name.
-    name:        []const u8,
+    name: []const u8,
     /// `inherits OtherContract`.
-    inherits:    ?[]const u8,
+    inherits: ?[]const u8,
     /// `implements Interface1, Interface2`.
-    implements:  [][]const u8,
+    implements: [][]const u8,
     /// `accounts:` block.
-    accounts:    []AccountDecl,
+    accounts: []AccountDecl,
     /// `authorities:` block.
     authorities: []AuthorityDecl,
     /// `config:` block — runtime-configurable parameters.
-    config:      []ConfigField,
+    config: []ConfigField,
     /// `always:` block — contract-level constants.
-    always:      []ConstDecl,
+    always: []ConstDecl,
     /// `has:` block — persistent state fields.
-    state:       []StateField,
+    state: []StateField,
     /// `computed:` — derived (non-stored) fields.
-    computed:    []ComputedField,
+    computed: []ComputedField,
     /// `setup` — constructor.
-    setup:       ?SetupBlock,
+    setup: ?SetupBlock,
     /// Named guards.
-    guards:      []GuardDecl,
+    guards: []GuardDecl,
     /// Public / internal actions.
-    actions:     []ActionDecl,
+    actions: []ActionDecl,
     /// Read-only views.
-    views:       []ViewDecl,
+    views: []ViewDecl,
     /// Pure functions.
-    pures:       []PureDecl,
+    pures: []PureDecl,
     /// Internal helpers.
-    helpers:     []HelperDecl,
+    helpers: []HelperDecl,
     /// Emittable events.
-    events:      []EventDecl,
+    events: []EventDecl,
     /// Typed errors this contract can throw.
-    errors_:     []ErrorDecl,
+    errors_: []ErrorDecl,
     /// `upgrade:` block (optional, Part 13).
-    upgrade:     ?UpgradeBlock,
+    upgrade: ?UpgradeBlock,
     /// Sub-namespace names declared with `namespace X`.
-    namespaces:  [][]const u8,
+    namespaces: [][]const u8,
     /// Invariant declarations for formal verification.
-    invariants:  []InvariantDecl,
+    invariants: []InvariantDecl,
     /// `conserves:` block — economic conservation proofs (Novel Idea 1).
-    conserves:   []ConservationExpr,
+    conserves: []ConservationExpr,
     /// `adversary tries:` blocks — in-language attack simulation (Novel Idea 3).
     adversary_blocks: []AdversaryBlock,
     /// `fallback:` handler (Spec Part 5.13) — called on unknown selectors.
-    fallback:    ?ActionDecl,
+    fallback: ?ActionDecl,
     /// `receive:` handler (Spec Part 5.13) — called on plain value transfers.
-    receive_:    ?ActionDecl,
-    span:        Span,
+    receive_: ?ActionDecl,
+    span: Span,
 };
 
 /// SPEC: Novel Idea 5 — Cross-Contract Global Invariants.
@@ -1449,7 +1458,7 @@ pub const SemanticDiff = struct {
 /// The parsed representation of an entire `.foz` source file.
 pub const SourceFile = struct {
     /// Absolute or relative path to the file.
-    path:       []const u8,
+    path: []const u8,
     top_levels: []TopLevel,
 };
 
@@ -1514,4 +1523,3 @@ fn freeValue(comptime T: type, value: T, allocator: std.mem.Allocator) void {
         else => {},
     }
 }
-

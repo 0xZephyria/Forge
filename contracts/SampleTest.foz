@@ -1,0 +1,17 @@
+/// SPEC: Part 14.5 — Contract Integration Testing
+version 1
+
+contract SampleTest:
+    has:
+        x is u256
+
+    setup():
+        x = 100
+
+    action test_initial_value():
+        need x equals 100 else "Initial value must be 100"
+
+    action test_fails_on_different_value():
+        need x equals 200 else "This check correctly fails if x is not 200"
+
+End;

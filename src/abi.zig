@@ -18,145 +18,161 @@
 //   Part 9  — Parallel Execution (access lists, parallel flag)
 //   Part 4  — Authority System
 //   Part 14 — Cross-Chain Interoperability & ABI
+//
 
-const std    = @import("std");
-const ast    = @import("ast.zig");
-const types  = @import("types.zig");
+const std = @import("std");
+const ast = @import("ast.zig");
+const types = @import("types.zig");
 const errors = @import("errors.zig");
 const checker_mod = @import("checker.zig");
 
-const ContractDef     = ast.ContractDef;
-const TypeResolver    = types.TypeResolver;
+const ContractDef = ast.ContractDef;
+const TypeResolver = types.TypeResolver;
 const CheckedContract = checker_mod.CheckedContract;
 
 // ============================================================================
 // Section 1 — EVM ABI Structures
 // ============================================================================
 
+/// SPEC: Part 14.4 — EVM ABI Input/Output Parameter Representation.
 pub const EVMParam = struct {
     name: []const u8,
     type: []const u8,
 };
 
+/// SPEC: Part 14.4 — EVM ABI Function Entry Structure.
 pub const EVMEntry = struct {
-    type:            []const u8,
-    name:            []const u8,
-    inputs:          []const EVMParam,
-    outputs:         []const EVMParam,
+    type: []const u8,
+    name: []const u8,
+    inputs: []const EVMParam,
+    outputs: []const EVMParam,
     stateMutability: []const u8,
-    anonymous:       bool,
+    anonymous: bool,
 };
 
 // ============================================================================
 // Section 2 — Zephyria Native ABI Structures
 // ============================================================================
 
+/// SPEC: Part 14.3 — Zephyria Native Parameter Representation.
 pub const ZephParam = struct {
-    name:     []const u8,
-    type:     []const u8,
+    name: []const u8,
+    type: []const u8,
     zvm_size: u32,
 };
 
+/// SPEC: Part 9.2 — Parallel Execution Access List Entry.
 pub const ZephAccessEntry = struct {
     account: []const u8,
-    field:   ?[]const u8,
+    field: ?[]const u8,
 };
 
+/// SPEC: Part 5.3 — Shared/External Guest Action Layout.
 pub const ZephAction = struct {
-    name:        []const u8,
-    selector:    u32,
-    visibility:  []const u8,
-    is_parallel: bool,
-    params:      []const ZephParam,
-    returns:     ?ZephParam,
-    reads:       []const ZephAccessEntry,
-    writes:      []const ZephAccessEntry,
-};
-
-pub const ZephView = struct {
-    name:       []const u8,
-    selector:   u32,
+    name: []const u8,
+    selector: u32,
     visibility: []const u8,
-    params:     []const ZephParam,
-    returns:    ?ZephParam,
+    is_parallel: bool,
+    params: []const ZephParam,
+    returns: ?ZephParam,
+    reads: []const ZephAccessEntry,
+    writes: []const ZephAccessEntry,
 };
 
+/// SPEC: Part 5.4 — View Function Layout.
+pub const ZephView = struct {
+    name: []const u8,
+    selector: u32,
+    visibility: []const u8,
+    params: []const ZephParam,
+    returns: ?ZephParam,
+};
+
+/// SPEC: Part 5.6 — Event Field Layout.
 pub const ZephEventField = struct {
-    name:    []const u8,
-    type:    []const u8,
+    name: []const u8,
+    type: []const u8,
     indexed: bool,
 };
 
+/// SPEC: Part 5.6 — Custom Contract Event Layout.
 pub const ZephEvent = struct {
-    name:     []const u8,
+    name: []const u8,
     selector: u32,
-    fields:   []const ZephEventField,
+    fields: []const ZephEventField,
 };
 
+/// SPEC: Part 5.7 — Error Field Layout.
 pub const ZephErrorField = struct {
     name: []const u8,
     type: []const u8,
 };
 
+/// SPEC: Part 5.7 — Custom Contract Compile/Runtime Error Layout.
 pub const ZephError = struct {
-    name:   []const u8,
+    name: []const u8,
     fields: []const ZephErrorField,
 };
 
+/// SPEC: Part 5.2 — Setup Constructor Layout.
 pub const ZephConstructor = struct {
     params: []const ZephParam,
 };
 
+/// SPEC: Part 14.1 — Storage Slot State Field Representation.
 pub const ZephStateField = struct {
-    name:      []const u8,
-    type:      []const u8,
-    field_id:  u32,
+    name: []const u8,
+    type: []const u8,
+    field_id: u32,
     slot_size: u32,
 };
 
+/// SPEC: Part 4.1 — Contract Authority Role Layout.
 pub const ZephAuthority = struct {
-    name:   []const u8,
-    kind:   []const u8,
+    name: []const u8,
+    kind: []const u8,
     covers: []const []const u8,
 };
 
 /// SPEC: Novel Idea 1 — Conservation proof entry in ABI.
 pub const ZephConservation = struct {
-    equation:      []const u8,
-    op:            []const u8,
-    at_all_times:  bool,
+    equation: []const u8,
+    op: []const u8,
+    at_all_times: bool,
 };
 
 /// SPEC: Novel Idea 2 — Complexity class entry in ABI.
 pub const ZephComplexity = struct {
-    action:        []const u8,
-    class:         []const u8,
-    max_n:         ?u64,
+    action: []const u8,
+    class: []const u8,
+    max_n: ?u64,
 };
 
+/// SPEC: Part 14.3 — Canonical Zephyria Native ABI Schema.
 pub const ZephABI = struct {
     forge_abi_version: []const u8,
-    contract:          []const u8,
-    spec_version:      u32,
-    constructor:       ?ZephConstructor,
-    actions:           []const ZephAction,
-    views:             []const ZephView,
-    events:            []const ZephEvent,
-    errors:            []const ZephError,
-    state_layout:      []const ZephStateField,
-    authorities:       []const ZephAuthority,
+    contract: []const u8,
+    spec_version: u32,
+    constructor: ?ZephConstructor,
+    actions: []const ZephAction,
+    views: []const ZephView,
+    events: []const ZephEvent,
+    errors: []const ZephError,
+    state_layout: []const ZephStateField,
+    authorities: []const ZephAuthority,
     conservation_proofs: []const ZephConservation,
-    complexity_classes:  []const ZephComplexity,
-    encoding:          []const u8,
+    complexity_classes: []const ZephComplexity,
+    encoding: []const u8,
 };
 
 // ============================================================================
 // Section 3 — ABI Generator
 // ============================================================================
 
+/// SPEC: Part 14.3 — Contract ABI Generator backend.
 pub const AbiGenerator = struct {
     allocator: std.mem.Allocator,
-    resolver:  *TypeResolver,
+    resolver: *TypeResolver,
 
     pub fn init(allocator: std.mem.Allocator, resolver: *TypeResolver) AbiGenerator {
         return .{ .allocator = allocator, .resolver = resolver };
@@ -197,8 +213,8 @@ pub const AbiGenerator = struct {
             for (act.params) |p| {
                 const rt = try self.resolver.resolve(p.declared_type);
                 try params.append(self.allocator, .{
-                    .name     = p.name,
-                    .type     = mapZephType(rt),
+                    .name = p.name,
+                    .type = mapZephType(rt),
                     .zvm_size = zvmSize(rt),
                 });
             }
@@ -208,13 +224,13 @@ pub const AbiGenerator = struct {
                 break :blk ZephParam{ .name = "", .type = mapZephType(rt), .zvm_size = zvmSize(rt) };
             } else null;
 
-            var reads  = std.ArrayListUnmanaged(ZephAccessEntry){};
+            var reads = std.ArrayListUnmanaged(ZephAccessEntry){};
             var writes = std.ArrayListUnmanaged(ZephAccessEntry){};
             errdefer reads.deinit(self.allocator);
             errdefer writes.deinit(self.allocator);
 
             if (checked.action_lists.get(act.name)) |al| {
-                for (al.reads.items)  |e| try reads.append(self.allocator, .{ .account = e.account_name, .field = e.field });
+                for (al.reads.items) |e| try reads.append(self.allocator, .{ .account = e.account_name, .field = e.field });
                 for (al.writes.items) |e| try writes.append(self.allocator, .{ .account = e.account_name, .field = e.field });
             }
 
@@ -224,20 +240,23 @@ pub const AbiGenerator = struct {
             }
 
             try actions_list.append(self.allocator, .{
-                .name        = act.name,
-                .selector    = actionSelector(act.name),
-                .visibility  = visibilityStr(act.visibility),
+                .name = act.name,
+                .selector = actionSelector(act.name),
+                .visibility = visibilityStr(act.visibility),
                 .is_parallel = is_parallel,
-                .params      = try params.toOwnedSlice(self.allocator),
-                .returns     = returns,
-                .reads       = try reads.toOwnedSlice(self.allocator),
-                .writes      = try writes.toOwnedSlice(self.allocator),
+                .params = try params.toOwnedSlice(self.allocator),
+                .returns = returns,
+                .reads = try reads.toOwnedSlice(self.allocator),
+                .writes = try writes.toOwnedSlice(self.allocator),
             });
         }
 
         // Views
         var views_list = std.ArrayListUnmanaged(ZephView){};
-        defer { for (views_list.items) |v| self.allocator.free(v.params); views_list.deinit(self.allocator); }
+        defer {
+            for (views_list.items) |v| self.allocator.free(v.params);
+            views_list.deinit(self.allocator);
+        }
 
         for (contract.views) |view| {
             var params = std.ArrayListUnmanaged(ZephParam){};
@@ -252,17 +271,20 @@ pub const AbiGenerator = struct {
                 break :blk ZephParam{ .name = "", .type = mapZephType(rt), .zvm_size = zvmSize(rt) };
             } else null;
             try views_list.append(self.allocator, .{
-                .name       = view.name,
-                .selector   = actionSelector(view.name),
+                .name = view.name,
+                .selector = actionSelector(view.name),
                 .visibility = visibilityStr(view.visibility),
-                .params     = try params.toOwnedSlice(self.allocator),
-                .returns    = returns,
+                .params = try params.toOwnedSlice(self.allocator),
+                .returns = returns,
             });
         }
 
         // Events
         var evts = std.ArrayListUnmanaged(ZephEvent){};
-        defer { for (evts.items) |e| self.allocator.free(e.fields); evts.deinit(self.allocator); }
+        defer {
+            for (evts.items) |e| self.allocator.free(e.fields);
+            evts.deinit(self.allocator);
+        }
         for (contract.events) |ev| {
             var fields = std.ArrayListUnmanaged(ZephEventField){};
             errdefer fields.deinit(self.allocator);
@@ -275,7 +297,10 @@ pub const AbiGenerator = struct {
 
         // Errors
         var errs = std.ArrayListUnmanaged(ZephError){};
-        defer { for (errs.items) |e| self.allocator.free(e.fields); errs.deinit(self.allocator); }
+        defer {
+            for (errs.items) |e| self.allocator.free(e.fields);
+            errs.deinit(self.allocator);
+        }
         for (contract.errors_) |er| {
             var fields = std.ArrayListUnmanaged(ZephErrorField){};
             errdefer fields.deinit(self.allocator);
@@ -290,7 +315,7 @@ pub const AbiGenerator = struct {
         var state_layout = std.ArrayListUnmanaged(ZephStateField){};
         defer state_layout.deinit(self.allocator);
         for (contract.state) |sf| {
-            const rt  = try self.resolver.resolve(sf.type_);
+            const rt = try self.resolver.resolve(sf.type_);
             const fid = field_ids.get(sf.name) orelse 0;
             try state_layout.append(self.allocator, .{ .name = sf.name, .type = mapZephType(rt), .field_id = fid, .slot_size = zvmSize(rt) });
         }
@@ -356,18 +381,18 @@ pub const AbiGenerator = struct {
 
         const abi_doc = ZephABI{
             .forge_abi_version = "1.0",
-            .contract          = contract.name,
-            .spec_version      = 1,
-            .constructor       = constructor,
-            .actions           = actions_list.items,
-            .views             = views_list.items,
-            .events            = evts.items,
-            .errors            = errs.items,
-            .state_layout      = state_layout.items,
-            .authorities       = auths.items,
+            .contract = contract.name,
+            .spec_version = 1,
+            .constructor = constructor,
+            .actions = actions_list.items,
+            .views = views_list.items,
+            .events = evts.items,
+            .errors = errs.items,
+            .state_layout = state_layout.items,
+            .authorities = auths.items,
             .conservation_proofs = conservation.items,
-            .complexity_classes  = complexity.items,
-            .encoding          = "zvm_native_le",
+            .complexity_classes = complexity.items,
+            .encoding = "zvm_native_le",
         };
 
         return try serializeJson(abi_doc, self.allocator);
@@ -395,9 +420,12 @@ pub const AbiGenerator = struct {
                 try inputs.append(self.allocator, .{ .name = p.name, .type = mapEVMType(rt) });
             }
             try entries.append(self.allocator, .{
-                .type = "constructor", .name = "",
-                .inputs = try inputs.toOwnedSlice(self.allocator), .outputs = &[_]EVMParam{},
-                .stateMutability = "nonpayable", .anonymous = false,
+                .type = "constructor",
+                .name = "",
+                .inputs = try inputs.toOwnedSlice(self.allocator),
+                .outputs = &[_]EVMParam{},
+                .stateMutability = "nonpayable",
+                .anonymous = false,
             });
         }
 
@@ -417,9 +445,12 @@ pub const AbiGenerator = struct {
                     try outputs.append(self.allocator, .{ .name = "", .type = mapEVMType(rt) });
             }
             try entries.append(self.allocator, .{
-                .type = "function", .name = act.name,
-                .inputs = try inputs.toOwnedSlice(self.allocator), .outputs = try outputs.toOwnedSlice(self.allocator),
-                .stateMutability = "nonpayable", .anonymous = false,
+                .type = "function",
+                .name = act.name,
+                .inputs = try inputs.toOwnedSlice(self.allocator),
+                .outputs = try outputs.toOwnedSlice(self.allocator),
+                .stateMutability = "nonpayable",
+                .anonymous = false,
             });
         }
 
@@ -439,9 +470,12 @@ pub const AbiGenerator = struct {
                     try outputs.append(self.allocator, .{ .name = "", .type = mapEVMType(rt) });
             }
             try entries.append(self.allocator, .{
-                .type = "function", .name = view.name,
-                .inputs = try inputs.toOwnedSlice(self.allocator), .outputs = try outputs.toOwnedSlice(self.allocator),
-                .stateMutability = "view", .anonymous = false,
+                .type = "function",
+                .name = view.name,
+                .inputs = try inputs.toOwnedSlice(self.allocator),
+                .outputs = try outputs.toOwnedSlice(self.allocator),
+                .stateMutability = "view",
+                .anonymous = false,
             });
         }
 
@@ -454,9 +488,12 @@ pub const AbiGenerator = struct {
                 try inputs.append(self.allocator, .{ .name = f.name, .type = mapEVMType(rt) });
             }
             try entries.append(self.allocator, .{
-                .type = "event", .name = ev.name,
-                .inputs = try inputs.toOwnedSlice(self.allocator), .outputs = &[_]EVMParam{},
-                .stateMutability = "", .anonymous = false,
+                .type = "event",
+                .name = ev.name,
+                .inputs = try inputs.toOwnedSlice(self.allocator),
+                .outputs = &[_]EVMParam{},
+                .stateMutability = "",
+                .anonymous = false,
             });
         }
 
@@ -469,9 +506,12 @@ pub const AbiGenerator = struct {
                 try inputs.append(self.allocator, .{ .name = f.name, .type = mapEVMType(rt) });
             }
             try entries.append(self.allocator, .{
-                .type = "error", .name = er.name,
-                .inputs = try inputs.toOwnedSlice(self.allocator), .outputs = &[_]EVMParam{},
-                .stateMutability = "", .anonymous = false,
+                .type = "error",
+                .name = er.name,
+                .inputs = try inputs.toOwnedSlice(self.allocator),
+                .outputs = &[_]EVMParam{},
+                .stateMutability = "",
+                .anonymous = false,
             });
         }
 
@@ -480,17 +520,13 @@ pub const AbiGenerator = struct {
 };
 
 // ============================================================================
-// Section 4 — JSON Serialisation (Zig 0.15 correct pattern)
-// ============================================================================
-
-// ============================================================================
 // Section 4 — JSON Serialisation (manual; no std.json dependency)
 // ============================================================================
 // std.json.stringify / stringifyAlloc do not exist in Zig 0.15.2.
 // We own all the ABI structs, so a comptime-recursive append-based writer
 // is simpler, faster, and dependency-free.
 
-/// Serialize `value` to a heap-allocated, caller-owned JSON string.
+/// SPEC: Part 14.3 — Serialize `value` to a heap-allocated JSON string.
 pub fn serializeJson(value: anytype, allocator: std.mem.Allocator) anyerror![]u8 {
     var buf = std.ArrayListUnmanaged(u8){};
     errdefer buf.deinit(allocator);
@@ -498,7 +534,7 @@ pub fn serializeJson(value: anytype, allocator: std.mem.Allocator) anyerror![]u8
     return buf.toOwnedSlice(allocator);
 }
 
-/// Recursively append the JSON representation of `value` into `buf`.
+/// SPEC: Part 14.3 — Recursively append JSON representation of `value` to `buf`.
 pub fn jsonAppend(buf: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, value: anytype) anyerror!void {
     const T = @TypeOf(value);
     const info = @typeInfo(T);
@@ -530,7 +566,7 @@ pub fn jsonAppend(buf: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, va
                     try buf.append(alloc, '"');
                     for (value) |c| {
                         switch (c) {
-                            '"'  => try buf.appendSlice(alloc, "\\\""),
+                            '"' => try buf.appendSlice(alloc, "\\\""),
                             '\\' => try buf.appendSlice(alloc, "\\\\"),
                             '\n' => try buf.appendSlice(alloc, "\\n"),
                             '\r' => try buf.appendSlice(alloc, "\\r"),
@@ -580,45 +616,46 @@ pub fn jsonAppend(buf: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, va
 // Section 5 — EVM Type Mapping
 // ============================================================================
 
+/// SPEC: Part 14.4 — Map a resolved type to its canonical EVM standard type name.
 fn mapEVMType(ty: types.ResolvedType) []const u8 {
     return switch (ty) {
-        .u8       => "uint8",
-        .u16      => "uint16",
-        .u32      => "uint32",
-        .u64      => "uint64",
-        .u128     => "uint128",
-        .u256     => "uint256",
-        .i8       => "int8",
-        .i16      => "int16",
-        .i32      => "int32",
-        .i64      => "int64",
-        .i128     => "int128",
-        .i256     => "int256",
+        .u8 => "uint8",
+        .u16 => "uint16",
+        .u32 => "uint32",
+        .u64 => "uint64",
+        .u128 => "uint128",
+        .u256 => "uint256",
+        .i8 => "int8",
+        .i16 => "int16",
+        .i32 => "int32",
+        .i64 => "int64",
+        .i128 => "int128",
+        .i256 => "int256",
         .fixed_point => "uint256",
-        .bool     => "bool",
+        .bool => "bool",
         .account, .wallet, .program, .system_acc => "address",
         .hash, .commitment => "bytes32",
-        .bytes    => "bytes",
-        .bytes_n  => "bytes32",
+        .bytes => "bytes",
+        .bytes_n => "bytes32",
         .signature => "bytes",
-        .pubkey   => "bytes",
+        .pubkey => "bytes",
         .string, .short_str => "string",
         .timestamp, .duration => "uint64",
         .block_number => "uint64",
-        .asset    => "address",
-        .maybe    => "bytes",
-        .list     => "bytes",
-        .set      => "bytes",
+        .asset => "address",
+        .maybe => "bytes",
+        .list => "bytes",
+        .set => "bytes",
         .map, .enum_map => "bytes",
-        .array    => "bytes",
-        .tuple    => "bytes",
-        .struct_  => "bytes",
-        .enum_    => "uint8",
-        .result   => "bytes",
-        .linear   => "bytes",
+        .array => "bytes",
+        .tuple => "bytes",
+        .struct_ => "bytes",
+        .enum_ => "uint8",
+        .result => "bytes",
+        .linear => "bytes",
         .capability => "bytes",
-        .proof    => "bytes",
-        .void_    => "void",
+        .proof => "bytes",
+        .void_ => "void",
     };
 }
 
@@ -626,52 +663,58 @@ fn mapEVMType(ty: types.ResolvedType) []const u8 {
 // Section 6 — Zephyria Native Type Mapping
 // ============================================================================
 
+/// SPEC: Part 14.3 — Map a resolved type to its canonical ZVM type name.
 fn mapZephType(ty: types.ResolvedType) []const u8 {
     return switch (ty) {
-        .u8       => "u8",
-        .u16      => "u16",
-        .u32      => "u32",
-        .u64      => "u64",
-        .u128     => "u128",
-        .u256     => "u256",
-        .i8       => "i8",
-        .i16      => "i16",
-        .i32      => "i32",
-        .i64      => "i64",
-        .i128     => "i128",
-        .i256     => "i256",
-        .fixed_point => |d| switch (d) { 4 => "percent", 9 => "price9", 18 => "price18", else => "fixed" },
-        .bool       => "bool",
-        .account    => "account",
-        .wallet     => "wallet",
-        .program    => "program",
+        .u8 => "u8",
+        .u16 => "u16",
+        .u32 => "u32",
+        .u64 => "u64",
+        .u128 => "u128",
+        .u256 => "u256",
+        .i8 => "i8",
+        .i16 => "i16",
+        .i32 => "i32",
+        .i64 => "i64",
+        .i128 => "i128",
+        .i256 => "i256",
+        .fixed_point => |d| switch (d) {
+            4 => "percent",
+            9 => "price9",
+            18 => "price18",
+            else => "fixed",
+        },
+        .bool => "bool",
+        .account => "account",
+        .wallet => "wallet",
+        .program => "program",
         .system_acc => "system_acc",
-        .hash       => "hash",
+        .hash => "hash",
         .commitment => "commitment",
-        .bytes      => "bytes",
-        .bytes_n    => "bytesN",
-        .signature  => "signature",
-        .pubkey     => "pubkey",
-        .string     => "string",
-        .short_str  => "short_str",
-        .timestamp  => "timestamp",
-        .duration   => "duration",
+        .bytes => "bytes",
+        .bytes_n => "bytesN",
+        .signature => "signature",
+        .pubkey => "pubkey",
+        .string => "string",
+        .short_str => "short_str",
+        .timestamp => "timestamp",
+        .duration => "duration",
         .block_number => "block_number",
-        .asset      => "asset",
-        .maybe      => "maybe",
-        .map        => "map",
-        .enum_map   => "enum_map",
-        .list       => "list",
-        .set        => "set",
-        .array      => "array",
-        .tuple      => "tuple",
-        .struct_    => |info| info.name,
-        .enum_      => |info| info.name,
-        .result     => "result",
-        .linear     => "linear",
+        .asset => "asset",
+        .maybe => "maybe",
+        .map => "map",
+        .enum_map => "enum_map",
+        .list => "list",
+        .set => "set",
+        .array => "array",
+        .tuple => "tuple",
+        .struct_ => |info| info.name,
+        .enum_ => |info| info.name,
+        .result => "result",
+        .linear => "linear",
         .capability => |name| name,
-        .proof      => "proof",
-        .void_      => "void",
+        .proof => "proof",
+        .void_ => "void",
     };
 }
 
@@ -679,24 +722,25 @@ fn mapZephType(ty: types.ResolvedType) []const u8 {
 // Section 7 — ZVM Encoding Sizes
 // ============================================================================
 
+/// SPEC: Part 14.1 — Get ZVM byte width size of the primitive resolved type.
 fn zvmSize(ty: types.ResolvedType) u32 {
     return switch (ty) {
-        .bool       => 1,
-        .u8, .i8   => 1,
+        .bool => 1,
+        .u8, .i8 => 1,
         .u16, .i16 => 2,
         .u32, .i32 => 4,
         .u64, .i64 => 8,
         .u128, .i128 => 16,
         .u256, .i256 => 32,
-        .fixed_point  => 16,
+        .fixed_point => 16,
         .account, .wallet, .program, .system_acc => 32,
         .hash, .commitment => 32,
-        .bytes_n    => |n| n,
-        .signature  => 96,
-        .pubkey     => 48,
+        .bytes_n => |n| n,
+        .signature => 96,
+        .pubkey => 48,
         .timestamp, .duration, .block_number => 8,
-        .asset      => 32,
-        else        => 0,
+        .asset => 32,
+        else => 0,
     };
 }
 
@@ -704,20 +748,24 @@ fn zvmSize(ty: types.ResolvedType) u32 {
 // Section 8 — Helpers
 // ============================================================================
 
+/// SPEC: Part 5.5 — Simple FNV-1a hash to derive function selectors.
 fn actionSelector(name: []const u8) u32 {
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update(name);
-    const digest = hasher.finalResult();
-    return std.mem.readInt(u32, digest[0..4], .little);
+    var h: u32 = 0x811c9dc5;
+    for (name) |b| {
+        h ^= b;
+        h *%= 0x01000193;
+    }
+    return h;
 }
 
+/// SPEC: Part 5.2 — Visibility name mapping helper.
 fn visibilityStr(v: ast.Visibility) []const u8 {
     return switch (v) {
-        .shared  => "shared",
-        .within  => "within",
-        .hidden  => "hidden",
+        .shared => "shared",
+        .within => "within",
+        .hidden => "hidden",
         .outside => "outside",
-        .system  => "system",
+        .system => "system",
     };
 }
 
@@ -727,48 +775,48 @@ fn visibilityStr(v: ast.Visibility) []const u8 {
 
 test "mapEVMType covers all numeric and address primitives" {
     try std.testing.expectEqualStrings("uint256", mapEVMType(.u256));
-    try std.testing.expectEqualStrings("uint8",   mapEVMType(.u8));
-    try std.testing.expectEqualStrings("int256",  mapEVMType(.i256));
-    try std.testing.expectEqualStrings("bool",    mapEVMType(.bool));
+    try std.testing.expectEqualStrings("uint8", mapEVMType(.u8));
+    try std.testing.expectEqualStrings("int256", mapEVMType(.i256));
+    try std.testing.expectEqualStrings("bool", mapEVMType(.bool));
     try std.testing.expectEqualStrings("address", mapEVMType(.wallet));
     try std.testing.expectEqualStrings("address", mapEVMType(.account));
     try std.testing.expectEqualStrings("bytes32", mapEVMType(.hash));
-    try std.testing.expectEqualStrings("bytes",   mapEVMType(.bytes));
-    try std.testing.expectEqualStrings("string",  mapEVMType(.string));
-    try std.testing.expectEqualStrings("uint64",  mapEVMType(.timestamp));
-    try std.testing.expectEqualStrings("uint64",  mapEVMType(.duration));
-    try std.testing.expectEqualStrings("uint8",   mapEVMType(.{ .enum_ = @constCast(&types.EnumInfo{ .name = "S", .variants = &.{} }) }));
+    try std.testing.expectEqualStrings("bytes", mapEVMType(.bytes));
+    try std.testing.expectEqualStrings("string", mapEVMType(.string));
+    try std.testing.expectEqualStrings("uint64", mapEVMType(.timestamp));
+    try std.testing.expectEqualStrings("uint64", mapEVMType(.duration));
+    try std.testing.expectEqualStrings("uint8", mapEVMType(.{ .enum_ = @constCast(&types.EnumInfo{ .name = "S", .variants = &.{} }) }));
 }
 
 test "mapZephType covers all variants including composites" {
-    try std.testing.expectEqualStrings("u256",      mapZephType(.u256));
-    try std.testing.expectEqualStrings("wallet",    mapZephType(.wallet));
-    try std.testing.expectEqualStrings("duration",  mapZephType(.duration));
+    try std.testing.expectEqualStrings("u256", mapZephType(.u256));
+    try std.testing.expectEqualStrings("wallet", mapZephType(.wallet));
+    try std.testing.expectEqualStrings("duration", mapZephType(.duration));
     try std.testing.expectEqualStrings("signature", mapZephType(.signature));
-    try std.testing.expectEqualStrings("pubkey",    mapZephType(.pubkey));
-    try std.testing.expectEqualStrings("price9",    mapZephType(.{ .fixed_point = 9 }));
-    try std.testing.expectEqualStrings("price18",   mapZephType(.{ .fixed_point = 18 }));
-    try std.testing.expectEqualStrings("percent",   mapZephType(.{ .fixed_point = 4 }));
-    try std.testing.expectEqualStrings("map",       mapZephType(.{ .map = undefined }));
-    try std.testing.expectEqualStrings("list",      mapZephType(.{ .list = undefined }));
-    try std.testing.expectEqualStrings("maybe",     mapZephType(.{ .maybe = undefined }));
-    try std.testing.expectEqualStrings("linear",    mapZephType(.{ .linear = undefined }));
-    try std.testing.expectEqualStrings("void",      mapZephType(.void_));
+    try std.testing.expectEqualStrings("pubkey", mapZephType(.pubkey));
+    try std.testing.expectEqualStrings("price9", mapZephType(.{ .fixed_point = 9 }));
+    try std.testing.expectEqualStrings("price18", mapZephType(.{ .fixed_point = 18 }));
+    try std.testing.expectEqualStrings("percent", mapZephType(.{ .fixed_point = 4 }));
+    try std.testing.expectEqualStrings("map", mapZephType(.{ .map = undefined }));
+    try std.testing.expectEqualStrings("list", mapZephType(.{ .list = undefined }));
+    try std.testing.expectEqualStrings("maybe", mapZephType(.{ .maybe = undefined }));
+    try std.testing.expectEqualStrings("linear", mapZephType(.{ .linear = undefined }));
+    try std.testing.expectEqualStrings("void", mapZephType(.void_));
 }
 
 test "zvmSize is correct for all typed primitives" {
-    try std.testing.expectEqual(@as(u32, 1),  zvmSize(.u8));
-    try std.testing.expectEqual(@as(u32, 8),  zvmSize(.u64));
+    try std.testing.expectEqual(@as(u32, 1), zvmSize(.u8));
+    try std.testing.expectEqual(@as(u32, 8), zvmSize(.u64));
     try std.testing.expectEqual(@as(u32, 32), zvmSize(.u256));
     try std.testing.expectEqual(@as(u32, 32), zvmSize(.account));
     try std.testing.expectEqual(@as(u32, 96), zvmSize(.signature));
     try std.testing.expectEqual(@as(u32, 48), zvmSize(.pubkey));
-    try std.testing.expectEqual(@as(u32, 8),  zvmSize(.timestamp));
-    try std.testing.expectEqual(@as(u32, 8),  zvmSize(.duration));
-    try std.testing.expectEqual(@as(u32, 0),  zvmSize(.string));
-    try std.testing.expectEqual(@as(u32, 0),  zvmSize(.bytes));
-    try std.testing.expectEqual(@as(u32, 0),  zvmSize(.{ .list = undefined }));
-    try std.testing.expectEqual(@as(u32, 0),  zvmSize(.void_));
+    try std.testing.expectEqual(@as(u32, 8), zvmSize(.timestamp));
+    try std.testing.expectEqual(@as(u32, 8), zvmSize(.duration));
+    try std.testing.expectEqual(@as(u32, 0), zvmSize(.string));
+    try std.testing.expectEqual(@as(u32, 0), zvmSize(.bytes));
+    try std.testing.expectEqual(@as(u32, 0), zvmSize(.{ .list = undefined }));
+    try std.testing.expectEqual(@as(u32, 0), zvmSize(.void_));
 }
 
 test "actionSelector is deterministic and non-zero" {
@@ -783,11 +831,11 @@ test "actionSelector is deterministic and non-zero" {
 }
 
 test "visibilityStr covers all variants" {
-    try std.testing.expectEqualStrings("shared",  visibilityStr(.shared));
-    try std.testing.expectEqualStrings("within",  visibilityStr(.within));
-    try std.testing.expectEqualStrings("hidden",  visibilityStr(.hidden));
+    try std.testing.expectEqualStrings("shared", visibilityStr(.shared));
+    try std.testing.expectEqualStrings("within", visibilityStr(.within));
+    try std.testing.expectEqualStrings("hidden", visibilityStr(.hidden));
     try std.testing.expectEqualStrings("outside", visibilityStr(.outside));
-    try std.testing.expectEqualStrings("system",  visibilityStr(.system));
+    try std.testing.expectEqualStrings("system", visibilityStr(.system));
 }
 
 test "serializeJson produces valid JSON" {
@@ -810,13 +858,30 @@ test "generateZephAbi and generateEVMAbi minimal contract" {
     defer gen.deinit();
 
     const contract = ContractDef{
-        .name = "Minimal", .inherits = null, .implements = &.{},
-        .accounts = &.{}, .authorities = &.{}, .config = &.{}, .always = &.{},
-        .state = &.{}, .computed = &.{}, .setup = null, .guards = &.{},
-        .actions = &.{}, .views = &.{}, .pures = &.{}, .helpers = &.{},
-        .events = &.{}, .errors_ = &.{}, .upgrade = null, .namespaces = &.{},
-        .invariants = &.{}, .conserves = &.{}, .adversary_blocks = &.{},
-        .fallback = null, .receive_ = null,
+        .name = "Minimal",
+        .inherits = null,
+        .implements = &.{},
+        .accounts = &.{},
+        .authorities = &.{},
+        .config = &.{},
+        .always = &.{},
+        .state = &.{},
+        .computed = &.{},
+        .setup = null,
+        .guards = &.{},
+        .actions = &.{},
+        .views = &.{},
+        .pures = &.{},
+        .helpers = &.{},
+        .events = &.{},
+        .errors_ = &.{},
+        .upgrade = null,
+        .namespaces = &.{},
+        .invariants = &.{},
+        .conserves = &.{},
+        .adversary_blocks = &.{},
+        .fallback = null,
+        .receive_ = null,
         .span = .{ .line = 1, .col = 1, .len = 0 },
     };
     var checked = checker_mod.CheckedContract{
