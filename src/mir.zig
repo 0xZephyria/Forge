@@ -805,6 +805,18 @@ pub const MirLowerer = struct {
 
             // ── Type cast ─────────────────────────────────────────────────
             .cast => |c| {
+                if (c.expr.kind == .float_lit) {
+                    const resolved_to = self.resolver.resolve(c.to) catch .void_;
+                    switch (resolved_to) {
+                        .fixed_point => |decimals| {
+                            const dst = self.freshReg();
+                            const bytes = scaleFixedPointTo256(c.expr.kind.float_lit, decimals);
+                            try self.emit(.{ .const_i256 = .{ .dst = dst, .bytes = bytes } }, span);
+                            return dst;
+                        },
+                        else => {},
+                    }
+                }
                 // Most casts are no-ops at MIR level. The backend handles
                 // width masking (e.g. address → 160-bit mask on EVM).
                 return try self.lowerExpr(c.expr);
@@ -1032,7 +1044,27 @@ pub const MirLowerer = struct {
 
         // Internal calls use a selector derived from the callee name.
         if (callee.kind == .identifier) {
-            const sel = fnvHash32(callee.kind.identifier);
+            const name = callee.kind.identifier;
+            if (std.mem.eql(u8, name, "oracle")) {
+                var feed_id: u32 = 0;
+                if (args.len > 0 and args[0].value.kind == .string_lit) {
+                    feed_id = fnvHash32(args[0].value.kind.string_lit);
+                }
+                try self.emit(.{ .oracle_read = .{
+                    .dst = dst,
+                    .feed_id = feed_id,
+                } }, span);
+                return dst;
+            }
+            if (std.mem.eql(u8, name, "vrf_random")) {
+                const seed = if (args.len > 0) try self.lowerExpr(args[0].value) else try self.lowerExpr(&ast.Expr{ .kind = .{ .int_lit = "0" }, .span = span });
+                try self.emit(.{ .vrf_random = .{
+                    .dst = dst,
+                    .seed = seed,
+                } }, span);
+                return dst;
+            }
+            const sel = fnvHash32(name);
             try self.emit(.{ .call_internal = .{
                 .dst = dst,
                 .selector = sel,
@@ -1604,8 +1636,8 @@ pub const MirLowerer = struct {
         switch (target.kind) {
             .identifier => |name| {
                 // Local or state field.
-                if (self.lookupLocal(name)) |_| {
-                    try self.bindLocal(name, value);
+                if (self.lookupLocal(name)) |existing_reg| {
+                    try self.emit(.{ .mov = .{ .dst = existing_reg, .src = value } }, span);
                 } else if (self.field_ids.get(name)) |fid| {
                     try self.emit(.{ .state_write = .{
                         .field_id = fid,

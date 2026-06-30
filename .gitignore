@@ -1,6 +1,6 @@
 # Zig
 .zig-cache/
-zig-out/
+#zig-out/
 o
 # OS
 .DS_Store
@@ -28,10 +28,13 @@ contracts/NovelFeaturesTest.foz
 zephyria
 
 # Folders
-skills/
-vm/
+#skills/
+#vm/
 node_data/
 artifacts/
+#out/
+scratch-test
+
 
 # Artifacts
 gaps_implementation_plan.md
@@ -43,7 +46,6 @@ Gemini.md
 deploy.html
 interact.html
 forge_multi_agent_abi.md
-out/
 *.zip
 *.logmain
 FORGE_DOCS.md

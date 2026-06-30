@@ -1,0 +1,22 @@
+version 1
+contract MathOpsTest:
+    has:
+        counter is u256
+
+    setup():
+        counter = 100
+
+    action setSubtract(offset is u256):
+        counter = 200 - offset
+
+    action decrement():
+        counter = counter - 1
+
+    action throwOnZero(x is u256):
+        need x > 0 else "x must be nonzero"
+        counter = x
+
+    view getCounter() gives u256:
+        give back counter
+
+End;

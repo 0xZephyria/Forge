@@ -6,7 +6,7 @@ contract TokenTest:
     authorities:
         admin is AdminAuthority
             held_by Wallet
-            initially 0x5B38Da6a701c568545dCfcB03FcB875f56beddC4
+            initially 0xc48b812bb43401392c037381aca934f4069c0517
 
     has:
         total_supply is u256
@@ -26,7 +26,7 @@ contract TokenTest:
     setup():
         total_supply = 1000000
         is_paused = no
-        balances[0x5B38Da6a701c568545dCfcB03FcB875f56beddC4] = 1000000
+        balances[0xc48b812bb43401392c037381aca934f4069c0517] = 1000000
 
     action issue(recipient is Account, amount is u256):
         only admin:

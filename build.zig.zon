@@ -1,0 +1,18 @@
+.{
+    .name = .forge,
+    .version = "0.1.0",
+    .fingerprint = 0xf304462c2ce8547d,
+    .minimum_zig_version = "0.15.2",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "vm",
+    },
+    .dependencies = .{
+        .bls12_381 = .{
+            .url = "https://github.com/pilot-repl/bls12-381/archive/main.tar.gz",
+            .hash = "bls12_381-0.1.0-39DRXlMeAwDIlx7ZmO59RaiOAhc2fq-PFu9yd7KxbFho",
+        },
+    },
+}

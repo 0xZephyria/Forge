@@ -9,6 +9,7 @@
 // SPEC REFERENCE: Part 14.5 — Contract Integration Testing.
 //
 // Usage:  forgec <input.foz> [options]
+//         forgec verify <contract.fozbin> <contract.fozabi>
 
 const std = @import("std");
 const ast = @import("ast.zig");
@@ -23,6 +24,7 @@ const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const abi = @import("abi.zig");
 const mod_resolver = @import("module_resolver.zig");
+const contract_runner = @import("contract_runner.zig");
 
 const DiagnosticList = errors.DiagnosticList;
 const TypeResolver = types.TypeResolver;
@@ -56,12 +58,17 @@ pub const CompileOptions = struct {
 // Section 2 — Argument Parsing
 // ============================================================================
 
-/// Result from argument parsing: either valid args or explicit exit request.
+/// Result from argument parsing: either valid args, verify subcommand, or explicit exit request.
 const ArgResult = union(enum) {
-    /// Parsed successfully with input path and options.
+    /// Parsed successfully with input path and options for compilation.
     success: struct {
         input_path: []const u8,
         opts: CompileOptions,
+    },
+    /// Verify subcommand carrying fozbin and fozabi paths
+    verify: struct {
+        bin_path: []const u8,
+        abi_path: []const u8,
     },
     /// Help or version was printed; caller should exit 0.
     exit_ok: void,
@@ -71,9 +78,31 @@ const ArgResult = union(enum) {
 
 /// Parse command-line arguments. Prints help/version/errors to stderr.
 fn parseArgs(args: []const [:0]const u8) ArgResult {
+    if (args.len > 1) {
+        const first_arg = args[1];
+        if (std.mem.eql(u8, first_arg, "verify")) {
+            if (args.len < 4) {
+                std.debug.print("error: verify command requires <contract.fozbin> and <contract.fozabi> paths\n\n", .{});
+                printUsage();
+                return .exit_err;
+            }
+            return .{
+                .verify = .{
+                    .bin_path = args[2],
+                    .abi_path = args[3],
+                },
+            };
+        }
+    }
+
     var opts = CompileOptions{};
     var input_path: ?[]const u8 = null;
     var i: usize = 1; // skip argv[0] (program name)
+
+    // Optional "build" command check to allow "forgec build file.foz" syntax
+    if (args.len > 1 and std.mem.eql(u8, args[1], "build")) {
+        i = 2;
+    }
 
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -130,9 +159,11 @@ fn parseArgs(args: []const [:0]const u8) ArgResult {
 fn printUsage() void {
     std.debug.print(
         \\Usage: forge [command] [options] <file.foz>
+        \\       forge verify <contract.fozbin> <contract.fozabi>
         \\
         \\Commands:
-        \\  build      Compile a Forge source file.
+        \\  build      Compile a Forge source file (default).
+        \\  verify     Verify compiled contract (.fozbin) against ABI (.fozabi) inside local ZVM.
         \\
         \\Options:
         \\  -o <file>       Specify output binary path (default: a.fozbin)
@@ -211,25 +242,10 @@ pub fn compile(
         return err;
     };
     const all_top_levels = resolved_all.merged_top_levels;
-    const file_modules = resolved_all.file_modules;
 
     // ── Stage 3: Type resolution ─────────────────────────────────────────
     var resolver = TypeResolver.init(temp_alloc, &diagnostics);
     defer resolver.deinit();
-    // Register file-based module namespaces.
-    {
-        var iter = file_modules.iterator();
-        while (iter.next()) |entry| {
-            const mod = entry.value_ptr.*;
-            try resolver.global_scope.define(mod.module_name, .{
-                .name = mod.module_name,
-                .kind = .module,
-                .type_ = .void_,
-                .span = .{ .line = 0, .col = 0, .len = 0 },
-                .mutable = false,
-            });
-        }
-    }
     try resolver.registerTopLevel(all_top_levels);
 
     // ── Stage 4: Find components ─────────────────────────────────────────
@@ -299,6 +315,7 @@ pub fn compile(
         defer gen.deinit();
         gen.mir_data = mir_module.data_section;
         gen.mir_events = mir_module.events;
+        gen.mir_errors = mir_module.errors_;
         const tmp_bin = try gen.generateFromMir(&mir_module);
         binary = try alloc.dupe(u8, tmp_bin);
     } else {
@@ -582,6 +599,9 @@ pub fn main() anyerror!void {
     switch (arg_res) {
         .exit_ok => std.process.exit(0),
         .exit_err => std.process.exit(2),
+        .verify => |v| {
+            try contract_runner.runContractVerification(alloc, v.bin_path, v.abi_path);
+        },
         .success => |res| {
             const input_path = res.input_path;
             const opts = res.opts;

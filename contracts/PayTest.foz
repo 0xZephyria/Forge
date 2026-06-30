@@ -1,0 +1,10 @@
+version 1
+
+contract PayTest:
+    setup():
+        nothing
+
+    action pay_recipient(recipient is Account, amount is u256):
+        pay amount to recipient
+
+End;

@@ -569,6 +569,8 @@ pub const EVMCodeGen = struct {
     mir_data: ?[]const u8,
     /// MIR event descriptors.
     mir_events: []const mir_mod.EventDesc,
+    /// MIR error type descriptors.
+    mir_errors: []const mir_mod.ErrorDesc,
     /// Internal label counter for safety checks.
     next_label: u32,
 
@@ -583,6 +585,7 @@ pub const EVMCodeGen = struct {
             .resolver = resolver,
             .mir_data = null,
             .mir_events = &.{},
+            .mir_errors = &.{},
             .next_label = 1000000,
         };
     }
@@ -599,7 +602,6 @@ pub const EVMCodeGen = struct {
     /// This is the new unified entry point that replaces direct AST walking.
     /// All backends share the same MirModule; only this lowering layer is
     /// target-specific.
-    /// SPEC: Part 5, Part 14 — Generate complete EVM initcode from a MirModule.
     pub fn generateFromMir(
         self: *EVMCodeGen,
         mir: *const mir_mod.MirModule,
@@ -993,25 +995,28 @@ pub const EVMCodeGen = struct {
             .add => |a| {
                 const ok_label = self.next_label;
                 self.next_label += 1;
+                const ok_math_label = self.next_label;
+                self.next_label += 1;
+
                 try w.pushU32(rctx.memOf(a.rhs));
-                try w.op(.MLOAD);
+                try w.op(.MLOAD); // rhs
                 try w.pushU32(rctx.memOf(a.lhs));
-                try w.op(.MLOAD);
-                // Status: [rhs, lhs]
-                try w.op(.ADD);
-                // Status: [sum]
-                try w.op(.DUP1);
-                try w.pushU32(rctx.memOf(a.rhs));
-                try w.op(.MLOAD);
-                // Status: [sum, sum, rhs]
-                try w.op(.GT);
-                try w.op(.ISZERO);
-                // Status: [sum, sum >= rhs]
-                if (label_offsets.get(ok_label)) |target_off| {
+                try w.op(.MLOAD); // lhs
+                // Stack: [rhs, lhs]
+                try w.op(.DUP2); // [rhs, lhs, rhs]
+                try w.op(.DUP2); // [rhs, lhs, rhs, lhs]
+                try w.op(.ADD);  // [rhs, lhs, sum]
+                // Check sum >= rhs:
+                try w.op(.DUP1); // [rhs, lhs, sum, sum]
+                try w.op(.DUP4); // duplicates rhs. Stack: [rhs, lhs, sum, sum, rhs]
+                try w.op(.GT); // rhs > sum. Stack: [rhs, lhs, sum, overflow]
+                try w.op(.ISZERO); // sum >= rhs. Stack: [rhs, lhs, sum, no_overflow]
+                
+                if (label_offsets.get(ok_math_label)) |target_off| {
                     try w.push2(@intCast(target_off));
                 } else {
                     const p = try w.push2Placeholder();
-                    const entry = try label_patches.getOrPut(ok_label);
+                    const entry = try label_patches.getOrPut(ok_math_label);
                     if (!entry.found_existing) entry.value_ptr.* = .{};
                     try entry.value_ptr.append(self.allocator, p);
                 }
@@ -1019,6 +1024,15 @@ pub const EVMCodeGen = struct {
                 try w.push0();
                 try w.push0();
                 try w.op(.REVERT);
+
+                // Math succeeded target: clean up stack
+                const ok_math_off = w.offset();
+                try label_offsets.put(ok_math_label, ok_math_off);
+                try w.op(.JUMPDEST);
+                try w.op(.SWAP2);
+                try w.op(.POP);
+                try w.op(.POP); // Stack: [sum]
+
                 // Target Label
                 const ok_off = w.offset();
                 try label_offsets.put(ok_label, ok_off);
@@ -1065,14 +1079,16 @@ pub const EVMCodeGen = struct {
                 self.next_label += 1;
                 const zero_label = self.next_label;
                 self.next_label += 1;
+                const ok_math_label = self.next_label;
+                self.next_label += 1;
 
                 try w.pushU32(rctx.memOf(a.rhs));
-                try w.op(.MLOAD);
+                try w.op(.MLOAD); // rhs
                 try w.pushU32(rctx.memOf(a.lhs));
-                try w.op(.MLOAD);
-                // Status: [rhs, lhs]
-                try w.op(.DUP1);
-                try w.op(.ISZERO);
+                try w.op(.MLOAD); // lhs
+                // Stack: [rhs, lhs]
+                try w.op(.DUP1); // [rhs, lhs, lhs]
+                try w.op(.ISZERO); // [rhs, lhs, lhs == 0]
                 if (label_offsets.get(zero_label)) |target_off| {
                     try w.push2(@intCast(target_off));
                 } else {
@@ -1081,18 +1097,39 @@ pub const EVMCodeGen = struct {
                     if (!entry.found_existing) entry.value_ptr.* = .{};
                     try entry.value_ptr.append(self.allocator, p);
                 }
-                try w.op(.JUMPI);
+                try w.op(.JUMPI); // Jumps to zero_label if lhs == 0. Stack: [rhs, lhs]
+
                 // lhs != 0: check product / lhs == rhs
-                try w.op(.DUP2);
-                try w.op(.DUP2);
-                try w.op(.MUL);
-                // Status: [lhs, rhs, product]
-                try w.op(.DUP1);
-                try w.op(.DUP4); // lhs
-                try w.op(.DIV);
-                // Status: [lhs, rhs, product, product/lhs]
-                try w.op(.DUP3); // rhs
-                try w.op(.EQ);
+                try w.op(.DUP2); // [rhs, lhs, rhs]
+                try w.op(.DUP2); // [rhs, lhs, rhs, lhs]
+                try w.op(.MUL);  // [rhs, lhs, product]
+                try w.op(.DUP1); // [rhs, lhs, product, product]
+                try w.op(.DUP3); // duplicates lhs. Stack: [rhs, lhs, product, product, lhs]
+                try w.op(.DIV);  // [rhs, lhs, product, product / lhs]
+                try w.op(.DUP4); // duplicates rhs. Stack: [rhs, lhs, product, product / lhs, rhs]
+                try w.op(.EQ);   // [rhs, lhs, product, (product / lhs) == rhs]
+                
+                if (label_offsets.get(ok_math_label)) |target_off| {
+                    try w.push2(@intCast(target_off));
+                } else {
+                    const p = try w.push2Placeholder();
+                    const entry = try label_patches.getOrPut(ok_math_label);
+                    if (!entry.found_existing) entry.value_ptr.* = .{};
+                    try entry.value_ptr.append(self.allocator, p);
+                }
+                try w.op(.JUMPI); // Jumps to ok_math_label if no overflow. Stack: [rhs, lhs, product]
+                try w.push0();
+                try w.push0();
+                try w.op(.REVERT);
+
+                // Zero label dest (only reached if lhs == 0)
+                const zero_off = w.offset();
+                try label_offsets.put(zero_label, zero_off);
+                try w.op(.JUMPDEST);
+                try w.op(.POP);
+                try w.op(.POP);
+                try w.push0(); // Stack: [0]
+                
                 if (label_offsets.get(ok_label)) |target_off| {
                     try w.push2(@intCast(target_off));
                 } else {
@@ -1101,18 +1138,15 @@ pub const EVMCodeGen = struct {
                     if (!entry.found_existing) entry.value_ptr.* = .{};
                     try entry.value_ptr.append(self.allocator, p);
                 }
-                try w.op(.JUMPI);
-                try w.push0();
-                try w.push0();
-                try w.op(.REVERT);
+                try w.op(.JUMP);
 
-                // Zero label dest
-                const zero_off = w.offset();
-                try label_offsets.put(zero_label, zero_off);
+                // Ok math label dest (reached if lhs != 0 and no overflow)
+                const ok_math_off = w.offset();
+                try label_offsets.put(ok_math_label, ok_math_off);
                 try w.op(.JUMPDEST);
+                try w.op(.SWAP2);
                 try w.op(.POP);
-                try w.op(.POP);
-                try w.push0();
+                try w.op(.POP); // Stack: [product]
 
                 // Ok label dest
                 const ok_off = w.offset();
@@ -1180,10 +1214,13 @@ pub const EVMCodeGen = struct {
                 try w.op(.MSTORE);
             },
             .negate => |u| {
-                try w.push0();
+                // SPEC: Part 4.3 — Unary negation: 0 - operand.
+                // EVM SUB: a (top) - b → result. To get 0-operand: a=0 (top), b=operand (below).
+                // Push operand first (goes deep), then push0 on top.
                 try w.pushU32(rctx.memOf(u.operand));
-                try w.op(.MLOAD);
-                try w.op(.SUB);
+                try w.op(.MLOAD); // stack: [operand]
+                try w.push0();    // stack: [operand, 0]  a=0 (top), b=operand
+                try w.op(.SUB);   // result = 0 - operand = -operand
                 try w.pushU32(rctx.memOf(u.dst));
                 try w.op(.MSTORE);
             },
@@ -1452,11 +1489,8 @@ pub const EVMCodeGen = struct {
                     }
                 }
 
-                // Push data size and offset.
-                try w.pushU32(mem_off); // data size
-                try w.push0(); // data offset
-
                 // Push indexed topics (reverse order for EVM stack).
+                // They must be pushed before size and offset so they end up deeper in the stack.
                 var ti = topic_regs.items.len;
                 while (ti > 0) {
                     ti -= 1;
@@ -1472,6 +1506,10 @@ pub const EVMCodeGen = struct {
                 } else {
                     try w.push0();
                 }
+
+                // Push data size and offset.
+                try w.pushU32(mem_off); // data size
+                try w.push0(); // data offset (pushed last, ends up at the top of stack, popped first)
 
                 // LOGn where n = 1 + indexed_count.
                 const log_n = 1 + indexed_count;
@@ -1516,15 +1554,17 @@ pub const EVMCodeGen = struct {
             // ── Native transfer ───────────────────────────────────────────
             .pay => |p| {
                 // CALL(gas, to, value, inOff, inLen, outOff, outLen)
-                try w.op(.GAS); // gas
-                try w.pushU32(rctx.memOf(p.recipient)); // to
-                try w.op(.MLOAD);
+                // EVM stack pops from top to bottom: first popped is gas, last is outLen.
+                // So we push in reverse order.
+                try w.push0(); // outLen
+                try w.push0(); // outOff
+                try w.push0(); // inLen
+                try w.push0(); // inOff
                 try w.pushU32(rctx.memOf(p.amount)); // value
                 try w.op(.MLOAD);
-                try w.push0(); // inOff
-                try w.push0(); // inLen
-                try w.push0(); // outOff
-                try w.push0(); // outLen
+                try w.pushU32(rctx.memOf(p.recipient)); // to
+                try w.op(.MLOAD);
+                try w.op(.GAS); // gas
                 try w.op(.CALL);
                 try w.op(.POP); // pop success
             },
@@ -1608,7 +1648,36 @@ pub const EVMCodeGen = struct {
 
             // ── Error throwing ─────────────────────────────────────────────
             .throw_error => |te| {
-                // ABI-encode error and revert.
+                // SPEC: Part 5.10 — ABI-encode custom error and revert.
+                // Layout: [4-byte selector][arg0 32B][arg1 32B]...
+                // Selector = keccak256("ErrorName(t0,t1,...)")[0..4]
+                var err_selector: u32 = 0;
+                for (self.mir_errors) |edesc| {
+                    if (edesc.error_id == te.error_id) {
+                        // Build minimal signature: ErrorName() without field types
+                        // (field types not stored in ErrorDesc; use uint256 for each arg as default).
+                        var sig_buf = std.ArrayListUnmanaged(u8){};
+                        defer sig_buf.deinit(self.allocator);
+                        sig_buf.appendSlice(self.allocator, edesc.name) catch {};
+                        sig_buf.append(self.allocator, '(') catch {};
+                        var fi: u32 = 0;
+                        while (fi < edesc.field_count) : (fi += 1) {
+                            if (fi > 0) sig_buf.append(self.allocator, ',') catch {};
+                            sig_buf.appendSlice(self.allocator, "uint256") catch {};
+                        }
+                        sig_buf.append(self.allocator, ')') catch {};
+                        err_selector = evmSelector(sig_buf.items);
+                        break;
+                    }
+                }
+                // Write selector as left-padded 4 bytes at memory offset 0.
+                // Use PUSH4 + SHL pattern: selector << 224 stores as big-endian at slot 0.
+                try w.push4(err_selector);
+                try w.push1(0xe0);
+                try w.op(.SHL);
+                try w.push0();
+                try w.op(.MSTORE);
+                // Write each argument at offset 4 + i*32.
                 for (te.args, 0..) |arg, i| {
                     try w.pushU32(rctx.memOf(arg));
                     try w.op(.MLOAD);
@@ -1965,4 +2034,42 @@ test "buildSelector produces correct 4-byte ERC-20 transfer selector" {
     };
     const sel = try buildSelector("transfer", &params, &resolver, alloc);
     try std.testing.expectEqual(@as(u32, 0xa9059cbb), sel);
+}
+
+// SPEC: Part 2.5 & 14.5 — Test end-to-end EVM code generation with fixed-point types, float literals coercion, and checked math.
+test "EVM compilation end-to-end with fixed-point coercion and math" {
+    const main = @import("main.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\version 1
+        \\contract FixedMath:
+        \\    has:
+        \\        rate is percent
+        \\        price is price9
+        \\
+        \\    action update():
+        \\        let new_rate is percent = 0.05
+        \\        let new_price is price9 = 1.23456789
+        \\        let rate_mult is percent = new_rate * 0.1
+        \\        let price_add is price9 = new_price + 0.00000001
+        \\        give back
+    ;
+
+    const opts = main.CompileOptions{
+        .evm_abi = true,
+        .target = "evm",
+    };
+
+    const result = try main.compile(source, "test_fixed.foz", opts, alloc);
+    try std.testing.expect(result != null);
+    if (result) |cr| {
+        // EVM binary generated successfully
+        try std.testing.expect(cr.binary.len > 0);
+        alloc.free(cr.binary);
+        if (cr.zeph_abi) |z| alloc.free(z);
+        if (cr.evm_abi) |e| alloc.free(e);
+    }
 }

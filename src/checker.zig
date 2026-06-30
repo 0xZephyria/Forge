@@ -268,6 +268,8 @@ pub const Checker = struct {
     storage_version: u32 = 1,
     /// Set by field_access when the object is a module, consumed by call handler.
     pending_module_fn: ?struct { module_fn: modules.ModuleFn } = null,
+    /// Tracks return type of current action/view/pure function being checked.
+    current_return_type: ?ResolvedType = null,
 
     /// Create a new checker bound to a type resolver and diagnostic sink.
     pub fn init(
@@ -283,6 +285,7 @@ pub const Checker = struct {
             .current_file = current_file,
             .forbidden_fields = null,
             .storage_version = 1,
+            .current_return_type = null,
         };
     }
 
@@ -688,6 +691,75 @@ pub const Checker = struct {
         }
     }
 
+    /// SPEC: Part 2.5 — Coerce a float literal to a target fixed-point type of decimals other than 18.
+    /// Mutates the AST expression node to wrap it in a cast if compatible.
+    fn coerceFloatLit(
+        self: *Checker,
+        expr: *const Expr,
+        target_ty: ResolvedType,
+    ) anyerror!void {
+        if (expr.kind != .float_lit) return;
+        if (std.meta.activeTag(target_ty) != .fixed_point) return;
+        const decimals = target_ty.fixed_point;
+        if (decimals == 18) return;
+
+        const mutable_expr = @constCast(expr);
+        const inner_expr = try self.allocator.create(Expr);
+        inner_expr.* = mutable_expr.*;
+
+        mutable_expr.kind = .{
+            .cast = .{
+                .expr = inner_expr,
+                .to = .{ .fixed = .{ .decimals = decimals } },
+            },
+        };
+    }
+
+    /// SPEC: Part 2.1 — Coerce an integer literal to a target integer type.
+    /// Mutates the AST expression node to wrap it in a cast if compatible.
+    fn coerceIntLit(
+        self: *Checker,
+        expr: *const Expr,
+        target_ty: ResolvedType,
+    ) anyerror!void {
+        if (expr.kind != .int_lit) return;
+        const tag = std.meta.activeTag(target_ty);
+        const is_int = switch (tag) {
+            .u8, .u16, .u32, .u64, .u128, .u256 => true,
+            .i8, .i16, .i32, .i64, .i128, .i256 => true,
+            else => false,
+        };
+        if (!is_int) return;
+        if (tag == .u256) return; // Default is u256
+
+        const mutable_expr = @constCast(expr);
+        const inner_expr = try self.allocator.create(Expr);
+        inner_expr.* = mutable_expr.*;
+
+        const to_expr = switch (tag) {
+            .u8 => ast.TypeExpr{ .u8 = {} },
+            .u16 => ast.TypeExpr{ .u16 = {} },
+            .u32 => ast.TypeExpr{ .u32 = {} },
+            .u64 => ast.TypeExpr{ .u64 = {} },
+            .u128 => ast.TypeExpr{ .u128 = {} },
+            .u256 => ast.TypeExpr{ .u256 = {} },
+            .i8 => ast.TypeExpr{ .i8 = {} },
+            .i16 => ast.TypeExpr{ .i16 = {} },
+            .i32 => ast.TypeExpr{ .i32 = {} },
+            .i64 => ast.TypeExpr{ .i64 = {} },
+            .i128 => ast.TypeExpr{ .i128 = {} },
+            .i256 => ast.TypeExpr{ .i256 = {} },
+            else => unreachable,
+        };
+
+        mutable_expr.kind = .{
+            .cast = .{
+                .expr = inner_expr,
+                .to = to_expr,
+            },
+        };
+    }
+
     // ── Expression Type Checking ─────────────────────────────────────────
 
     /// Type-check an expression and return its resolved type.
@@ -731,6 +803,11 @@ pub const Checker = struct {
             .field_access => |fa| {
                 if (fa.object.kind == .identifier) {
                     const obj_name = fa.object.kind.identifier;
+                    if (std.mem.eql(u8, obj_name, "mine")) {
+                        if (scope.lookup(fa.field)) |sym| {
+                            return sym.type_;
+                        }
+                    }
                     if (scope.lookup(obj_name)) |sym| {
                         if (sym.kind == .module) {
                             if (self.resolver.lookupModuleFn(obj_name, fa.field)) |fn_| {
@@ -762,8 +839,31 @@ pub const Checker = struct {
                 }
             },
             .bin_op => |op| {
-                const left_ty = try self.checkExpr(op.left, scope);
-                const right_ty = try self.checkExpr(op.right, scope);
+                var left_ty = try self.checkExpr(op.left, scope);
+                var right_ty = try self.checkExpr(op.right, scope);
+                if (op.left.kind == .float_lit and std.meta.activeTag(right_ty) == .fixed_point) {
+                    try self.coerceFloatLit(op.left, right_ty);
+                    left_ty = right_ty;
+                } else if (op.right.kind == .float_lit and std.meta.activeTag(left_ty) == .fixed_point) {
+                    try self.coerceFloatLit(op.right, left_ty);
+                    right_ty = left_ty;
+                }
+
+                const is_target_int = switch (std.meta.activeTag(right_ty)) {
+                    .u8, .u16, .u32, .u64, .u128, .u256, .i8, .i16, .i32, .i64, .i128, .i256 => true,
+                    else => false,
+                };
+                const is_left_target_int = switch (std.meta.activeTag(left_ty)) {
+                    .u8, .u16, .u32, .u64, .u128, .u256, .i8, .i16, .i32, .i64, .i128, .i256 => true,
+                    else => false,
+                };
+                if (op.left.kind == .int_lit and is_target_int) {
+                    try self.coerceIntLit(op.left, right_ty);
+                    left_ty = right_ty;
+                } else if (op.right.kind == .int_lit and is_left_target_int) {
+                    try self.coerceIntLit(op.right, left_ty);
+                    right_ty = left_ty;
+                }
                 switch (op.op) {
                     .plus, .minus, .times, .divided_by, .mod => {
                         if (!isNumeric(left_ty) or !isNumeric(right_ty)) {
@@ -852,8 +952,10 @@ pub const Checker = struct {
                         });
                     } else {
                         for (c.args, fn_info.params) |arg, param| {
-                            const arg_ty = try self.checkExpr(arg.value, scope);
                             const param_ty = modules.toResolvedType(param.type_);
+                            try self.coerceFloatLit(arg.value, param_ty);
+                            try self.coerceIntLit(arg.value, param_ty);
+                            const arg_ty = try self.checkExpr(arg.value, scope);
                             if (!self.resolver.isCompatible(arg_ty, param_ty) and
                                 !self.resolver.isCompatible(param_ty, arg_ty))
                             {
@@ -882,11 +984,25 @@ pub const Checker = struct {
                 return .void_;
             },
             .struct_lit => |sl| {
+                if (self.resolver.struct_defs.getPtr(sl.type_name)) |info| {
+                    for (sl.fields) |fi| {
+                        var field_ty: ?ResolvedType = null;
+                        for (info.fields) |sff| {
+                            if (std.mem.eql(u8, sff.name, fi.name)) {
+                                field_ty = sff.type_;
+                                break;
+                            }
+                        }
+                        if (field_ty) |fty| {
+                            try self.coerceFloatLit(fi.value, fty);
+                            try self.coerceIntLit(fi.value, fty);
+                        }
+                        _ = try self.checkExpr(fi.value, scope);
+                    }
+                    return .{ .struct_ = info };
+                }
                 for (sl.fields) |fi| {
                     _ = try self.checkExpr(fi.value, scope);
-                }
-                if (self.resolver.struct_defs.getPtr(sl.type_name)) |info| {
-                    return .{ .struct_ = info };
                 }
                 return .void_;
             },
@@ -1146,6 +1262,11 @@ pub const Checker = struct {
                 _ = try self.checkExpr(v.commitment, scope);
             },
             .let_bind => |lb| {
+                if (lb.declared_type) |dt| {
+                    const declared_ty = try self.resolver.resolve(dt);
+                    try self.coerceFloatLit(lb.init, declared_ty);
+                    try self.coerceIntLit(lb.init, declared_ty);
+                }
                 const init_ty = try self.checkExpr(lb.init, scope);
                 const declared_ty = if (lb.declared_type) |dt|
                     try self.resolver.resolve(dt)
@@ -1179,8 +1300,26 @@ pub const Checker = struct {
                 });
             },
             .assign => |asg| {
-                _ = try self.checkExpr(asg.target, scope);
-                _ = try self.checkExpr(asg.value, scope);
+                const target_ty = try self.checkExpr(asg.target, scope);
+                try self.coerceFloatLit(asg.value, target_ty);
+                try self.coerceIntLit(asg.value, target_ty);
+                const value_ty = try self.checkExpr(asg.value, scope);
+                if (!self.resolver.isCompatible(value_ty, target_ty)) {
+                    const msg = try std.fmt.allocPrint(
+                        self.allocator,
+                        "type mismatch in assignment: expected {s}, got {s}",
+                        .{ @tagName(target_ty), @tagName(value_ty) },
+                    );
+                    try self.diagnostics.add(.{
+                        .file = self.current_file,
+                        .line = asg.value.span.line,
+                        .col = asg.value.span.col,
+                        .len = asg.value.span.len,
+                        .kind = CompileError.TypeMismatch,
+                        .message = msg,
+                        .source_line = "",
+                    });
+                }
 
                 // Security: Enforce #[private] zero-knowledge boundaries
                 const target_is_mine = switch (asg.target.kind) {
@@ -1241,8 +1380,26 @@ pub const Checker = struct {
                 }
             },
             .aug_assign => |aug| {
-                _ = try self.checkExpr(aug.target, scope);
-                _ = try self.checkExpr(aug.value, scope);
+                const target_ty = try self.checkExpr(aug.target, scope);
+                try self.coerceFloatLit(aug.value, target_ty);
+                try self.coerceIntLit(aug.value, target_ty);
+                const value_ty = try self.checkExpr(aug.value, scope);
+                if (!self.resolver.isCompatible(value_ty, target_ty)) {
+                    const msg = try std.fmt.allocPrint(
+                        self.allocator,
+                        "type mismatch in augmented assignment: expected {s}, got {s}",
+                        .{ @tagName(target_ty), @tagName(value_ty) },
+                    );
+                    try self.diagnostics.add(.{
+                        .file = self.current_file,
+                        .line = aug.value.span.line,
+                        .col = aug.value.span.col,
+                        .len = aug.value.span.len,
+                        .kind = CompileError.TypeMismatch,
+                        .message = msg,
+                        .source_line = "",
+                    });
+                }
 
                 // Security: Enforce #[private] zero-knowledge boundaries for += / -= etc.
                 const target_is_mine = switch (aug.target.kind) {
@@ -1344,6 +1501,10 @@ pub const Checker = struct {
                 _ = try self.checkExpr(e.cond, scope);
             },
             .give_back => |expr| {
+                if (self.current_return_type) |ret_ty| {
+                    try self.coerceFloatLit(expr, ret_ty);
+                    try self.coerceIntLit(expr, ret_ty);
+                }
                 _ = try self.checkExpr(expr, scope);
             },
             .call_stmt => |expr| {
@@ -2085,6 +2246,10 @@ pub const Checker = struct {
         }
         // Check each action
         for (contract.actions) |action| {
+            const ret_ty = if (action.return_type) |rt| try self.resolver.resolve(rt) else null;
+            self.current_return_type = ret_ty;
+            defer self.current_return_type = null;
+
             var action_scope = SymbolTable.init(self.allocator, &result.scope);
             defer action_scope.deinit();
             // GAP-7: inject built-in identifiers available in every action
@@ -2131,6 +2296,10 @@ pub const Checker = struct {
         }
         // Check views
         for (contract.views) |view| {
+            const ret_ty = if (view.return_type) |rt| try self.resolver.resolve(rt) else null;
+            self.current_return_type = ret_ty;
+            defer self.current_return_type = null;
+
             var view_scope = SymbolTable.init(self.allocator, &result.scope);
             defer view_scope.deinit();
             // GAP-7: built-in identifiers available in views too
@@ -2174,6 +2343,10 @@ pub const Checker = struct {
         }
         // Check pure functions
         for (contract.pures) |pure| {
+            const ret_ty = if (pure.return_type) |rt| try self.resolver.resolve(rt) else null;
+            self.current_return_type = ret_ty;
+            defer self.current_return_type = null;
+
             var pure_scope = SymbolTable.init(self.allocator, &result.scope);
             defer pure_scope.deinit();
             for (pure.params) |param| {

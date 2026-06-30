@@ -28,6 +28,15 @@ pub fn build(b: *std.Build) void {
         "Filter test names (substring match)",
     );
 
+    // ── BLS12-381 Dependency ──────────────────────────────────────────────
+    // Native BLS12-381 signature library for the Zeph VM (min-pk variant).
+    // Uses blst as the underlying C implementation for maximum performance.
+    const bls_dep = b.dependency("bls12_381", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const bls_mod = bls_dep.module("bls12-381-min-pk");
+
     // ── Zephyria VM Module ────────────────────────────────────────────────
     // Registers the core ZVM logic as a modular import so both the compiler
     // unit tests and other verification executables can load it.
@@ -36,6 +45,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    zvm_vm.addImport("bls12_381", bls_mod);
 
     // ── Freestanding WebAssembly ZVM Module ──────────────────────────────
     // Configures ZVM module for target CPU wasm32 and OS freestanding.
@@ -57,6 +67,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     root_mod.addImport("zephyria_vm", zvm_vm);
+    root_mod.addImport("bls12_381", bls_mod);
 
     // Apply fast-path compilation options on ReleaseFast builds
     if (optimize == .ReleaseFast) {
@@ -70,6 +81,33 @@ pub fn build(b: *std.Build) void {
         .root_module = root_mod,
     });
     b.installArtifact(exe);
+
+    // ── WebAssembly Library: forge.wasm ──────────────────────────────────
+    // Compiles src/wasm.zig as a freestanding WASM library for the browser IDE.
+    // The ZVM (RISC-V executor) is excluded via comptime `is_wasm` checks in
+    // wasm.zig because it depends on OS threads/POSIX not available in WASM.
+    const wasm_target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .freestanding,
+    });
+    const wasm_mod = b.createModule(.{
+        .root_source_file = b.path("src/wasm.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    // No zephyria_vm import for WASM — the file stubs it out via comptime.
+
+    const wasm_lib = b.addExecutable(.{
+        .name = "forge",
+        .root_module = wasm_mod,
+    });
+    wasm_lib.rdynamic = true;
+    wasm_lib.entry = .disabled;
+
+    const wasm_step = b.step("wasm", "Build forge.wasm for the browser IDE");
+    const wasm_install = b.addInstallFile(wasm_lib.getEmittedBin(), "../../out/forge.wasm");
+    wasm_install.step.dependOn(&wasm_lib.step);
+    wasm_step.dependOn(&wasm_install.step);
 
     // ── Run Step ─────────────────────────────────────────────────────────
     // Allows building and executing the compiler in one go via 'zig build run -- <args>'
@@ -98,6 +136,8 @@ pub fn build(b: *std.Build) void {
         "src/u256.zig",
         "src/main.zig",
         "src/wasm.zig",
+        "src/modules.zig",
+        "src/module_resolver.zig",
         // Zephyria VM unit tests
         "vm/vm.zig",
     };
@@ -117,6 +157,7 @@ pub fn build(b: *std.Build) void {
 
         // Binds the ZVM module into the unit testing contexts
         test_mod.addImport("zephyria_vm", zvm_vm);
+        test_mod.addImport("bls12_381", bls_mod);
 
         const t = b.addTest(.{
             .root_module = test_mod,

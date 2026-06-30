@@ -1,0 +1,12 @@
+version 1
+
+contract EventTest:
+    event TransferEvent(recipient is Account, amount is u256)
+
+    setup():
+        nothing
+
+    action trigger_event(recipient is Account, amount is u256):
+        tell TransferEvent(recipient, amount)
+
+End;

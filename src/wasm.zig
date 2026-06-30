@@ -25,7 +25,39 @@ const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const abi = @import("abi.zig");
 const mir_mod = @import("mir.zig");
-const vm_mod = @import("zephyria_vm");
+
+/// True when compiled as a freestanding WASM module.
+/// All ZVM/RISC-V execution paths are stubbed out in that case because
+/// the ZVM depends on OS threads and POSIX APIs not available in the browser.
+const is_wasm: bool = @import("builtin").cpu.arch.isWasm();
+
+/// Import the Zephyria VM only when not targeting WASM freestanding.
+/// The VM uses threads, AOT compilation, and POSIX syscalls that are
+/// unavailable in a freestanding Wasm environment.
+const vm_mod = if (!is_wasm) @import("zephyria_vm") else struct {
+    // ── Minimal stubs so the file compiles without the VM ────────────────
+    pub const ExecutionStatus = enum { returned, breakpoint, reverted, outOfGas, fault };
+    pub const StorageBackend = struct {
+        ctx: *anyopaque,
+        loadFn: *const fn (*anyopaque, [32]u8) [32]u8,
+        storeFn: *const fn (*anyopaque, [32]u8, [32]u8) void,
+    };
+    pub const sandbox = struct {
+        pub const codeSize: u32 = 0;
+        pub const heapStart: u32 = 0;
+        pub const scratchStart: u32 = 0;
+    };
+    pub const HostEnv = struct {
+        pub fn init(_: std.mem.Allocator) @This() { return .{}; }
+        pub fn deinit(_: *@This()) void {}
+    };
+    pub const ForgeVM = struct {
+        pub fn create(_: std.mem.Allocator, _: []const u8, _: []const u8, _: u64, _: *anyopaque) !@This() { return error.VmUnsupported; }
+    };
+    pub const zephbinLoader = struct {
+        pub fn parse(_: std.mem.Allocator, _: []const u8) !struct { pub fn deinit(_: *@This()) void {} pub fn pickAction(_: *@This(), _: u32) ?struct { code: []const u8 } { return null; } } { return error.VmUnsupported; }
+    };
+};
 
 // ── Allocator setup for Freestanding Wasm ────────────────────────────────────
 var wasm_allocator = if (@import("builtin").cpu.arch.isWasm())
@@ -189,6 +221,7 @@ fn compileInternal(alloc: std.mem.Allocator, source: []const u8, target_evm: boo
                 defer cg.deinit();
                 cg.mir_data = mir_module.data_section;
                 cg.mir_events = mir_module.events;
+                cg.mir_errors = mir_module.errors_;
                 const tmp_bin = try cg.generateFromMir(&mir_module);
                 binary = try temp_alloc.dupe(u8, tmp_bin);
             } else {
@@ -351,6 +384,7 @@ const ParamVal = union(enum) {
 };
 
 /// SPEC: Part 14.1 — Storage Model
+/// Only meaningful on native targets where the ZVM is available.
 const MemStorage = struct {
     map: std.AutoHashMap([32]u8, [32]u8),
     allocator: std.mem.Allocator,
@@ -377,6 +411,7 @@ const MemStorage = struct {
     }
 
     pub fn backend(self: *MemStorage) vm_mod.StorageBackend {
+        // On WASM the VM is stubbed — this path is never reached at runtime.
         return .{
             .ctx = self,
             .loadFn = load,
@@ -538,6 +573,7 @@ fn compileFozBytesWithDiags(
 }
 
 /// SPEC: Part 14.3 — Invocation in WebAssembly
+/// On WASM targets the ZVM is not available; returns VmUnsupported.
 fn runWasmAction(
     allocator: std.mem.Allocator,
     binary: []const u8,
@@ -548,6 +584,11 @@ fn runWasmAction(
     caller: [32]u8,
     call_value: [32]u8,
 ) anyerror!ActionResult {
+    if (is_wasm) {
+        // ZVM execution requires OS threads and POSIX — not available in browser WASM.
+        return error.VmUnsupported;
+    }
+
     var pkg = try vm_mod.zephbinLoader.parse(allocator, binary);
     defer pkg.deinit();
 
@@ -801,14 +842,7 @@ fn run_forge_steps_json_internal(
                 break :run_result try abi.serializeJson(response, temp_alloc);
             };
 
-            const status_str = switch (outcome.status) {
-                .returned => "returned",
-                .breakpoint => "breakpoint",
-                .reverted => "reverted",
-                .outOfGas => "outOfGas",
-                .fault => "fault",
-                else => "fault",
-            };
+            const status_str = @tagName(outcome.status);
 
             const revert_str = if (outcome.revert_data.len > 0)
                 try temp_alloc.dupe(u8, outcome.revert_data)
