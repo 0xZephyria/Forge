@@ -333,6 +333,7 @@ test "module_resolver resolveAll skips stdlib imports" {
     const top_levels = [_]TopLevel{
         .{ .use_import = .{
             .path = path_storage[0..],
+            .selective = &.{},
             .alias = null,
             .span = .{ .line = 1, .col = 1, .len = 14 },
         } },

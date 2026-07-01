@@ -150,6 +150,9 @@ fn errorCodeFromDiag(d: errors.Diagnostic) u16 {
         error.ImportNotFound => 39,
         error.ImportCollision => 40,
         error.CyclicImport => 41,
+        error.ConstructNotEmittedOnTarget => 42,
+        error.NonExhaustiveMatch => 43,
+        error.TooManyIndexedFields => 44,
         error.OutOfMemory => 33,
         error.InternalError => 34,
     };

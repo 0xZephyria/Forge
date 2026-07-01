@@ -131,6 +131,9 @@ pub const CheckedContract = struct {
     type_map: std.StringHashMap(ResolvedType),
     scope: SymbolTable,
     allocator: std.mem.Allocator,
+    /// Auto-generated public getter views for every `public` state field.
+    /// Backends concatenate these with the user-written views.
+    generated_views: std.ArrayListUnmanaged(ast.ViewDecl) = .{},
 
     /// Release all resources held by the checked contract.
     pub fn deinit(self: *CheckedContract) void {
@@ -142,6 +145,7 @@ pub const CheckedContract = struct {
         self.action_lists.deinit();
         self.type_map.deinit();
         self.scope.deinit();
+        self.generated_views.deinit(self.allocator);
     }
 };
 
@@ -909,6 +913,27 @@ pub const Checker = struct {
                     .and_, .or_ => return .bool,
                     .has => return .bool,
                     .duration_add, .duration_sub => return .timestamp,
+                    .bit_and, .bit_or, .bit_xor, .shl, .shr, .power => {
+                        // SPEC: Part 2.2 — Bitwise/power ops require integer operands and
+                        // return the integer type of the left operand.
+                        if (!isNumeric(left_ty) or !isNumeric(right_ty)) {
+                            const msg = try std.fmt.allocPrint(
+                                self.allocator,
+                                "bitwise/power operator requires integer types",
+                                .{},
+                            );
+                            try self.diagnostics.add(.{
+                                .file = self.current_file,
+                                .line = expr.span.line,
+                                .col = expr.span.col,
+                                .len = expr.span.len,
+                                .kind = CompileError.InvalidTypeForOperation,
+                                .message = msg,
+                                .source_line = "",
+                            });
+                        }
+                        return left_ty;
+                    },
                 }
             },
             .unary_op => |op| {
@@ -916,6 +941,7 @@ pub const Checker = struct {
                 return switch (op.op) {
                     .not_ => .bool,
                     .negate => operand_ty,
+                    .bit_not => operand_ty,
                 };
             },
             .call => |c| {
@@ -930,7 +956,7 @@ pub const Checker = struct {
                     }
                 }
                 // Resolve the callee first — this may set pending_module_fn.
-                _ = try self.checkExpr(c.callee, scope);
+                const callee_ty = try self.checkExpr(c.callee, scope);
                 // Module function call (e.g., math.sqrt(x))
                 if (self.pending_module_fn) |pending| {
                     self.pending_module_fn = null;
@@ -980,6 +1006,25 @@ pub const Checker = struct {
                 }
                 for (c.args) |arg| {
                     _ = try self.checkExpr(arg.value, scope);
+                }
+                // Function-value call: `f(args)` where `f` has function type
+                // returns the function's declared return type.
+                switch (callee_ty) {
+                    .function => |ft| {
+                        if (ft.return_) |rt| return rt.*;
+                        return .void_;
+                    },
+                    else => {},
+                }
+                // Named function call: the callee identifier resolves to a
+                // pure/view/action symbol whose `.type_` is its return type.
+                if (c.callee.kind == .identifier) {
+                    if (scope.lookup(c.callee.kind.identifier)) |sym| {
+                        switch (sym.kind) {
+                            .pure_fn, .view, .action => return sym.type_,
+                            else => {},
+                        }
+                    }
                 }
                 return .void_;
             },
@@ -1041,6 +1086,86 @@ pub const Checker = struct {
             .try_propagate => |inner| {
                 return try self.checkExpr(inner, scope);
             },
+
+            // SPEC: Part 5.5 — Lambda yields a function value. Resolve each
+            // parameter's declared type and the return type into a fresh
+            // `function` ResolvedType. The body is checked in a child scope.
+            .lambda => |le| {
+                const params_buf = try self.allocator.alloc(*ResolvedType, le.params.len);
+                for (le.params, 0..) |p, i| {
+                    const rt = try self.resolver.resolve(p.declared_type);
+                    const slot = try self.allocator.create(ResolvedType);
+                    slot.* = rt;
+                    params_buf[i] = slot;
+                }
+                const ret_ptr: ?*ResolvedType = if (le.return_type) |rt_expr| blk: {
+                    const rt = try self.resolver.resolve(rt_expr);
+                    const slot = try self.allocator.create(ResolvedType);
+                    slot.* = rt;
+                    break :blk slot;
+                } else null;
+                // Best-effort body check: walk any `give_back expr` form so
+                // the return-expression sees lambda params; deeper statement
+                // checking happens once the lambda is lifted into a top-level
+                // pure during MIR lowering.
+                var child = SymbolTable.init(self.allocator, @constCast(scope));
+                defer child.deinit();
+                for (le.params) |p| {
+                    const pty = try self.resolver.resolve(p.declared_type);
+                    try child.define(p.name, .{
+                        .name = p.name,
+                        .kind = .parameter,
+                        .type_ = pty,
+                        .span = le.span,
+                        .mutable = false,
+                    });
+                }
+                for (le.body) |s| {
+                    if (s.kind == .give_back) {
+                        _ = self.checkExpr(s.kind.give_back, &child) catch {};
+                    }
+                }
+                return .{ .function = .{ .params = params_buf, .return_ = ret_ptr } };
+            },
+
+            // SPEC: Part 5.5 — `fn_ref Name` materialises a function pointer.
+            // Look up the symbol's signature and build a `function` type.
+            .fn_ref => |name| {
+                if (scope.lookup(name)) |sym| {
+                    // Best-effort: at this layer we don't carry parameter
+                    // type lists on symbols. Return a function value with
+                    // unknown params and the symbol's return type so the
+                    // caller can still treat it as a function.
+                    const ret_ptr = try self.allocator.create(ResolvedType);
+                    ret_ptr.* = sym.type_;
+                    return .{ .function = .{
+                        .params = &.{},
+                        .return_ = ret_ptr,
+                    } };
+                }
+                const msg = try std.fmt.allocPrint(
+                    self.allocator,
+                    "fn_ref target '{s}' not found",
+                    .{name},
+                );
+                try self.diagnostics.add(.{
+                    .file = self.current_file,
+                    .line = expr.span.line,
+                    .col = expr.span.col,
+                    .len = expr.span.len,
+                    .kind = CompileError.UndeclaredIdentifier,
+                    .message = msg,
+                    .source_line = "",
+                });
+                return .void_;
+            },
+
+            // SPEC: Part 2 / Solidity parity — `payable(addr)` is a marker
+            // cast; the value type is the underlying address-like type.
+            .payable_cast => |inner| {
+                return try self.checkExpr(inner, scope);
+            },
+
             else => .void_,
         };
     }
@@ -1299,6 +1424,39 @@ pub const Checker = struct {
                     .is_private = self.isPrivateTainted(lb.init, scope),
                 });
             },
+            .let_tuple => |lt| {
+                // Type-check the initialiser and bind each name. When the
+                // initialiser resolves to a tuple type we distribute the
+                // element types positionally; otherwise (e.g. a low-level
+                // call returning (bool, Bytes) modelled loosely) we fall back
+                // to declared types or a permissive u256.
+                const init_ty = try self.checkExpr(lt.init, scope);
+                for (lt.names, 0..) |nm, i| {
+                    var elem_ty: ResolvedType = .u256;
+                    switch (init_ty) {
+                        .tuple => |elems| {
+                            if (i < elems.len) elem_ty = elems[i].*;
+                        },
+                        else => {},
+                    }
+                    if (i < lt.declared_types.len) {
+                        elem_ty = try self.resolver.resolve(lt.declared_types[i]);
+                    }
+                    // `_` discards a slot — do not bind it.
+                    if (std.mem.eql(u8, nm, "_")) continue;
+                    scope.define(nm, .{
+                        .name = nm,
+                        .kind = .local_var,
+                        .type_ = elem_ty,
+                        .span = lt.span,
+                        .mutable = true,
+                        .is_private = false,
+                    }) catch |err| switch (err) {
+                        error.DuplicateDeclaration => {},
+                        else => return err,
+                    };
+                }
+            },
             .assign => |asg| {
                 const target_ty = try self.checkExpr(asg.target, scope);
                 try self.coerceFloatLit(asg.value, target_ty);
@@ -1522,11 +1680,55 @@ pub const Checker = struct {
                 }
             },
             .match => |m| {
-                _ = try self.checkExpr(m.subject, scope);
+                const subject_ty = self.checkExpr(m.subject, scope) catch .void_;
+                _ = subject_ty;
                 for (m.arms) |arm| {
                     for (arm.body) |s| {
                         try self.checkStmtWithContext(&s, scope, contract, is_migrate);
                     }
+                }
+                // SPEC: Match exhaustiveness for enums — require either a
+                // wildcard `_` arm or all enum variants covered.
+                const subj_ty = self.checkExpr(m.subject, scope) catch .void_;
+                switch (subj_ty) {
+                    .enum_ => |enum_info| {
+                        var has_wildcard = false;
+                        var covered = std.StringHashMap(void).init(self.allocator);
+                        defer covered.deinit();
+                        for (m.arms) |arm| {
+                            switch (arm.pattern) {
+                                .wildcard => {
+                                    has_wildcard = true;
+                                },
+                                .enum_variant => |ev| {
+                                    try covered.put(ev.variant_name, {});
+                                },
+                                else => {},
+                            }
+                        }
+                        if (!has_wildcard) {
+                            for (enum_info.variants) |v| {
+                                if (!covered.contains(v.name)) {
+                                    const msg = try std.fmt.allocPrint(
+                                        self.allocator,
+                                        "match is not exhaustive: missing variant '{s}' of enum '{s}'",
+                                        .{ v.name, enum_info.name },
+                                    );
+                                    try self.diagnostics.add(.{
+                                        .file = self.current_file,
+                                        .line = m.subject.span.line,
+                                        .col = m.subject.span.col,
+                                        .len = m.subject.span.len,
+                                        .kind = CompileError.NonExhaustiveMatch,
+                                        .message = msg,
+                                        .source_line = "",
+                                    });
+                                    break;
+                                }
+                            }
+                        }
+                    },
+                    else => {},
                 }
             },
             else => {},
@@ -2243,6 +2445,54 @@ pub const Checker = struct {
                 else => return err,
             };
             try result.type_map.put(sf.name, resolved);
+
+            // SPEC: Solidity-parity — auto-emit a `public` getter view for
+            // every `public` state field. The synthesised view simply
+            // returns `mine.fieldName`.
+            if (sf.visibility == .public) {
+                const body_ident = try self.allocator.create(ast.Expr);
+                body_ident.* = .{ .kind = .{ .identifier = "mine" }, .span = sf.span };
+                const field_expr = try self.allocator.create(ast.Expr);
+                field_expr.* = .{
+                    .kind = .{ .field_access = .{ .object = body_ident, .field = sf.name } },
+                    .span = sf.span,
+                };
+                var body_stmts = try self.allocator.alloc(ast.Stmt, 1);
+                body_stmts[0] = .{ .kind = .{ .give_back = field_expr }, .span = sf.span };
+                try result.generated_views.append(self.allocator, .{
+                    .name = sf.name,
+                    .visibility = .public,
+                    .type_params = &.{},
+                    .params = &.{},
+                    .return_type = sf.type_,
+                    .accounts = &.{},
+                    .body = body_stmts,
+                    .span = sf.span,
+                });
+            }
+        }
+        // ── SPEC: Event indexed field enforcement (EVM ceiling: max 3 indexed) ─
+        for (contract.events) |ev| {
+            var indexed_count: u32 = 0;
+            for (ev.fields) |f| {
+                if (f.indexed) indexed_count += 1;
+            }
+            if (indexed_count > 3) {
+                const msg = try std.fmt.allocPrint(
+                    self.allocator,
+                    "event '{s}' has {d} indexed fields but the maximum is 3",
+                    .{ ev.name, indexed_count },
+                );
+                try self.diagnostics.add(.{
+                    .file = self.current_file,
+                    .line = ev.span.line,
+                    .col = ev.span.col,
+                    .len = ev.span.len,
+                    .kind = CompileError.TooManyIndexedFields,
+                    .message = msg,
+                    .source_line = "",
+                });
+            }
         }
         // Check each action
         for (contract.actions) |action| {
@@ -3317,6 +3567,12 @@ const ConservationChecker = struct {
     fn collectStatementDeltas(self: *ConservationChecker, stmt: *const Stmt, deltas: *DeltaMap) anyerror!void {
         switch (stmt.kind) {
             .verify => {},
+            // Tuple destructuring binds locals; does not directly mutate
+            // state fields tracked by conservation.
+            .let_tuple => {},
+            // Guard-body insertion marker — only meaningful during inlining,
+            // never reaches conservation analysis with state side effects.
+            .placeholder => {},
             .assign => |asg| {
                 // `mine.field = expr` or `field = expr`
                 // Treat as a full reassignment. We treat this conservatively:
@@ -4254,6 +4510,7 @@ test "use std.math registers module and field_access resolves function" {
     var path_storage: [2][]const u8 = .{ "std", "math" };
     const use_top = TopLevel{ .use_import = .{
         .path = path_storage[0..],
+            .selective = &.{},
         .alias = null,
         .span = .{ .line = 2, .col = 1, .len = 15 },
     } };
@@ -4288,6 +4545,7 @@ test "use std.crypto registers crypto module and functions" {
     var crypto_path: [2][]const u8 = .{ "std", "crypto" };
     const use_top = TopLevel{ .use_import = .{
         .path = crypto_path[0..],
+        .selective = &.{},
         .alias = null,
         .span = .{ .line = 2, .col = 1, .len = 16 },
     } };
@@ -4323,6 +4581,7 @@ test "use std.unknown does not register a module" {
     var unknown_path: [2][]const u8 = .{ "std", "unknown" };
     const use_top = TopLevel{ .use_import = .{
         .path = unknown_path[0..],
+        .selective = &.{},
         .alias = null,
         .span = .{ .line = 2, .col = 1, .len = 16 },
     } };

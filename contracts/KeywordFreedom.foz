@@ -1,0 +1,33 @@
+version 1
+
+// Verifies that `create`, `call`, `staticcall`, `delegatecall`, `create2`
+// are usable as ordinary action/variable names (contextual, not reserved),
+// while the builtin expression forms still work.
+
+contract KeywordFreedom:
+    has:
+        call_count is u256
+        created is u256
+
+    setup():
+        call_count = 0
+        created = 0
+
+    // `create` as an action name — previously blocked by the keyword.
+    action create(amount is u256):
+        created = amount
+
+    // `staticcall` / `delegatecall` as ordinary action names.
+    action staticcall(x is u256):
+        call_count = x
+
+    action delegatecall(x is u256):
+        call_count = x
+
+    view read_calls() gives u256:
+        give back call_count
+
+    // Low-level external call builtin still works via `.call(...)`.
+    action forward(target is Account, data is Bytes):
+        let (success, ret) = target.call(0, data)
+        need success else "call failed"

@@ -1,0 +1,36 @@
+version 1
+
+// Full struct-in-storage test: construction, field read, field write,
+// struct-valued mappings, and per-field storage persistence.
+
+struct Account_Info:
+    balance is u256
+    nonce is u256
+    frozen is bool
+
+contract StructStorage:
+    has:
+        ledger is Map[Account -> Account_Info]
+        owner is Account
+
+    setup():
+        owner = caller
+
+    // Whole-struct write into a mapping slot.
+    action open(user is Account, initial is u256):
+        ledger[user] = Account_Info { balance = initial, nonce = 0, frozen = no }
+
+    // Single struct-field write.
+    action freeze_user(user is Account):
+        ledger[user].frozen = yes
+
+    // Struct-field increment.
+    action bump_nonce(user is Account):
+        ledger[user].nonce = ledger[user].nonce plus 1
+
+    // Struct-field read.
+    view balance_of(user is Account) gives u256:
+        give back ledger[user].balance
+
+    view is_frozen(user is Account) gives bool:
+        give back ledger[user].frozen

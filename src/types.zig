@@ -106,6 +106,20 @@ pub const ResolvedType = union(enum) {
     // ── ZK / Privacy ──────────────────────────────────────────────────────
     /// `Proof[T]` — ZK Proof payload mapped to parametric assertion type.
     proof: *ResolvedType,
+    // ── First-class generics ──────────────────────────────────────────────
+    /// SPEC: Part 5.5 — A free type parameter referenced inside the body of
+    /// a generic action/view/pure/struct/asset. The `u32` is a unique id
+    /// assigned during resolution (1-based; 0 is reserved for unresolved).
+    type_param: u32,
+    /// SPEC: Part 5.5 — First-class function value type. `params` lists the
+    /// argument types; `return_` is `null` for a function returning void.
+    function: struct { params: []*ResolvedType, return_: ?*ResolvedType },
+    // ── Payable address marker ────────────────────────────────────────────
+    /// SPEC: Solidity-parity — `payable Account`. For type comparison
+    /// purposes this is transparent (unwraps to `account`), but the checker
+    /// uses the marker to enforce that `pay`/value-attached calls target a
+    /// payable destination.
+    payable_addr: *ResolvedType,
 };
 
 // ============================================================================
@@ -240,6 +254,15 @@ pub const TypeResolver = struct {
     interface_defs: std.StringHashMap(ast.InterfaceDef),
     /// SPEC: Novel Idea 6 — Track capability type names for linear resolution.
     capability_names: std.StringHashMap(void),
+    /// SPEC: Part 5.5 — Active type parameters in the enclosing declaration.
+    /// The checker pushes the type-param names with fresh u32 ids while
+    /// resolving a generic action/view/pure/struct/asset, and clears the
+    /// map again when leaving. While populated, the resolver maps a bare
+    /// `named: "T"` to `.type_param = id` instead of treating it as a
+    /// user-defined type.
+    active_type_params: std.StringHashMap(u32),
+    /// Monotonic id allocator for type parameters.
+    next_type_param_id: u32,
     /// Stores resolved modules (e.g. from `use std.math`) for lookup by name.
     module_map: std.StringHashMap(modules.Module),
     allocator: std.mem.Allocator,
@@ -256,6 +279,8 @@ pub const TypeResolver = struct {
             .asset_defs = std.StringHashMap(ast.AssetDef).init(allocator),
             .interface_defs = std.StringHashMap(ast.InterfaceDef).init(allocator),
             .capability_names = std.StringHashMap(void).init(allocator),
+            .active_type_params = std.StringHashMap(u32).init(allocator),
+            .next_type_param_id = 1,
             .module_map = std.StringHashMap(modules.Module).init(allocator),
             .allocator = allocator,
             .diagnostics = diagnostics,
@@ -284,7 +309,29 @@ pub const TypeResolver = struct {
         self.asset_defs.deinit();
         self.interface_defs.deinit();
         self.capability_names.deinit();
+        self.active_type_params.deinit();
         self.module_map.deinit();
+    }
+
+    /// SPEC: Part 5.5 — Push a fresh set of type parameters into the active
+    /// scope. Each name receives a unique id. Returns the count pushed so
+    /// the caller can pair the push with `popTypeParams`.
+    pub fn pushTypeParams(self: *TypeResolver, params: []const ast.TypeParam) anyerror!u32 {
+        var n: u32 = 0;
+        for (params) |tp| {
+            const id = self.next_type_param_id;
+            self.next_type_param_id += 1;
+            self.active_type_params.put(tp.name, id) catch {};
+            n += 1;
+        }
+        return n;
+    }
+
+    /// SPEC: Part 5.5 — Remove a set of type parameters from the active scope.
+    pub fn popTypeParams(self: *TypeResolver, params: []const ast.TypeParam) void {
+        for (params) |tp| {
+            _ = self.active_type_params.remove(tp.name);
+        }
     }
 
     pub fn lookupInterface(self: *const TypeResolver, name: []const u8) ?ast.InterfaceDef {
@@ -345,6 +392,30 @@ pub const TypeResolver = struct {
             .string => .string,
             .short_str => .short_str,
             .label => .string,
+            // SPEC: Part 5.5 — `Fn[A, B -> R]` resolves to the dedicated
+            // `function` variant.
+            .function_type => |ft| blk: {
+                const params_buf = try self.allocator.alloc(*ResolvedType, ft.params.len);
+                for (ft.params, 0..) |p, i| {
+                    const r = try self.resolve(p.*);
+                    params_buf[i] = try self.allocResolvedType(r);
+                }
+                var ret: ?*ResolvedType = null;
+                if (ft.return_) |r| {
+                    const rr = try self.resolve(r.*);
+                    ret = try self.allocResolvedType(rr);
+                }
+                break :blk .{ .function = .{ .params = params_buf, .return_ = ret } };
+            },
+            // `payable T` is a payable-address marker around the inner type.
+            // Codegen sees through it as the inner address-flavoured value,
+            // but the checker preserves the marker so it can enforce that
+            // value-bearing operations (pay, value-attached call) target it.
+            .payable => |inner| blk: {
+                const inner_res = try self.resolve(inner.*);
+                const ptr = try self.allocResolvedType(inner_res);
+                break :blk .{ .payable_addr = ptr };
+            },
             .maybe => |inner| {
                 const resolved_inner = try self.resolve(inner.*);
                 const ptr = try self.allocResolvedType(resolved_inner);
@@ -398,6 +469,12 @@ pub const TypeResolver = struct {
                 return .{ .tuple = resolved };
             },
             .named => |name| {
+                // SPEC: Part 5.5 — Generic type parameters take precedence
+                // over user-defined types so that a `T` inside `pure
+                // identity[T](x is T)` resolves to a free type parameter.
+                if (self.active_type_params.get(name)) |id| {
+                    return .{ .type_param = id };
+                }
                 if (self.type_aliases.get(name)) |aliased| {
                     return aliased;
                 }
@@ -528,6 +605,11 @@ pub const TypeResolver = struct {
                     .and_, .or_ => return .bool,
                     .has => return .bool,
                     .duration_add, .duration_sub => return .timestamp,
+                    .bit_and, .bit_or, .bit_xor, .shl, .shr, .power => {
+                        if (self.isCompatible(left_ty, right_ty)) return left_ty;
+                        if (self.isCompatible(right_ty, left_ty)) return right_ty;
+                        return left_ty;
+                    },
                 }
             },
             .unary_op => |op| {
@@ -535,6 +617,7 @@ pub const TypeResolver = struct {
                 switch (op.op) {
                     .not_ => return .bool,
                     .negate => return operand_ty,
+                    .bit_not => return operand_ty,
                 }
             },
             .call => |c| {
@@ -795,6 +878,46 @@ pub const TypeResolver = struct {
                     });
                 },
                 .global_invariant => {},
+                // ── Free top-level functions (Solidity parity: file-scope
+                // helpers without a surrounding contract). They are
+                // resolved during checker/MIR lowering — at registration
+                // time we just record their name in the global scope so
+                // call sites can bind. SPEC: Part 5 — Free Functions.
+                .free_pure => |fd| try self.global_scope.define(fd.name, .{
+                    .name = fd.name,
+                    .kind = .pure_fn,
+                    .type_ = if (fd.return_type) |rt| try self.resolve(rt) else .void_,
+                    .span = fd.span,
+                    .mutable = false,
+                }),
+                .free_view => |fd| try self.global_scope.define(fd.name, .{
+                    .name = fd.name,
+                    .kind = .view,
+                    .type_ = if (fd.return_type) |rt| try self.resolve(rt) else .void_,
+                    .span = fd.span,
+                    .mutable = false,
+                }),
+                .free_action => |fd| try self.global_scope.define(fd.name, .{
+                    .name = fd.name,
+                    .kind = .action,
+                    .type_ = if (fd.return_type) |rt| try self.resolve(rt) else .void_,
+                    .span = fd.span,
+                    .mutable = false,
+                }),
+                .free_helper => |fd| try self.global_scope.define(fd.name, .{
+                    .name = fd.name,
+                    .kind = .pure_fn,
+                    .type_ = if (fd.return_type) |rt| try self.resolve(rt) else .void_,
+                    .span = fd.span,
+                    .mutable = false,
+                }),
+                .free_error => |fd| try self.global_scope.define(fd.name, .{
+                    .name = fd.name,
+                    .kind = .error_decl,
+                    .type_ = .void_,
+                    .span = fd.span,
+                    .mutable = false,
+                }),
             }
         }
     }

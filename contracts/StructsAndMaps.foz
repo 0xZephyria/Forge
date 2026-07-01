@@ -1,0 +1,30 @@
+version 1
+
+struct Order:
+    id is u256
+    buyer is Account
+    filled is bool
+
+contract Probe:
+    has:
+        orders is Map[u256 -> Order]
+        allowances is Map[Account -> Map[Account -> u256]]
+        ids is List[u256]
+        next_id is u256
+
+    setup():
+        next_id = 0
+
+    action make_order(buyer is Account):
+        let oid = next_id
+        next_id = next_id plus 1
+        orders[oid] = Order { id = oid, buyer = buyer, filled = no }
+
+    action fill(oid is u256):
+        orders[oid].filled = yes
+
+    action approve(spender is Account, amount is u256):
+        allowances[caller][spender] = amount
+
+    view get_buyer(oid is u256) gives Account:
+        give back orders[oid].buyer

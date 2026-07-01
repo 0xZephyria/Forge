@@ -154,6 +154,15 @@ pub const TypeExpr = union(enum) {
     /// A generic instantiation: `Name[T1, T2, ...]`.
     generic: struct { name: []const u8, params: []*TypeExpr },
 
+    // ── Function value type ────────────────────────────────────────────────
+    /// `Fn[A, B -> R]` — a first-class function value type.
+    /// `return_` is `null` for `Fn[A, B]` with no result (void).
+    function_type: struct { params: []*TypeExpr, return_: ?*TypeExpr },
+
+    // ── Payable address ────────────────────────────────────────────────────
+    /// `payable Account` — an account explicitly allowed to receive value.
+    payable: *TypeExpr,
+
     // ── Source location ────────────────────────────────────────────────────
     /// Attached span, stored as a tagged variant to keep the union flat.
     /// The parser attaches this to every `TypeExpr` via a wrapping struct;
@@ -242,6 +251,125 @@ pub const ExprKind = union(enum) {
     asset_wrap: struct { asset_type: []const u8, value: *Expr },
     /// `AssetType.unwrap(token)` — unwrap a typed asset to native currency.
     asset_unwrap: struct { asset_type: []const u8, token: *Expr },
+
+    // ── Bytes / unit literals (Solidity-parity flexibility) ───────────────
+    /// `hex"deadbeef"` — raw byte string literal (Bytes value).
+    /// Stored as the raw source slice including the surrounding `hex"…"`.
+    hex_bytes_lit: []const u8,
+    /// Integer with a denomination unit suffix: `1 ether`, `5 gwei`, `7 wei`.
+    /// The compiler scales `value` by the chosen unit before lowering.
+    unit_lit: struct { value: []const u8, unit: UnitDenom },
+
+    // ── Collection literals ───────────────────────────────────────────────
+    /// `[a, b, c]` — list literal.
+    list_lit: []*Expr,
+    /// `{k => v, ...}` — map literal entries.
+    map_lit: []MapEntry,
+    /// `set { a, b, c }` — set literal.
+    set_lit: []*Expr,
+
+    // ── Struct spread / partial update ────────────────────────────────────
+    /// `Type { ..base, field = expr, ... }` — start from `base`, overlay
+    /// the given field initialisers.
+    struct_update: struct {
+        type_name: []const u8,
+        base: *Expr,
+        fields: []FieldInit,
+    },
+
+    // ── First-class function values ───────────────────────────────────────
+    /// `fn (params) gives RetTy: body` — lambda / closure expression.
+    lambda: LambdaExpr,
+    /// `fn_ref FunctionName` — a bare function pointer to a top-level fn.
+    fn_ref: []const u8,
+
+    // ── Payable address cast ──────────────────────────────────────────────
+    /// `payable(addr)` — coerce an address to its payable subtype.
+    payable_cast: *Expr,
+
+    // ── Low-level external calls ──────────────────────────────────────────
+    /// `target.call(value, data)` / `target.staticcall(data)` /
+    /// `target.delegatecall(data)` — return `(bool, Bytes)`.
+    low_call: LowCall,
+
+    // ── ABI helpers ───────────────────────────────────────────────────────
+    /// `abi.encode(a, b, …)`, `abi.encode_packed(...)`,
+    /// `abi.encode_with_selector(sel, …)`, `abi.decode(bytes, T)`.
+    abi_op: AbiOp,
+
+    // ── Contract creation ─────────────────────────────────────────────────
+    /// `create(value, init_code)` or `create2(value, salt, init_code)`.
+    create_expr: CreateExpr,
+};
+
+/// Denomination unit applied to a numeric literal.
+pub const UnitDenom = enum {
+    /// `1 wei` — the smallest atomic unit (no scaling).
+    wei,
+    /// `1 gwei` — 10^9 wei.
+    gwei,
+    /// `1 ether` — 10^18 wei.
+    ether,
+};
+
+/// One entry in a map literal: `k => v`.
+pub const MapEntry = struct {
+    key: *Expr,
+    value: *Expr,
+    span: Span,
+};
+
+/// `fn (params) gives RetTy: body` — an inline function value.
+pub const LambdaExpr = struct {
+    params: []Param,
+    return_type: ?TypeExpr,
+    body: []Stmt,
+    span: Span,
+};
+
+/// Low-level call expression: `target.call(value, data)` etc.
+pub const LowCall = struct {
+    target: *Expr,
+    kind: LowCallKind,
+    /// For `.call`: value to attach. `null` for `staticcall`/`delegatecall`.
+    value: ?*Expr,
+    data: *Expr,
+    span: Span,
+};
+
+/// Which low-level call variant this is.
+pub const LowCallKind = enum {
+    /// `call` — full external call with value transfer.
+    call,
+    /// `staticcall` — read-only external call (must not mutate state).
+    staticcall,
+    /// `delegatecall` — call executes in the caller's storage context.
+    delegatecall,
+};
+
+/// ABI helper expression kinds.
+pub const AbiOp = union(enum) {
+    /// `abi.encode(a, b, ...)` — Solidity-style head-and-tail encoding.
+    encode: []Argument,
+    /// `abi.encode_packed(a, b, ...)` — no padding.
+    encode_packed: []Argument,
+    /// `abi.encode_with_selector(selector, args...)`.
+    encode_with_selector: struct { selector: *Expr, args: []Argument },
+    /// `abi.decode(bytes_expr, TargetType)` — decode bytes into type.
+    decode: struct { data: *Expr, target_type: *TypeExpr },
+};
+
+/// Contract creation expression.
+pub const CreateExpr = struct {
+    /// True for `create2`, false for plain `create`.
+    is_create2: bool,
+    /// Native value to attach to the new contract.
+    value: *Expr,
+    /// Init bytecode (Bytes).
+    init_code: *Expr,
+    /// Salt expression for `create2`; `null` for plain `create`.
+    salt: ?*Expr,
+    span: Span,
 };
 
 /// A function/action call argument — may be positional or named.
@@ -295,6 +423,18 @@ pub const BinOp = enum {
     duration_add,
     /// `a minus b` for Duration arithmetic.
     duration_sub,
+    /// `a bitand b` — bitwise AND on integer operands.
+    bit_and,
+    /// `a bitor b` — bitwise OR on integer operands.
+    bit_or,
+    /// `a bitxor b` — bitwise XOR on integer operands.
+    bit_xor,
+    /// `a shl b` — logical left shift; rhs is the shift count.
+    shl,
+    /// `a shr b` — logical right shift; rhs is the shift count.
+    shr,
+    /// `a power b` — exponentiation.
+    power,
 };
 
 /// Unary prefix operators.
@@ -303,6 +443,8 @@ pub const UnaryOp = enum {
     not_,
     /// `negate expr` — arithmetic negation.
     negate,
+    /// `bitnot expr` — bitwise complement.
+    bit_not,
 };
 
 /// Built-in context values available inside any ZEPH action/view.
@@ -398,10 +540,15 @@ pub const StmtKind = union(enum) {
     // ── Bindings ──────────────────────────────────────────────────────────
     /// `let x is Type = expr`  or  `let x = expr` (type inferred).
     let_bind: LetBind,
+    /// `let (a, b, c) = expr` — destructure a tuple result.
+    let_tuple: LetTupleBind,
     /// `target = expr` — simple assignment.
     assign: Assign,
     /// `target += expr` / `-=` / `*=` / … — augmented assignment.
     aug_assign: AugAssign,
+    /// `_` — wrapped body insertion placeholder in `guard` definitions.
+    /// During lowering, this is replaced with the body of the wrapped fn.
+    placeholder,
 
     // ── Control flow ──────────────────────────────────────────────────────
     /// `when cond: … otherwise when cond: … otherwise: …`
@@ -472,8 +619,10 @@ pub const StmtKind = union(enum) {
     schedule: ScheduleStmt,
 
     // ── Access control ────────────────────────────────────────────────────
-    /// `guard guardName` — apply a named guard at this point.
-    guard_apply: []const u8,
+    /// `guard guardName(args...)` — apply a named guard at this point.
+    /// The guard's precondition body is inlined here with parameters bound
+    /// to the supplied arguments.
+    guard_apply: GuardApply,
     /// `only authorityName` / `only [a, b, c]` / `only auth1 or auth2`.
     only: OnlyStmt,
 
@@ -494,6 +643,17 @@ pub const LetBind = struct {
     init: *Expr,
     /// `readonly` / `let` immutability.
     mutable: bool,
+    span: Span,
+};
+
+/// `let (a, b, ...) = expr` — destructure a tuple value into N bindings.
+pub const LetTupleBind = struct {
+    /// One binding per tuple slot.  `_` means "discard this slot".
+    names: [][]const u8,
+    /// Optional declared element types — must match `names.len` or be empty.
+    declared_types: []TypeExpr,
+    /// The tuple-producing expression.
+    init: *Expr,
     span: Span,
 };
 
@@ -691,6 +851,13 @@ pub const ScheduleStmt = struct {
     /// The call expression to be scheduled.
     call: *Expr,
     after: *Expr,
+    span: Span,
+};
+
+/// `guard guardName(args...)` — invoke a named guard's precondition body.
+pub const GuardApply = struct {
+    name: []const u8,
+    args: []Argument,
     span: Span,
 };
 
@@ -904,6 +1071,9 @@ pub const StateField = struct {
     type_: TypeExpr,
     /// Optional `in namespace` sub-namespace tag.
     namespace: ?[]const u8,
+    /// Visibility (Spec 7.x): `shared` (default) emits an auto-getter view,
+    /// `hidden`/`within` keep the field contract-private. Set by parser.
+    visibility: Visibility = .internal,
     span: Span,
 };
 
@@ -936,9 +1106,14 @@ pub const ConstDecl = struct {
 // SECTION 11 — Function-Level Declarations (Part 5)
 // ============================================================================
 
-/// Visibility keyword on an action or view.
+/// Visibility keyword on an action, view, helper, or state field.
+///
+/// The ZEPH spec-native names (`shared`, `within`, `hidden`, `outside`, `system`)
+/// are preserved for back-compat. Solidity-flavoured aliases (`public`,
+/// `internal`, `private`, `external`) parse alongside and map to the same
+/// underlying semantics.
 pub const Visibility = enum {
-    /// Default — callable from outside.
+    /// Default — callable from outside the contract.
     shared,
     /// Only callable from this contract or inheriting contracts.
     within,
@@ -948,6 +1123,14 @@ pub const Visibility = enum {
     outside,
     /// Only callable by the Zephyria system program.
     system,
+    /// `public` — exposed in the ABI and callable by anyone.
+    public,
+    /// `internal` — visible to this contract and any inheriting contracts.
+    internal,
+    /// `private` — visible only inside the declaring contract.
+    private,
+    /// `external` — only callable from outside the contract (never internally).
+    external,
 };
 
 /// An action declaration (state-changing function).
@@ -983,6 +1166,8 @@ pub const ViewDecl = struct {
 /// A pure function (no state access).
 pub const PureDecl = struct {
     name: []const u8,
+    /// Visibility — defaults to `internal`.
+    visibility: Visibility = .internal,
     type_params: []TypeParam,
     params: []Param,
     return_type: ?TypeExpr,
@@ -1000,6 +1185,10 @@ pub const TypeParam = struct {
 /// An internal helper declaration (`helper` keyword — within-only by default).
 pub const HelperDecl = struct {
     name: []const u8,
+    /// Visibility — defaults to `internal`.
+    visibility: Visibility = .internal,
+    /// Generic type parameters of the helper.
+    type_params: []TypeParam = &.{},
     params: []Param,
     return_type: ?TypeExpr,
     body: []Stmt,
@@ -1093,6 +1282,10 @@ pub const AssetHookWhen = enum {
 /// A top-level `asset Name { … }` declaration.
 pub const AssetDef = struct {
     name: []const u8,
+    /// Generic type parameters of the asset definition (rarely used in
+    /// practice, but the grammar accepts `asset Name[T]` for parity with
+    /// structs and contracts).
+    type_params: []TypeParam = &.{},
     /// `name:` display name (e.g. `"Zephyria Token"`).
     display_name: ?[]const u8,
     /// `symbol:` short ticker (e.g. `"ZEPH"`).
@@ -1158,11 +1351,14 @@ pub const VerifyStmt = struct {
 // SECTION 14 — Top-Level File Nodes
 // ============================================================================
 
-/// `use module.path` import statement.
+/// `use module.path[.{name1, name2}] [as alias]` import statement.
 pub const UseImport = struct {
-    /// Dot-separated path, e.g. `["standard", "math"]`.
+    /// Dot-separated path, e.g. `["std", "math"]`.
     path: [][]const u8,
-    /// Optional local alias: `use standard.math as sm`.
+    /// Optional selective imports: `use std.math.{sqrt, pow}`.
+    /// Empty slice means "import the whole module under its terminal name".
+    selective: [][]const u8,
+    /// Optional local alias: `use std.math as sm`.
     alias: ?[]const u8,
     span: Span,
 };
@@ -1193,6 +1389,16 @@ pub const TopLevel = union(enum) {
     capability_def: CapabilityDef,
     /// `global invariant Name:` — cross-contract invariant (Novel Idea 5).
     global_invariant: GlobalInvariantDef,
+    /// Top-level `pure` function (library-style helper, no contract).
+    free_pure: PureDecl,
+    /// Top-level `view` function (no contract).
+    free_view: ViewDecl,
+    /// Top-level `action` (free function with side-effect semantics).
+    free_action: ActionDecl,
+    /// Top-level `helper` (free helper function).
+    free_helper: HelperDecl,
+    /// Top-level `error Name(...)` shared across contracts.
+    free_error: ErrorDecl,
 };
 
 // ── User-defined type definitions ────────────────────────────────────────────
@@ -1236,9 +1442,11 @@ pub const EnumVariant = struct {
     span: Span,
 };
 
-/// `alias NewName = ExistingType`.
+/// `alias NewName[T1, T2] = ExistingType` — supports generic parameters.
 pub const TypeAliasDef = struct {
     name: []const u8,
+    /// Generic type parameters of the alias.  Empty for non-generic aliases.
+    type_params: []TypeParam,
     type_: TypeExpr,
     span: Span,
 };

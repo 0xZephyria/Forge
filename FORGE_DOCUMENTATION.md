@@ -191,7 +191,15 @@ Every expression carries both its `ExprKind` and its `Span`.
 | `asset_wrap { asset_type, value }` | Wrap native currency into asset |
 | `asset_unwrap { asset_type, token }` | Unwrap typed asset to native |
 
-Binary operators (`BinOp`): `plus, minus, times, divided_by, mod, equals, not_equals, less, less_eq, greater, greater_eq, and_, or_, has, duration_add, duration_sub`
+Binary operators (`BinOp`): `plus, minus, times, divided_by, mod, equals, not_equals, less, less_eq, greater, greater_eq, and_, or_, has, duration_add, duration_sub, bit_and, bit_or, bit_xor, shl, shr, power`
+
+Unary operators (`UnaryOp`): `not_, negate, bit_not`
+
+> **New in this build.** Bitwise operators (`bitand`, `bitor`, `bitxor`, `shl`, `shr`, `bitnot`) and exponentiation (`power`) are now full first-class operators, lowered through MIR to native EVM (`AND`/`OR`/`XOR`/`SHL`/`SHR`/`NOT`/`EXP`) and RISC-V instructions. The multiplication word `times` is also accepted as a synonym for `*`. See §4 "Operators" for precedence and usage.
+
+Additional `ExprKind` variants now produced by the parser: `struct_lit`, `struct_update` (spread), `list_lit`, `map_lit`, `set_lit`, `hex_bytes_lit`, `unit_lit`, `lambda`, `fn_ref`, `payable_cast`, `low_call`, `abi_op`, `create_expr`.
+
+Additional `StmtKind` variants now wired end-to-end: `let_tuple` (tuple destructuring), `guard_apply` (guard invocation), `placeholder` (modifier body marker).
 
 #### Section 4 — Patterns (`Pattern`)
 
@@ -646,7 +654,7 @@ Recursive JSON value appender. Dispatches on Zig type at comptime.
 ### 3.10 `errors.zig`
 **659 lines** · Diagnostic infrastructure.
 
-**`CompileError`** — A Zig error set covering all 38 distinct compile-time error conditions, from `UnexpectedCharacter` (E0000) through `AttackSucceeded` (E0034) to `InternalError` (E0037).
+**`CompileError`** — A Zig error set covering all distinct compile-time error conditions, from `UnexpectedCharacter` (E0000) through the semantic and asset errors to backend errors including `ConstructNotEmittedOnTarget` (E0042), `NonExhaustiveMatch` (E0043), and `TooManyIndexedFields` (E0044), ending at `InternalError`.
 
 **`Diagnostic { file, line, col, len, kind, message, source_line }`** — A single error record. `source_line` carries the raw source line text for caret display.
 
@@ -883,7 +891,246 @@ action expensive_op(): …
 
 ---
 
-## 5. Novel Ideas — What Makes Forge Different
+### Operators (Arithmetic, Bitwise, Exponentiation, Comparison, Logic)
+
+Forge expressions use English-word operators alongside symbolic ones. Precedence, from loosest to tightest binding:
+
+1. `or` (logical)
+2. `and` (logical)
+3. `bitor`
+4. `bitxor`
+5. `bitand`
+6. `shl`, `shr` (shifts)
+7. comparison: `equals` / `is` / `is not`, `<`, `<=`, `>`, `>=`
+8. `plus`, `minus`
+9. `times` (or `*`), `divided by` (or `/`), `mod`
+10. `power` (exponentiation, right-associative)
+11. unary prefix: `not`, `negate` / `-`, `bitnot`
+12. postfix: `.field`, `[index]`, `(call)`
+
+```forge
+// Arithmetic
+let a = base times height divided by 2      // `times` == `*`
+let b = principal power periods              // exponentiation (EVM EXP)
+
+// Bitwise — permission bitmaps, packed flags, hashing helpers
+let flags2   = flags bitor  (1 shl pos)      // set bit at `pos`
+let cleared  = flags bitand bitnot (1 shl p) // clear bit
+let toggled  = flags bitxor (1 shl pos)      // toggle bit
+let bit      = (flags shr pos) bitand 1      // read bit
+let mask     = (1 shl n) minus 1             // low-n-bit mask
+```
+
+Bitwise operators require integer operands and yield the left operand's integer type. All arithmetic remains overflow-checked (reverts with the Solidity panic code on the EVM target).
+
+---
+
+### Structs — Declaration, Construction, Storage
+
+Structs group related fields. They can be constructed with a literal, stored in state (including inside mappings), and read/written field-by-field.
+
+```forge
+struct Order:
+    id is u256
+    buyer is Account
+    filled is bool
+
+contract Market:
+    has:
+        orders is Map[u256 -> Order]     // struct-valued mapping
+        next_id is u256
+
+    setup():
+        next_id = 0
+
+    action place(buyer is Account):
+        let oid = next_id
+        next_id = next_id plus 1
+        // Struct literal — each field written to its own storage slot offset.
+        orders[oid] = Order { id = oid, buyer = buyer, filled = no }
+
+    action fill(oid is u256):
+        orders[oid].filled = yes          // single struct-field write
+
+    view buyer_of(oid is u256) gives Account:
+        give back orders[oid].buyer        // struct-field read
+```
+
+Struct spread / partial update:
+
+```forge
+let updated = Order { ..existing, filled = yes }
+```
+
+Storage layout follows Solidity conventions: struct field `i` lives at `base_slot + i`, and each field read/write derives its slot through the general slot-path model.
+
+---
+
+### Mappings — Simple and Nested
+
+```forge
+has:
+    balances   is Map[Account -> u256]
+    allowances is Map[Account -> Map[Account -> u256]]   // nested (ERC-20 shape)
+
+action approve(spender is Account, amount is u256):
+    allowances[caller][spender] = amount                  // nested write
+
+view allowance(owner is Account, spender is Account) gives u256:
+    give back allowances[owner][spender]                  // nested read
+```
+
+Nested mapping slots derive via chained `keccak256(key ++ base_slot)`, matching Solidity storage layout exactly, so on-chain state is readable by standard indexers.
+
+---
+
+### Guards as Modifiers
+
+A `guard` is a reusable precondition block. Declare it in the contract, then invoke it inside an action with `guard name(args)`; the guard body is inlined before the rest of the action runs — the Solidity `modifier` pattern.
+
+```forge
+contract Vault:
+    has:
+        owner is Account
+        locked is bool
+        balances is Map[Account -> u256]
+
+    setup(o is Account):
+        owner = o
+        locked = no
+
+    guard only_owner():
+        need caller equals owner else "not owner"
+
+    guard not_locked():
+        need locked equals no else "contract locked"
+
+    guard has_balance(acc is Account, amount is u256):
+        need balances[acc] >= amount else "insufficient balance"
+
+    action lock():
+        guard only_owner()
+        locked = yes
+
+    action withdraw(amount is u256):
+        guard not_locked()
+        guard has_balance(caller, amount)
+        balances[caller] = balances[caller] minus amount
+        pay caller amount
+```
+
+---
+
+### First-Class Function Values
+
+Functions can be captured as values via `fn_ref`, written inline as lambdas, and called through a variable. The function type is `Fn[A, B -> R]`.
+
+```forge
+pure double(x is u256) gives u256:
+    give back x times 2
+
+action apply_named(x is u256):
+    let f = fn_ref double          // reference to a named pure
+    total = total plus f(x)        // call through the value
+
+action apply_inline(x is u256):
+    let triple = fn (y is u256) gives u256: y times 3   // lambda
+    total = total plus triple(x)
+```
+
+Lambdas are lifted to synthesised top-level pures at lowering time.
+
+---
+
+### Tuple Destructuring & Multiple Returns
+
+```forge
+// Destructure a tuple-producing expression; `_` discards a slot.
+let (success, ret) = target.call(0, data)
+need success else "call failed"
+```
+
+---
+
+### Low-Level Calls, Contract Creation, ABI & Payable
+
+These are **contextual builtins** — recognised only in expression position, so `call`, `create`, `staticcall`, `delegatecall`, `create2` remain usable as ordinary action/variable names.
+
+```forge
+// Low-level external calls → (success: bool, ret: Bytes)
+let (ok1, data1) = target.call(value, calldata)
+let (ok2, data2) = target.staticcall(calldata)
+let (ok3, data3) = target.delegatecall(calldata)
+
+// Contract creation
+let addr  = create(value, init_code)
+let addr2 = create2(value, salt, init_code)
+
+// ABI helpers
+let blob   = abi.encode(a, b, c)
+let packed = abi.encode_packed(a, b)
+let sel    = abi.encode_with_selector(selector, a, b)
+let value  = abi.decode(blob, u256)
+
+// Payable address cast
+pay payable(recipient) amount
+```
+
+---
+
+### Literals — Hex Bytes, Ether Units, Collections
+
+```forge
+let sig  = hex"deadbeef"          // raw byte literal
+let fee  = 1 ether                // 10^18 wei
+let tip  = 5 gwei                 // 10^9 wei
+let dust = 100 wei                // atomic unit
+
+let nums  = [1, 2, 3]             // list literal
+let table = { "a" => 1, "b" => 2 } // map literal
+let uniq  = set { 1, 2, 3 }       // set literal
+```
+
+---
+
+### Enums, Exhaustive Match & Casts
+
+```forge
+enum Status:
+    Pending
+    Shipped
+    Delivered
+
+action advance(s is Status):
+    match s:                       // must cover all variants or use `_`
+        Status.Pending   => …
+        Status.Shipped   => …
+        Status.Delivered => …
+```
+
+A `match` over an enum that omits a variant without a wildcard `_` arm is a **compile-time error** (`NonExhaustiveMatch`).
+
+---
+
+### Events — Indexed Field Limit
+
+Events follow Solidity LOG encoding. At most **three** fields may be `indexed` (topic slots); exceeding this is a compile-time error (`TooManyIndexedFields`).
+
+```forge
+event Transfer(from is Account indexed, to is Account indexed, amount is u256)
+```
+
+---
+
+### Selective Module Imports
+
+```forge
+use std.math.{ sqrt, pow }        // import only the named exports
+use std.math.* as M               // import all under an alias
+```
+
+---
+
 
 These six features are not present in any other smart contract language. They are implemented in the checker (`checker.zig`) and type system (`types.zig`), and are first-class — not bolt-on.
 
@@ -1123,7 +1370,22 @@ All five access isolation rules: enforced. Authority reference validation: enfor
 Action/view/pure/setup/fallback/receive/upgrade handler generation: working. Gas metering (dedicated `a5` register): working. ZephBin v1 binary format output: working. Access list encoding: working. Register allocator: working. Fixup patch system for forward references: working.
 
 **EVM Codegen — Core (`codegen_evm.zig`)**  
-ABI dispatch table: working. Storage slot map: working. Action body emission for arithmetic, storage read/write, calldata load, events: working. Function selector computation: working.
+ABI dispatch table: working. Storage slot map: working. Action body emission for arithmetic, storage read/write, calldata load, events: working. Function selector computation: working. Bitwise ops + exponentiation (`AND`/`OR`/`XOR`/`SHL`/`SHR`/`NOT`/`EXP`): working. Nested-mapping and struct-field storage via the general slot-path model (`slot_field`/`slot_map`/`slot_offset`/`storage_load`/`storage_store`): working. Struct literals written field-by-field to storage: working.
+
+**Language surface additions (this build)**  
+The following are wired end-to-end (lexer → parser → AST → types → checker → MIR → EVM):
+- Bitwise operators `bitand`, `bitor`, `bitxor`, `shl`, `shr`, `bitnot`; exponentiation `power`; `times` as a `*` synonym.
+- Struct literals `T { f = v }` and spread `T { ..base, f = v }`; struct storage (whole-struct writes, per-field read/write, field increments).
+- Nested mappings `m[a][b]` with Solidity-compatible chained-keccak slot derivation.
+- Guard invocation `guard name(args)` (modifier-style inline preconditions).
+- First-class function values: `fn_ref`, lambdas, `Fn[A -> R]` type, call-through-variable typing.
+- Tuple destructuring `let (a, b) = expr`.
+- Contextual builtins (`create`, `create2`, `call`, `staticcall`, `delegatecall`) that no longer reserve those identifiers.
+- Enum match exhaustiveness (`NonExhaustiveMatch`) and indexed-event limit (`TooManyIndexedFields`) enforcement.
+- `--target evm` now correctly selects the EVM pipeline.
+
+> **Zephyria/RISC-V note.** Nested-mapping / computed-slot storage and `power` are EVM-complete; on the Zephyria target these emit an explicit `ConstructNotEmittedOnTarget` diagnostic (rather than silently-wrong bytecode) pending the keccak-syscall slot path.
+
 
 **PolkaVM Codegen (`codegen_polkavm.zig`)**  
 Basic WASM module structure, type section, import section, dispatch function, action stubs: working.

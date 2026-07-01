@@ -441,6 +441,9 @@ pub fn evmAbiType(ty: ResolvedType) []const u8 {
         .capability => "bytes",
         .proof => "bytes",
         .void_ => "",
+        .type_param => "bytes",
+        .function => "bytes",
+        .payable_addr => "address",
     };
 }
 
@@ -970,6 +973,40 @@ pub const EVMCodeGen = struct {
     ) anyerror!void {
         switch (instr.op) {
 
+            // ── Stubs for new MIR opcodes; backend lowering pending ────────
+            // TODO codegen: tuple_destructure
+            .tuple_destructure => {},
+            // TODO codegen: fn_ref
+            .fn_ref => {},
+            // TODO codegen: fn_call
+            .fn_call => {},
+            // TODO codegen: type_inst
+            .type_inst => {},
+            // TODO codegen: list_new
+            .list_new => {},
+            // TODO codegen: list_set
+            .list_set => {},
+            // TODO codegen: map_new
+            .map_new => {},
+            // TODO codegen: map_set
+            .map_set => {},
+            // TODO codegen: set_new
+            .set_new => {},
+            // TODO codegen: set_insert
+            .set_insert => {},
+            // TODO codegen: abi_encode
+            .abi_encode => {},
+            // TODO codegen: abi_encode_packed
+            .abi_encode_packed => {},
+            // TODO codegen: abi_decode
+            .abi_decode => {},
+            // TODO codegen: abi_encode_selector
+            .abi_encode_selector => {},
+            // TODO codegen: low_call
+            .low_call => {},
+            // TODO codegen: create_contract
+            .create_contract => {},
+
             // ── Constants ─────────────────────────────────────────────────
             .const_i256 => |c| {
                 try w.pushU256BE(c.bytes);
@@ -1311,6 +1348,77 @@ pub const EVMCodeGen = struct {
                 try w.op(.MSTORE);
             },
 
+            // ── Bitwise ────────────────────────────────────────────────────
+            // SPEC: Part 2.2 — Single-opcode 256-bit lowerings; no overflow
+            // checks (bitwise ops cannot overflow). For shifts the EVM
+            // convention is `SHL/SHR(shift, value) → result`, so we push value
+            // first then the shift count, matching EVM stack-arg order.
+            .bit_and => |a| {
+                try w.pushU32(rctx.memOf(a.lhs));
+                try w.op(.MLOAD);
+                try w.pushU32(rctx.memOf(a.rhs));
+                try w.op(.MLOAD);
+                try w.op(.AND);
+                try w.pushU32(rctx.memOf(a.dst));
+                try w.op(.MSTORE);
+            },
+            .bit_or => |a| {
+                try w.pushU32(rctx.memOf(a.lhs));
+                try w.op(.MLOAD);
+                try w.pushU32(rctx.memOf(a.rhs));
+                try w.op(.MLOAD);
+                try w.op(.OR);
+                try w.pushU32(rctx.memOf(a.dst));
+                try w.op(.MSTORE);
+            },
+            .bit_xor => |a| {
+                try w.pushU32(rctx.memOf(a.lhs));
+                try w.op(.MLOAD);
+                try w.pushU32(rctx.memOf(a.rhs));
+                try w.op(.MLOAD);
+                try w.op(.XOR);
+                try w.pushU32(rctx.memOf(a.dst));
+                try w.op(.MSTORE);
+            },
+            .shl => |a| {
+                // EVM SHL takes (shift, value) on the stack with shift on top.
+                // Push value first, then shift, so when SHL pops it sees shift
+                // on top and value below.
+                try w.pushU32(rctx.memOf(a.lhs));
+                try w.op(.MLOAD); // [value]
+                try w.pushU32(rctx.memOf(a.rhs));
+                try w.op(.MLOAD); // [value, shift]
+                try w.op(.SHL);   // [value << shift]
+                try w.pushU32(rctx.memOf(a.dst));
+                try w.op(.MSTORE);
+            },
+            .shr => |a| {
+                try w.pushU32(rctx.memOf(a.lhs));
+                try w.op(.MLOAD); // [value]
+                try w.pushU32(rctx.memOf(a.rhs));
+                try w.op(.MLOAD); // [value, shift]
+                try w.op(.SHR);   // [value >> shift]
+                try w.pushU32(rctx.memOf(a.dst));
+                try w.op(.MSTORE);
+            },
+            .bit_not => |u| {
+                try w.pushU32(rctx.memOf(u.operand));
+                try w.op(.MLOAD);
+                try w.op(.NOT);
+                try w.pushU32(rctx.memOf(u.dst));
+                try w.op(.MSTORE);
+            },
+            .exp => |a| {
+                // EVM EXP takes (base, exponent) where exponent is on top.
+                try w.pushU32(rctx.memOf(a.lhs));
+                try w.op(.MLOAD); // [base]
+                try w.pushU32(rctx.memOf(a.rhs));
+                try w.op(.MLOAD); // [base, exponent]
+                try w.op(.EXP);   // [base ** exponent]
+                try w.pushU32(rctx.memOf(a.dst));
+                try w.op(.MSTORE);
+            },
+
             // ── Move ──────────────────────────────────────────────────────
             .mov => |m| {
                 try w.pushU32(rctx.memOf(m.src));
@@ -1452,6 +1560,53 @@ pub const EVMCodeGen = struct {
                 try w.push1(0x40);
                 try w.push0();
                 try w.op(.KECCAK256);
+                try w.op(.SSTORE);
+            },
+
+            // ── General storage slot computation ───────────────────────────
+            .slot_field => |sf| {
+                // Base slot = field_id, stored as a value in dst.
+                try w.pushU64(@intCast(sf.field_id));
+                try w.pushU32(rctx.memOf(sf.dst));
+                try w.op(.MSTORE);
+            },
+            .slot_map => |sm| {
+                // dst = keccak256(pad32(key) ++ pad32(base_slot)).
+                try w.pushU32(rctx.memOf(sm.key));
+                try w.op(.MLOAD);
+                try w.push1(0x00);
+                try w.op(.MSTORE);
+                try w.pushU32(rctx.memOf(sm.base_slot));
+                try w.op(.MLOAD);
+                try w.push1(0x20);
+                try w.op(.MSTORE);
+                try w.push1(0x40);
+                try w.push0();
+                try w.op(.KECCAK256);
+                try w.pushU32(rctx.memOf(sm.dst));
+                try w.op(.MSTORE);
+            },
+            .slot_offset => |so| {
+                // dst = base_slot + offset.
+                try w.pushU32(rctx.memOf(so.base_slot));
+                try w.op(.MLOAD);
+                try w.pushU32(so.offset);
+                try w.op(.ADD);
+                try w.pushU32(rctx.memOf(so.dst));
+                try w.op(.MSTORE);
+            },
+            .storage_load => |sl| {
+                try w.pushU32(rctx.memOf(sl.slot));
+                try w.op(.MLOAD);
+                try w.op(.SLOAD);
+                try w.pushU32(rctx.memOf(sl.dst));
+                try w.op(.MSTORE);
+            },
+            .storage_store => |ss| {
+                try w.pushU32(rctx.memOf(ss.value));
+                try w.op(.MLOAD);
+                try w.pushU32(rctx.memOf(ss.slot));
+                try w.op(.MLOAD);
                 try w.op(.SSTORE);
             },
 

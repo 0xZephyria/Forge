@@ -356,6 +356,12 @@ pub const Parser = struct {
             .kw_record => .{ .record_def = try self.parseRecordDef() },
             .kw_enum => .{ .enum_def = try self.parseEnumDef() },
             .kw_alias => .{ .type_alias = try self.parseTypeAlias() },
+            // Free top-level functions and errors (Solidity-parity flexibility).
+            .kw_pure => .{ .free_pure = try self.parsePure(self.peek().span.col - 1) },
+            .kw_view => .{ .free_view = try self.parseView(self.peek().span.col - 1) },
+            .kw_action => .{ .free_action = try self.parseAction(self.peek().span.col - 1) },
+            .kw_helper => .{ .free_helper = try self.parseHelper(self.peek().span.col - 1) },
+            .kw_error => .{ .free_error = try self.parseError_() },
             .kw_global => blk: {
                 const start_col = self.peek().span.col;
                 _ = self.advance();
@@ -391,12 +397,25 @@ pub const Parser = struct {
         _ = try self.expect(.kw_use);
         var path: std.ArrayListUnmanaged([]const u8) = .{};
         errdefer path.deinit(self.allocator);
+        var selective: std.ArrayListUnmanaged([]const u8) = .{};
+        errdefer selective.deinit(self.allocator);
 
         // Expect at least one identifier, then dot-separated names.
         const first = try self.expect(.identifier);
         try path.append(self.allocator, first.text);
         while (self.check(.dot)) {
             _ = self.advance();
+            // `use std.math.{sqrt, pow}` — selective imports.
+            if (self.check(.lbrace)) {
+                _ = self.advance();
+                while (!self.check(.rbrace) and self.peekKind() != .eof) {
+                    const sel = try self.expect(.identifier);
+                    try selective.append(self.allocator, sel.text);
+                    _ = self.matchAny(&.{.comma});
+                }
+                _ = try self.expect(.rbrace);
+                break;
+            }
             const seg = try self.expect(.identifier);
             try path.append(self.allocator, seg.text);
         }
@@ -408,6 +427,7 @@ pub const Parser = struct {
         }
         return .{ .use_import = .{
             .path = try path.toOwnedSlice(self.allocator),
+            .selective = try selective.toOwnedSlice(self.allocator),
             .alias = alias,
             .span = start_span,
         } };
@@ -539,9 +559,19 @@ pub const Parser = struct {
         const start = self.peek().span;
         _ = try self.expect(.kw_alias);
         const name = (try self.expect(.identifier)).text;
+        // Optional generic params: `alias List[T] = ...`
+        var tparams: std.ArrayListUnmanaged(TypeParam) = .{};
+        if (self.check(.lbracket)) {
+            tparams = try self.parseTypeParams();
+        }
         _ = try self.expect(.equals_sign);
         const ty = try self.parseType();
-        return .{ .name = name, .type_ = ty, .span = start };
+        return .{
+            .name = name,
+            .type_params = try tparams.toOwnedSlice(self.allocator),
+            .type_ = ty,
+            .span = start,
+        };
     }
 
     // ── asset Name { ... } ─────────────────────────────────────────────
@@ -550,6 +580,10 @@ pub const Parser = struct {
         const start = self.peek().span;
         _ = try self.expect(.kw_asset);
         const name = (try self.expect(.identifier)).text;
+        var tparams: std.ArrayListUnmanaged(TypeParam) = .{};
+        if (self.check(.lbracket)) {
+            tparams = try self.parseTypeParams();
+        }
         _ = try self.expect(.colon);
         const parent_indent = start.col - 1;
         const block_indent = try self.expectIndentIncrease(parent_indent);
@@ -609,6 +643,7 @@ pub const Parser = struct {
 
         return .{
             .name = name,
+            .type_params = try tparams.toOwnedSlice(self.allocator),
             .display_name = display_name,
             .symbol = symbol,
             .decimals = decimals,
@@ -797,6 +832,32 @@ pub const Parser = struct {
             self.skipTrivia();
             if (self.isBlockEnd(block_indent)) break;
 
+            // Solidity-style: `public action foo(...)`. Pre-consume the
+            // visibility keyword (if any) and remember it for the next decl.
+            var pending_vis: ?Visibility = null;
+            if (self.isVisibilityToken()) {
+                const vk = self.peekKind();
+                // Visibility before `action`/`view`/`pure`/`helper` only.
+                const next_is_fn = switch (vk) {
+                    .kw_public, .kw_internal, .kw_private, .kw_external,
+                    .kw_shared, .kw_within, .kw_hidden, .kw_outside, .kw_system => true,
+                    else => false,
+                };
+                if (next_is_fn) {
+                    // Look one ahead — only consume if a fn keyword follows.
+                    const save_pos = self.pos;
+                    const vis = self.parseVisibility();
+                    self.skipTrivia();
+                    const k = self.peekKind();
+                    if (k == .kw_action or k == .kw_view or k == .kw_pure or k == .kw_helper) {
+                        pending_vis = vis;
+                    } else {
+                        // Rewind — not a function-prefixing visibility.
+                        self.pos = save_pos;
+                    }
+                }
+            }
+
             switch (self.peekKind()) {
                 .kw_accounts => {
                     const accs = try self.parseAccountsBlock(block_indent);
@@ -830,19 +891,23 @@ pub const Parser = struct {
                     try guards.append(self.allocator, gd);
                 },
                 .hash_sym, .kw_action => {
-                    const ad = try self.parseAction(block_indent);
+                    var ad = try self.parseAction(block_indent);
+                    if (pending_vis) |v| ad.visibility = v;
                     try actions.append(self.allocator, ad);
                 },
                 .kw_view => {
-                    const vd = try self.parseView(block_indent);
+                    var vd = try self.parseView(block_indent);
+                    if (pending_vis) |v| vd.visibility = v;
                     try views.append(self.allocator, vd);
                 },
                 .kw_pure => {
-                    const pd = try self.parsePure(block_indent);
+                    var pd = try self.parsePure(block_indent);
+                    if (pending_vis) |v| pd.visibility = v;
                     try pures.append(self.allocator, pd);
                 },
                 .kw_helper => {
-                    const hd = try self.parseHelper(block_indent);
+                    var hd = try self.parseHelper(block_indent);
+                    if (pending_vis) |v| hd.visibility = v;
                     try helpers.append(self.allocator, hd);
                 },
                 .kw_event => {
@@ -1323,11 +1388,22 @@ pub const Parser = struct {
                 ns = (try self.expect(.identifier)).text;
                 _ = try self.expect(.colon);
             }
+            // Optional visibility prefix on state fields (auto-getter hint).
+            var visibility: Visibility = .internal;
+            if (self.isVisibilityToken()) {
+                visibility = self.parseVisibility();
+            }
             const span = self.peek().span;
             const name = (try self.expect(.identifier)).text;
             _ = try self.expect(.kw_is);
             const ty = try self.parseType();
-            try list.append(self.allocator, .{ .name = name, .type_ = ty, .namespace = ns, .span = span });
+            try list.append(self.allocator, .{
+                .name = name,
+                .type_ = ty,
+                .namespace = ns,
+                .visibility = visibility,
+                .span = span,
+            });
         }
         return list.toOwnedSlice(self.allocator);
     }
@@ -1486,6 +1562,15 @@ pub const Parser = struct {
         };
     }
 
+    /// Look at the next non-trivia token without consuming.
+    fn peekKindSkipTrivia(self: *Parser) TokenKind {
+        const save = self.pos;
+        self.skipTrivia();
+        const k = self.peekKind();
+        self.pos = save;
+        return k;
+    }
+
     fn parseAction(self: *Parser, parent_indent: u32) anyerror!ActionDecl {
         var anns: std.ArrayListUnmanaged(Annotation) = .{};
         while (self.check(.hash_sym)) {
@@ -1494,12 +1579,11 @@ pub const Parser = struct {
         const span = self.peek().span;
         _ = try self.expect(.kw_action);
         var vis = Visibility.shared;
-        if (self.check(.kw_shared) or self.check(.kw_within) or self.check(.kw_hidden) or
-            self.check(.kw_outside) or self.check(.kw_system))
-        {
+        if (self.isVisibilityToken()) {
             vis = self.parseVisibility();
         }
         const name = (try self.expect(.identifier)).text;
+        const tparams = try self.parseOptionalTypeParams();
         const params = try self.parseParamList();
         var ret: ?TypeExpr = null;
         if (self.check(.kw_gives)) {
@@ -1539,7 +1623,7 @@ pub const Parser = struct {
         return .{
             .name = name,
             .visibility = vis,
-            .type_params = &.{},
+            .type_params = tparams,
             .params = params,
             .return_type = ret,
             .annotations = try anns.toOwnedSlice(self.allocator),
@@ -1554,10 +1638,11 @@ pub const Parser = struct {
         const span = self.peek().span;
         _ = try self.expect(.kw_view);
         var vis = Visibility.shared;
-        if (self.check(.kw_shared) or self.check(.kw_within) or self.check(.kw_hidden)) {
+        if (self.isVisibilityToken()) {
             vis = self.parseVisibility();
         }
         const name = (try self.expect(.identifier)).text;
+        const tparams = try self.parseOptionalTypeParams();
         const params = try self.parseParamList();
         var ret: ?TypeExpr = null;
         if (self.check(.kw_gives)) {
@@ -1570,7 +1655,7 @@ pub const Parser = struct {
         return .{
             .name = name,
             .visibility = vis,
-            .type_params = &.{},
+            .type_params = tparams,
             .params = params,
             .return_type = ret,
             .accounts = &.{},
@@ -1582,7 +1667,10 @@ pub const Parser = struct {
     fn parsePure(self: *Parser, parent_indent: u32) anyerror!PureDecl {
         const span = self.peek().span;
         _ = try self.expect(.kw_pure);
+        var vis = Visibility.internal;
+        if (self.isVisibilityToken()) vis = self.parseVisibility();
         const name = (try self.expect(.identifier)).text;
+        const tparams = try self.parseOptionalTypeParams();
         const params = try self.parseParamList();
         var ret: ?TypeExpr = null;
         if (self.check(.kw_gives)) {
@@ -1592,13 +1680,24 @@ pub const Parser = struct {
         _ = try self.expect(.colon);
         const block_indent = try self.expectIndentIncrease(parent_indent);
         const body = try self.parseBlock(block_indent);
-        return .{ .name = name, .type_params = &.{}, .params = params, .return_type = ret, .body = body, .span = span };
+        return .{
+            .name = name,
+            .visibility = vis,
+            .type_params = tparams,
+            .params = params,
+            .return_type = ret,
+            .body = body,
+            .span = span,
+        };
     }
 
     fn parseHelper(self: *Parser, parent_indent: u32) anyerror!HelperDecl {
         const span = self.peek().span;
         _ = try self.expect(.kw_helper);
+        var vis = Visibility.internal;
+        if (self.isVisibilityToken()) vis = self.parseVisibility();
         const name = (try self.expect(.identifier)).text;
+        const tparams = try self.parseOptionalTypeParams();
         const params = try self.parseParamList();
         var ret: ?TypeExpr = null;
         if (self.check(.kw_gives)) {
@@ -1608,7 +1707,62 @@ pub const Parser = struct {
         _ = try self.expect(.colon);
         const block_indent = try self.expectIndentIncrease(parent_indent);
         const body = try self.parseBlock(block_indent);
-        return .{ .name = name, .params = params, .return_type = ret, .body = body, .span = span };
+        return .{
+            .name = name,
+            .visibility = vis,
+            .type_params = tparams,
+            .params = params,
+            .return_type = ret,
+            .body = body,
+            .span = span,
+        };
+    }
+
+    /// Parse an optional generic type-parameter list right after a function or
+    /// type name: `name[T, U: Bound]`. Returns `&.{}` if absent.
+    fn parseOptionalTypeParams(self: *Parser) anyerror![]TypeParam {
+        // Generic type-parameter list is `[T, U: Bound]` immediately after
+        // the name. Don't consume `[` unless we can tell it's a type-param
+        // list (next token after `[` is an identifier followed by `,`, `]`,
+        // `:`, or `kw_where`).
+        if (!self.check(.lbracket)) return &.{};
+        const save = self.pos;
+        _ = self.advance(); // [
+        if (!self.check(.identifier)) {
+            self.pos = save;
+            return &.{};
+        }
+        // Peek one further: must be `,`, `]`, `:`, or `where`.
+        const look_save = self.pos;
+        _ = self.advance();
+        const k = self.peekKind();
+        self.pos = look_save;
+        const looks_like_tparams = (k == .comma or k == .rbracket or k == .colon or k == .kw_where);
+        if (!looks_like_tparams) {
+            self.pos = save;
+            return &.{};
+        }
+
+        var list: std.ArrayListUnmanaged(TypeParam) = .{};
+        while (!self.check(.rbracket) and self.peekKind() != .eof) {
+            const tname = (try self.expect(.identifier)).text;
+            var constraint: ?[]const u8 = null;
+            if (self.check(.colon)) {
+                _ = self.advance();
+                constraint = (try self.expect(.identifier)).text;
+            } else if (self.check(.kw_where)) {
+                _ = self.advance();
+                _ = self.matchAny(&.{.identifier}); // bound var name, often the type itself
+                if (self.check(.kw_follows)) {
+                    _ = self.advance();
+                    constraint = (try self.expect(.identifier)).text;
+                }
+            }
+            try list.append(self.allocator, .{ .name = tname, .constraint = constraint });
+            if (!self.matchAny(&.{.comma})) break;
+        }
+        _ = try self.expect(.rbracket);
+        return try list.toOwnedSlice(self.allocator);
     }
 
     fn parseVisibility(self: *Parser) Visibility {
@@ -1618,7 +1772,20 @@ pub const Parser = struct {
             .kw_hidden => .hidden,
             .kw_outside => .outside,
             .kw_system => .system,
+            .kw_public => .public,
+            .kw_internal => .internal,
+            .kw_private => .private,
+            .kw_external => .external,
             else => .shared,
+        };
+    }
+
+    /// Returns `true` if the current token is one of the visibility keywords.
+    fn isVisibilityToken(self: *Parser) bool {
+        return switch (self.peekKind()) {
+            .kw_shared, .kw_within, .kw_hidden, .kw_outside, .kw_system,
+            .kw_public, .kw_internal, .kw_private, .kw_external => true,
+            else => false,
         };
     }
 
@@ -1869,7 +2036,7 @@ pub const Parser = struct {
                         break :blk .conservation_violated;
                     },
                 };
-            } else if (self.check(.kw_call)) {
+            } else if (self.check(.identifier) and std.mem.eql(u8, self.peek().text, "call")) {
                 _ = self.advance();
                 const call_name = (try self.expect(.identifier)).text;
                 _ = try self.expect(.lparen);
@@ -1938,6 +2105,108 @@ pub const Parser = struct {
             const inner = try self.parseType();
             const ptr = try self.alloc(inner);
             return .{ .maybe = ptr };
+        }
+        // payable Type — payable address subtype.
+        if (self.check(.kw_payable)) {
+            _ = self.advance();
+            const inner = try self.parseType();
+            const ptr = try self.alloc(inner);
+            return .{ .payable = ptr };
+        }
+        // `(T1, T2, ...)` — tuple type sugar. A single `(T)` is treated as
+        // a parenthesised type expression for symmetry with expressions.
+        if (self.check(.lparen)) {
+            _ = self.advance();
+            var elems: std.ArrayListUnmanaged(*TypeExpr) = .{};
+            const first = try self.parseType();
+            const fp = try self.allocator.create(TypeExpr);
+            fp.* = first;
+            try elems.append(self.allocator, fp);
+            while (self.check(.comma)) {
+                _ = self.advance();
+                if (self.check(.rparen)) break;
+                const t = try self.parseType();
+                const tp = try self.allocator.create(TypeExpr);
+                tp.* = t;
+                try elems.append(self.allocator, tp);
+            }
+            _ = try self.expect(.rparen);
+            if (elems.items.len == 1) {
+                const only = elems.items[0].*;
+                self.allocator.destroy(elems.items[0]);
+                elems.deinit(self.allocator);
+                return only;
+            }
+            return .{ .tuple = try elems.toOwnedSlice(self.allocator) };
+        }
+        // fn (param-types) [-> ret-type] — function value type.
+        if (self.check(.kw_fn)) {
+            _ = self.advance();
+            _ = try self.expect(.lparen);
+            var params: std.ArrayListUnmanaged(*TypeExpr) = .{};
+            while (!self.check(.rparen) and self.peekKind() != .eof) {
+                const pt = try self.parseType();
+                const pp = try self.allocator.create(TypeExpr);
+                pp.* = pt;
+                try params.append(self.allocator, pp);
+                _ = self.matchAny(&.{.comma});
+            }
+            _ = try self.expect(.rparen);
+            var ret: ?*TypeExpr = null;
+            if (self.check(.arrow)) {
+                _ = self.advance();
+                const rt = try self.parseType();
+                const rp = try self.allocator.create(TypeExpr);
+                rp.* = rt;
+                ret = rp;
+            }
+            return .{ .function_type = .{
+                .params = try params.toOwnedSlice(self.allocator),
+                .return_ = ret,
+            } };
+        }
+        // `Fn[T1, T2 -> R]` — Solidity-style function type spelling.
+        if (self.check(.identifier) and std.mem.eql(u8, self.peek().text, "Fn")) {
+            _ = self.advance();
+            _ = try self.expect(.lbracket);
+            var params: std.ArrayListUnmanaged(*TypeExpr) = .{};
+            while (!self.check(.arrow) and !self.check(.rbracket) and self.peekKind() != .eof) {
+                const pt = try self.parseType();
+                const pp = try self.allocator.create(TypeExpr);
+                pp.* = pt;
+                try params.append(self.allocator, pp);
+                _ = self.matchAny(&.{.comma});
+            }
+            var ret: ?*TypeExpr = null;
+            if (self.check(.arrow)) {
+                _ = self.advance();
+                const rt = try self.parseType();
+                const rp = try self.allocator.create(TypeExpr);
+                rp.* = rt;
+                ret = rp;
+            }
+            _ = try self.expect(.rbracket);
+            return .{ .function_type = .{
+                .params = try params.toOwnedSlice(self.allocator),
+                .return_ = ret,
+            } };
+        }
+        // `Tuple[T1, T2, ...]` — explicit tuple type spelling.
+        if (self.check(.kw_tuple) or
+            (self.check(.identifier) and std.mem.eql(u8, self.peek().text, "Tuple")))
+        {
+            _ = self.advance();
+            _ = try self.expect(.lbracket);
+            var elems: std.ArrayListUnmanaged(*TypeExpr) = .{};
+            while (!self.check(.rbracket) and self.peekKind() != .eof) {
+                const pt = try self.parseType();
+                const pp = try self.allocator.create(TypeExpr);
+                pp.* = pt;
+                try elems.append(self.allocator, pp);
+                _ = self.matchAny(&.{.comma});
+            }
+            _ = try self.expect(.rbracket);
+            return .{ .tuple = try elems.toOwnedSlice(self.allocator) };
         }
         // Result[T, E]
         if (self.check(.kw_result_type)) {
@@ -2132,6 +2401,7 @@ pub const Parser = struct {
             },
             .kw_attempt => try self.parseAttempt(),
             .kw_only => try self.parseOnlyStmt(),
+            .kw_guard => try self.parseGuardApply(),
             .kw_remove => try self.parseRemove(),
             .kw_close => try self.parseClose(),
             .kw_freeze => try self.parseFreeze(),
@@ -2151,6 +2421,13 @@ pub const Parser = struct {
     fn parseLet(self: *Parser) anyerror!Stmt {
         const span = self.peek().span;
         _ = try self.expect(.kw_let);
+
+        // Tuple destructure form: `let (a, b, c) = expr` or
+        // `let (a is T1, b is T2) = expr`.
+        if (self.check(.lparen)) {
+            return try self.parseLetTuple(span);
+        }
+
         const name = (try self.expect(.identifier)).text;
         var declared_type: ?TypeExpr = null;
         if (self.check(.kw_is)) {
@@ -2164,6 +2441,35 @@ pub const Parser = struct {
             .declared_type = declared_type,
             .init = val,
             .mutable = true,
+            .span = span,
+        } }, .span = span };
+    }
+
+    fn parseLetTuple(self: *Parser, span: Span) anyerror!Stmt {
+        _ = try self.expect(.lparen);
+        var names: std.ArrayListUnmanaged([]const u8) = .{};
+        var types_list: std.ArrayListUnmanaged(TypeExpr) = .{};
+        var any_typed = false;
+        while (!self.check(.rparen) and self.peekKind() != .eof) {
+            const name = (try self.expect(.identifier)).text;
+            try names.append(self.allocator, name);
+            if (self.check(.kw_is)) {
+                _ = self.advance();
+                const ty = try self.parseType();
+                try types_list.append(self.allocator, ty);
+                any_typed = true;
+            }
+            if (!self.matchAny(&.{.comma})) break;
+        }
+        _ = try self.expect(.rparen);
+        _ = try self.expect(.equals_sign);
+        const init_expr = try self.parseExpr();
+        var declared: []TypeExpr = &[_]TypeExpr{};
+        if (any_typed) declared = try types_list.toOwnedSlice(self.allocator);
+        return .{ .kind = .{ .let_tuple = .{
+            .names = try names.toOwnedSlice(self.allocator),
+            .declared_types = declared,
+            .init = init_expr,
             .span = span,
         } }, .span = span };
     }
@@ -2270,7 +2576,9 @@ pub const Parser = struct {
     fn parseRepeat(self: *Parser) anyerror!Stmt {
         const span = self.peek().span;
         _ = try self.expect(.kw_repeat);
-        const count = try self.parseExpr();
+        // Parse the count at unary precedence so the trailing `times` keyword
+        // is not consumed as a multiplication operator.
+        const count = try self.parseUnary();
         _ = try self.expect(.kw_times);
         _ = try self.expect(.colon);
         const body_indent = try self.expectIndentIncrease(span.col - 1);
@@ -2422,6 +2730,29 @@ pub const Parser = struct {
         // but used as guard context — discard via underscore assignment.
         const only_body = try self.parseBlock(body_indent);
         return .{ .kind = .{ .only = .{ .requirement = req, .body = only_body, .span = span } }, .span = span };
+    }
+
+    /// `guard guardName(args...)` — invoke a named guard's precondition body
+    /// at this point in an action. Guards are inlined during MIR lowering.
+    fn parseGuardApply(self: *Parser) anyerror!Stmt {
+        const span = self.peek().span;
+        _ = try self.expect(.kw_guard);
+        const name = (try self.expect(.identifier)).text;
+        var args: std.ArrayListUnmanaged(Argument) = .{};
+        if (self.check(.lparen)) {
+            _ = self.advance();
+            while (!self.check(.rparen) and self.peekKind() != .eof) {
+                const val = try self.parseExpr();
+                try args.append(self.allocator, .{ .name = null, .value = val, .span = val.span });
+                _ = self.matchAny(&.{.comma});
+            }
+            _ = try self.expect(.rparen);
+        }
+        return .{ .kind = .{ .guard_apply = .{
+            .name = name,
+            .args = try args.toOwnedSlice(self.allocator),
+            .span = span,
+        } }, .span = span };
     }
 
     fn parseRemove(self: *Parser) anyerror!Stmt {
@@ -2585,11 +2916,69 @@ pub const Parser = struct {
     }
 
     fn parseAnd(self: *Parser) anyerror!*Expr {
-        var lhs = try self.parseComparison();
+        var lhs = try self.parseBitOr();
         while (self.check(.kw_and)) {
             const span = self.advance().span;
-            const rhs = try self.parseComparison();
+            const rhs = try self.parseBitOr();
             lhs = try self.makeExprNode(.{ .bin_op = .{ .op = .and_, .left = lhs, .right = rhs } }, span);
+        }
+        return lhs;
+    }
+
+    /// SPEC: Part 2.2 — Bitwise OR (`bitor`). Binds tighter than logical `or`,
+    /// looser than `bitxor`.
+    fn parseBitOr(self: *Parser) anyerror!*Expr {
+        var lhs = try self.parseBitXor();
+        while (self.check(.kw_bitor)) {
+            const span = self.advance().span;
+            const rhs = try self.parseBitXor();
+            lhs = try self.makeExprNode(.{ .bin_op = .{ .op = .bit_or, .left = lhs, .right = rhs } }, span);
+        }
+        return lhs;
+    }
+
+    /// SPEC: Part 2.2 — Bitwise XOR (`bitxor`).
+    fn parseBitXor(self: *Parser) anyerror!*Expr {
+        var lhs = try self.parseBitAnd();
+        while (self.check(.kw_bitxor)) {
+            const span = self.advance().span;
+            const rhs = try self.parseBitAnd();
+            lhs = try self.makeExprNode(.{ .bin_op = .{ .op = .bit_xor, .left = lhs, .right = rhs } }, span);
+        }
+        return lhs;
+    }
+
+    /// SPEC: Part 2.2 — Bitwise AND (`bitand`).
+    fn parseBitAnd(self: *Parser) anyerror!*Expr {
+        var lhs = try self.parseShift();
+        while (self.check(.kw_bitand)) {
+            const span = self.advance().span;
+            const rhs = try self.parseShift();
+            lhs = try self.makeExprNode(.{ .bin_op = .{ .op = .bit_and, .left = lhs, .right = rhs } }, span);
+        }
+        return lhs;
+    }
+
+    /// SPEC: Part 2.2 — Shifts (`shl`, `shr`). Bind tighter than the bitwise
+    /// ops but looser than comparison, mirroring C-family precedence.
+    fn parseShift(self: *Parser) anyerror!*Expr {
+        var lhs = try self.parseComparison();
+        while (true) {
+            const span = self.peek().span;
+            const op: ?BinOp = switch (self.peekKind()) {
+                .kw_shl => blk: {
+                    _ = self.advance();
+                    break :blk .shl;
+                },
+                .kw_shr => blk: {
+                    _ = self.advance();
+                    break :blk .shr;
+                },
+                else => null,
+            };
+            if (op == null) break;
+            const rhs = try self.parseComparison();
+            lhs = try self.makeExprNode(.{ .bin_op = .{ .op = op.?, .left = lhs, .right = rhs } }, span);
         }
         return lhs;
     }
@@ -2659,11 +3048,15 @@ pub const Parser = struct {
     }
 
     fn parseMulDiv(self: *Parser) anyerror!*Expr {
-        var lhs = try self.parseUnary();
+        var lhs = try self.parsePower();
         while (true) {
             const span = self.peek().span;
             const op: ?BinOp = switch (self.peekKind()) {
                 .kw_times_op => blk: {
+                    _ = self.advance();
+                    break :blk .times;
+                },
+                .kw_times => blk: {
                     _ = self.advance();
                     break :blk .times;
                 },
@@ -2683,10 +3076,23 @@ pub const Parser = struct {
                 else => null,
             };
             if (op == null) break;
-            const rhs = try self.parseUnary();
+            const rhs = try self.parsePower();
             lhs = try self.makeExprNode(.{ .bin_op = .{ .op = op.?, .left = lhs, .right = rhs } }, span);
         }
         return lhs;
+    }
+
+    /// SPEC: Part 2.2 — Exponentiation (`power`). Right-associative, binds
+    /// tighter than mul/div, looser than unary.
+    fn parsePower(self: *Parser) anyerror!*Expr {
+        var base = try self.parseUnary();
+        if (self.check(.kw_power)) {
+            const span = self.advance().span;
+            // Right-associative: recurse into parsePower.
+            const exp = try self.parsePower();
+            base = try self.makeExprNode(.{ .bin_op = .{ .op = .power, .left = base, .right = exp } }, span);
+        }
+        return base;
     }
 
     fn parseUnary(self: *Parser) anyerror!*Expr {
@@ -2700,6 +3106,11 @@ pub const Parser = struct {
             _ = self.advance();
             const operand = try self.parseUnary();
             return self.makeExprNode(.{ .unary_op = .{ .op = .negate, .operand = operand } }, span);
+        }
+        if (self.check(.kw_bitnot)) {
+            _ = self.advance();
+            const operand = try self.parseUnary();
+            return self.makeExprNode(.{ .unary_op = .{ .op = .bit_not, .operand = operand } }, span);
         }
         return self.parsePostfix();
     }
@@ -2735,10 +3146,49 @@ pub const Parser = struct {
                     _ = self.matchAny(&.{.comma});
                 }
                 _ = try self.expect(.rparen);
-                base = try self.makeExprNode(.{ .call = .{
-                    .callee = base,
-                    .args = try args.toOwnedSlice(self.allocator),
-                } }, span);
+                const args_owned = try args.toOwnedSlice(self.allocator);
+                // Detect low-level external call shapes:
+                //   `target.call(value, data)`         → low_call.call
+                //   `target.staticcall(data)`          → low_call.staticcall
+                //   `target.delegatecall(data)`        → low_call.delegatecall
+                var lowered = false;
+                if (base.kind == .field_access) {
+                    const fa = base.kind.field_access;
+                    if (std.mem.eql(u8, fa.field, "call") and args_owned.len == 2) {
+                        base = try self.makeExprNode(.{ .low_call = .{
+                            .target = fa.object,
+                            .kind = .call,
+                            .value = args_owned[0].value,
+                            .data = args_owned[1].value,
+                            .span = span,
+                        } }, span);
+                        lowered = true;
+                    } else if (std.mem.eql(u8, fa.field, "staticcall") and args_owned.len == 1) {
+                        base = try self.makeExprNode(.{ .low_call = .{
+                            .target = fa.object,
+                            .kind = .staticcall,
+                            .value = null,
+                            .data = args_owned[0].value,
+                            .span = span,
+                        } }, span);
+                        lowered = true;
+                    } else if (std.mem.eql(u8, fa.field, "delegatecall") and args_owned.len == 1) {
+                        base = try self.makeExprNode(.{ .low_call = .{
+                            .target = fa.object,
+                            .kind = .delegatecall,
+                            .value = null,
+                            .data = args_owned[0].value,
+                            .span = span,
+                        } }, span);
+                        lowered = true;
+                    }
+                }
+                if (!lowered) {
+                    base = try self.makeExprNode(.{ .call = .{
+                        .callee = base,
+                        .args = args_owned,
+                    } }, span);
+                }
             } else if (self.check(.question)) {
                 const span = self.advance().span;
                 base = try self.makeExprNode(.{ .try_propagate = base }, span);
@@ -2753,12 +3203,71 @@ pub const Parser = struct {
         return base;
     }
 
+    /// Parse a struct literal body starting at the `{`:
+    ///   `TypeName { field = value, ... }`
+    /// or a spread/partial-update form:
+    ///   `TypeName { ..base, field = value, ... }`
+    fn parseStructLiteral(self: *Parser, type_name: []const u8, span: Span) anyerror!*Expr {
+        _ = try self.expect(.lbrace);
+        var base: ?*Expr = null;
+        // Spread form: leading `..base`.
+        if (self.check(.dot_dot)) {
+            _ = self.advance();
+            base = try self.parseExpr();
+            _ = self.matchAny(&.{.comma});
+        }
+        var fields: std.ArrayListUnmanaged(FieldInit) = .{};
+        while (!self.check(.rbrace) and self.peekKind() != .eof) {
+            const fspan = self.peek().span;
+            const fname = (try self.expect(.identifier)).text;
+            _ = try self.expect(.equals_sign);
+            const fval = try self.parseExpr();
+            try fields.append(self.allocator, .{ .name = fname, .value = fval, .span = fspan });
+            if (!self.matchAny(&.{.comma})) break;
+        }
+        _ = try self.expect(.rbrace);
+        const owned_fields = try fields.toOwnedSlice(self.allocator);
+        if (base) |b| {
+            return self.makeExprNode(.{ .struct_update = .{
+                .type_name = type_name,
+                .base = b,
+                .fields = owned_fields,
+            } }, span);
+        }
+        return self.makeExprNode(.{ .struct_lit = .{
+            .type_name = type_name,
+            .fields = owned_fields,
+        } }, span);
+    }
+
     fn parsePrimary(self: *Parser) anyerror!*Expr {
         const tok = self.peek();
         const span = tok.span;
         switch (tok.kind) {
             .int_literal => {
                 _ = self.advance();
+                // Optional denomination suffix: `1 wei`, `5 gwei`, `100 ether`.
+                if (self.check(.kw_wei)) {
+                    _ = self.advance();
+                    return self.makeExprNode(.{ .unit_lit = .{
+                        .value = tok.text,
+                        .unit = .wei,
+                    } }, span);
+                }
+                if (self.check(.kw_gwei)) {
+                    _ = self.advance();
+                    return self.makeExprNode(.{ .unit_lit = .{
+                        .value = tok.text,
+                        .unit = .gwei,
+                    } }, span);
+                }
+                if (self.check(.kw_ether)) {
+                    _ = self.advance();
+                    return self.makeExprNode(.{ .unit_lit = .{
+                        .value = tok.text,
+                        .unit = .ether,
+                    } }, span);
+                }
                 return self.makeExprNode(.{ .int_lit = tok.text }, span);
             },
             .float_literal => {
@@ -2772,6 +3281,10 @@ pub const Parser = struct {
             .hex_literal => {
                 _ = self.advance();
                 return self.makeExprNode(.{ .int_lit = tok.text }, span);
+            },
+            .hex_bytes_literal => {
+                _ = self.advance();
+                return self.makeExprNode(.{ .hex_bytes_lit = tok.text }, span);
             },
             .kw_yes => {
                 _ = self.advance();
@@ -2816,14 +3329,244 @@ pub const Parser = struct {
                 _ = try self.expect(.rparen);
                 return self.makeExprNode(.{ .something = inner }, span);
             },
-            .lparen => {
+            // `payable(addr)` — coerce an address to its payable subtype.
+            .kw_payable => {
                 _ = self.advance();
+                _ = try self.expect(.lparen);
                 const inner = try self.parseExpr();
                 _ = try self.expect(.rparen);
-                return inner;
+                return self.makeExprNode(.{ .payable_cast = inner }, span);
+            },
+            // `create(value, init_code)` — plain CREATE.
+            .kw_create => {
+                _ = self.advance();
+                _ = try self.expect(.lparen);
+                const value_expr = try self.parseExpr();
+                _ = try self.expect(.comma);
+                const init_code = try self.parseExpr();
+                _ = try self.expect(.rparen);
+                return self.makeExprNode(.{ .create_expr = .{
+                    .is_create2 = false,
+                    .value = value_expr,
+                    .init_code = init_code,
+                    .salt = null,
+                    .span = span,
+                } }, span);
+            },
+            // `create2(value, salt, init_code)` — CREATE2 with deterministic addr.
+            .kw_create2 => {
+                _ = self.advance();
+                _ = try self.expect(.lparen);
+                const value_expr = try self.parseExpr();
+                _ = try self.expect(.comma);
+                const salt_expr = try self.parseExpr();
+                _ = try self.expect(.comma);
+                const init_code = try self.parseExpr();
+                _ = try self.expect(.rparen);
+                return self.makeExprNode(.{ .create_expr = .{
+                    .is_create2 = true,
+                    .value = value_expr,
+                    .init_code = init_code,
+                    .salt = salt_expr,
+                    .span = span,
+                } }, span);
+            },
+            // `abi.encode(...)`, `abi.encode_packed(...)`,
+            // `abi.encode_with_selector(sel, ...)`, `abi.decode(bytes, T)`.
+            .kw_abi => {
+                _ = self.advance();
+                _ = try self.expect(.dot);
+                const opname = (try self.expect(.identifier)).text;
+                _ = try self.expect(.lparen);
+                if (std.mem.eql(u8, opname, "decode")) {
+                    const data_expr = try self.parseExpr();
+                    _ = try self.expect(.comma);
+                    const target_ty = try self.parseType();
+                    _ = try self.expect(.rparen);
+                    const ty_ptr = try self.allocator.create(TypeExpr);
+                    ty_ptr.* = target_ty;
+                    return self.makeExprNode(.{ .abi_op = .{ .decode = .{
+                        .data = data_expr,
+                        .target_type = ty_ptr,
+                    } } }, span);
+                }
+                if (std.mem.eql(u8, opname, "encode_with_selector")) {
+                    const sel = try self.parseExpr();
+                    var args: std.ArrayListUnmanaged(Argument) = .{};
+                    while (self.check(.comma)) {
+                        _ = self.advance();
+                        if (self.check(.rparen)) break;
+                        const arg_span = self.peek().span;
+                        const v = try self.parseExpr();
+                        try args.append(self.allocator, .{
+                            .name = null,
+                            .value = v,
+                            .span = arg_span,
+                        });
+                    }
+                    _ = try self.expect(.rparen);
+                    return self.makeExprNode(.{ .abi_op = .{ .encode_with_selector = .{
+                        .selector = sel,
+                        .args = try args.toOwnedSlice(self.allocator),
+                    } } }, span);
+                }
+                // encode / encode_packed — simple arg list.
+                var args: std.ArrayListUnmanaged(Argument) = .{};
+                while (!self.check(.rparen) and self.peekKind() != .eof) {
+                    const arg_span = self.peek().span;
+                    const v = try self.parseExpr();
+                    try args.append(self.allocator, .{
+                        .name = null,
+                        .value = v,
+                        .span = arg_span,
+                    });
+                    if (!self.matchAny(&.{.comma})) break;
+                }
+                _ = try self.expect(.rparen);
+                const owned = try args.toOwnedSlice(self.allocator);
+                if (std.mem.eql(u8, opname, "encode_packed")) {
+                    return self.makeExprNode(.{ .abi_op = .{ .encode_packed = owned } }, span);
+                }
+                return self.makeExprNode(.{ .abi_op = .{ .encode = owned } }, span);
+            },
+            // `fn_ref FunctionName` — take a pointer to a named top-level fn.
+            .kw_fn_ref => {
+                _ = self.advance();
+                const name = (try self.expect(.identifier)).text;
+                return self.makeExprNode(.{ .fn_ref = name }, span);
+            },
+            // `fn (params) gives RetTy: body` — a lambda expression.
+            .kw_fn => {
+                _ = self.advance();
+                const params = try self.parseParamList();
+                var ret_ty: ?TypeExpr = null;
+                if (self.check(.kw_gives)) {
+                    _ = self.advance();
+                    ret_ty = try self.parseType();
+                }
+                _ = try self.expect(.colon);
+                // A lambda body is one expression statement or a small block.
+                // For one-line lambdas, accept an expression and wrap it as a
+                // `give back` statement.
+                var body_stmts: std.ArrayListUnmanaged(Stmt) = .{};
+                const body_expr = try self.parseExpr();
+                try body_stmts.append(self.allocator, .{
+                    .kind = .{ .give_back = body_expr },
+                    .span = body_expr.span,
+                });
+                return self.makeExprNode(.{ .lambda = .{
+                    .params = params,
+                    .return_type = ret_ty,
+                    .body = try body_stmts.toOwnedSlice(self.allocator),
+                    .span = span,
+                } }, span);
+            },
+            // `[a, b, c]` — list literal.
+            .lbracket => {
+                _ = self.advance();
+                var elems: std.ArrayListUnmanaged(*Expr) = .{};
+                while (!self.check(.rbracket) and self.peekKind() != .eof) {
+                    const e = try self.parseExpr();
+                    try elems.append(self.allocator, e);
+                    if (!self.matchAny(&.{.comma})) break;
+                }
+                _ = try self.expect(.rbracket);
+                return self.makeExprNode(.{ .list_lit = try elems.toOwnedSlice(self.allocator) }, span);
+            },
+            // `{k => v, ...}` — map literal.  Empty `{}` is treated as an
+            // empty map literal for now.
+            .lbrace => {
+                _ = self.advance();
+                var entries: std.ArrayListUnmanaged(ast.MapEntry) = .{};
+                while (!self.check(.rbrace) and self.peekKind() != .eof) {
+                    const entry_span = self.peek().span;
+                    const k = try self.parseExpr();
+                    _ = try self.expect(.fat_arrow);
+                    const v = try self.parseExpr();
+                    try entries.append(self.allocator, .{
+                        .key = k,
+                        .value = v,
+                        .span = entry_span,
+                    });
+                    if (!self.matchAny(&.{.comma})) break;
+                }
+                _ = try self.expect(.rbrace);
+                return self.makeExprNode(.{ .map_lit = try entries.toOwnedSlice(self.allocator) }, span);
+            },
+            // `set { a, b, c }` — set literal expression.
+            .kw_set => {
+                _ = self.advance();
+                _ = try self.expect(.lbrace);
+                var elems: std.ArrayListUnmanaged(*Expr) = .{};
+                while (!self.check(.rbrace) and self.peekKind() != .eof) {
+                    const e = try self.parseExpr();
+                    try elems.append(self.allocator, e);
+                    if (!self.matchAny(&.{.comma})) break;
+                }
+                _ = try self.expect(.rbrace);
+                return self.makeExprNode(.{ .set_lit = try elems.toOwnedSlice(self.allocator) }, span);
+            },
+            .lparen => {
+                _ = self.advance();
+                // Empty tuple is not supported; require at least one elem.
+                const first = try self.parseExpr();
+                if (self.check(.comma)) {
+                    var elems: std.ArrayListUnmanaged(*Expr) = .{};
+                    try elems.append(self.allocator, first);
+                    while (self.check(.comma)) {
+                        _ = self.advance();
+                        if (self.check(.rparen)) break;
+                        try elems.append(self.allocator, try self.parseExpr());
+                    }
+                    _ = try self.expect(.rparen);
+                    const owned = try elems.toOwnedSlice(self.allocator);
+                    return self.makeExprNode(.{ .tuple_lit = owned }, span);
+                }
+                _ = try self.expect(.rparen);
+                return first;
             },
             .identifier, .kw_mine, .kw_this, .kw_oracle, .kw_vrf_random, .kw_zk_proof, .kw_private => {
                 _ = self.advance();
+                // Contextual builtins recognised only in expression position,
+                // so they never block use as ordinary names elsewhere.
+                if (tok.kind == .identifier and self.check(.lparen)) {
+                    // `create(value, init_code)` — plain CREATE.
+                    if (std.mem.eql(u8, tok.text, "create")) {
+                        _ = self.advance(); // (
+                        const value_expr = try self.parseExpr();
+                        _ = try self.expect(.comma);
+                        const init_code = try self.parseExpr();
+                        _ = try self.expect(.rparen);
+                        return self.makeExprNode(.{ .create_expr = .{
+                            .is_create2 = false,
+                            .value = value_expr,
+                            .init_code = init_code,
+                            .salt = null,
+                            .span = span,
+                        } }, span);
+                    }
+                    // `create2(value, salt, init_code)` — CREATE2.
+                    if (std.mem.eql(u8, tok.text, "create2")) {
+                        _ = self.advance(); // (
+                        const value_expr = try self.parseExpr();
+                        _ = try self.expect(.comma);
+                        const salt_expr = try self.parseExpr();
+                        _ = try self.expect(.comma);
+                        const init_code = try self.parseExpr();
+                        _ = try self.expect(.rparen);
+                        return self.makeExprNode(.{ .create_expr = .{
+                            .is_create2 = true,
+                            .value = value_expr,
+                            .init_code = init_code,
+                            .salt = salt_expr,
+                            .span = span,
+                        } }, span);
+                    }
+                }
+                // Struct literal: `TypeName { field = value, ... }`.
+                if (tok.kind == .identifier and self.check(.lbrace)) {
+                    return self.parseStructLiteral(tok.text, span);
+                }
                 return self.makeExprNode(.{ .identifier = tok.text }, span);
             },
             .kw_ok => {

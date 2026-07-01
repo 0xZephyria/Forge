@@ -1,0 +1,54 @@
+version 1
+
+// Smoke test for the bitwise operators newly added to FORGE.
+// Exercises:
+//   - `bitand`, `bitor`, `bitxor`        (BinOps)
+//   - `shl`, `shr`                       (BinOps)
+//   - `bitnot`                           (UnaryOp)
+//
+// Demonstrates a permission-bitmap pattern that every general-purpose
+// smart-contract language needs (Solidity's `&`, `|`, `^`, `<<`, `>>`, `~`).
+
+contract BitwiseFlags:
+    has:
+        flags is u256
+        admin is Account
+
+    setup(a is Account):
+        admin = a
+        flags = 0
+
+    // Set the bit at position `pos`.
+    action set_bit(pos is u256):
+        need caller equals admin else "only admin"
+        flags = flags bitor (1 shl pos)
+        tell BitSet(pos, flags)
+
+    // Clear the bit at position `pos`.
+    action clear_bit(pos is u256):
+        need caller equals admin else "only admin"
+        flags = flags bitand bitnot (1 shl pos)
+        tell BitCleared(pos, flags)
+
+    // Toggle the bit at position `pos`.
+    action toggle_bit(pos is u256):
+        need caller equals admin else "only admin"
+        flags = flags bitxor (1 shl pos)
+        tell BitToggled(pos, flags)
+
+    // Read the bit at position `pos` (1 if set, 0 if clear).
+    view get_bit(pos is u256) gives u256:
+        give back (flags shr pos) bitand 1
+
+    // Test whether any of the low N bits are set.
+    view any_low_set(n is u256) gives bool:
+        let mask = (1 shl n) minus 1
+        give back (flags bitand mask) is not 0
+
+    event BitSet(pos is u256, new_flags is u256)
+    event BitCleared(pos is u256, new_flags is u256)
+    event BitToggled(pos is u256, new_flags is u256)
+
+    // Test exponentiation operator.
+    pure compute_power(base is u256, exp is u256) gives u256:
+        give back base power exp

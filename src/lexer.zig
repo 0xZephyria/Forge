@@ -41,6 +41,9 @@ pub const TokenKind = enum {
     /// Hex literal (any length): `0xABCD…`
     /// 32+ byte hex becomes an address; shorter is a number.
     hex_literal,
+    /// `hex"deadbeef"` — raw byte string literal (Spec §2.3, EVM parity).
+    /// The lexer captures the surrounding quotes and `hex` prefix verbatim.
+    hex_bytes_literal,
 
     // ── Keywords — Declaration structure ─────────────────────────────────
     kw_version,
@@ -103,6 +106,22 @@ pub const TokenKind = enum {
     kw_and,
     kw_or,
 
+    // ── Keywords — Bitwise operators (Part 2.2) ──────────────────────────
+    /// `a bitand b` — bitwise AND (returns same numeric type as operands)
+    kw_bitand,
+    /// `a bitor b` — bitwise OR
+    kw_bitor,
+    /// `a bitxor b` — bitwise XOR
+    kw_bitxor,
+    /// `a shl b` — left shift (logical)
+    kw_shl,
+    /// `a shr b` — right shift (logical)
+    kw_shr,
+    /// `bitnot expr` — bitwise complement
+    kw_bitnot,
+    /// `a power b` — exponentiation
+    kw_power,
+
     // ── Keywords — Arithmetic operators (English) ─────────────────────────
     kw_plus,
     kw_minus,
@@ -127,6 +146,10 @@ pub const TokenKind = enum {
     kw_within,
     kw_outside,
     kw_system,
+    // Solidity-flavoured visibility aliases.
+    kw_public,
+    kw_internal,
+    kw_external,
 
     // ── Keywords — Account declarations ───────────────────────────────────
     kw_owned_by,
@@ -251,6 +274,29 @@ pub const TokenKind = enum {
     kw_let,
     kw_alias,
     kw_gives, // `gives ReturnType`
+    /// `fn` — first-class function type / lambda introducer.
+    kw_fn,
+    /// `fn_ref` — take a function pointer to a named top-level pure.
+    kw_fn_ref,
+    /// `payable` — payable address subtype / cast.
+    kw_payable,
+    /// `abi` — ABI encode/decode module identifier (recognised as keyword
+    /// so the parser can specialise `abi.encode`, `abi.decode`, etc.).
+    kw_abi,
+    /// `create` — low-level contract creation expression.
+    kw_create,
+    /// `create2` — salted low-level contract creation expression.
+    kw_create2,
+    /// `staticcall` — read-only external call method.
+    kw_staticcall,
+    /// `delegatecall` — delegated external call method.
+    kw_delegatecall,
+    /// `wei` — native-unit suffix on int literal (1 wei == 1 base unit).
+    kw_wei,
+    /// `gwei` — 10^9 base units suffix on int literal.
+    kw_gwei,
+    /// `ether` — 10^18 base units suffix on int literal.
+    kw_ether,
     kw_ok,
     kw_fail,
     kw_deployer,
@@ -426,6 +472,14 @@ const keyword_map = std.StaticStringMap(TokenKind).initComptime(.{
     // Logic
     .{ "and", .kw_and },
     .{ "or", .kw_or },
+    // Bitwise
+    .{ "bitand", .kw_bitand },
+    .{ "bitor", .kw_bitor },
+    .{ "bitxor", .kw_bitxor },
+    .{ "shl", .kw_shl },
+    .{ "shr", .kw_shr },
+    .{ "bitnot", .kw_bitnot },
+    .{ "power", .kw_power },
     // Arithmetic (English)
     .{ "plus", .kw_plus },
     .{ "minus", .kw_minus },
@@ -445,6 +499,9 @@ const keyword_map = std.StaticStringMap(TokenKind).initComptime(.{
     .{ "within", .kw_within },
     .{ "outside", .kw_outside },
     .{ "system", .kw_system },
+    .{ "public", .kw_public },
+    .{ "internal", .kw_internal },
+    .{ "external", .kw_external },
     .{ "readonly", .kw_readonly },
     // Account keywords
     .{ "owned_by", .kw_owned_by },
@@ -561,6 +618,17 @@ const keyword_map = std.StaticStringMap(TokenKind).initComptime(.{
     .{ "let", .kw_let },
     .{ "alias", .kw_alias },
     .{ "gives", .kw_gives },
+    .{ "fn", .kw_fn },
+    .{ "fn_ref", .kw_fn_ref },
+    .{ "payable", .kw_payable },
+    .{ "abi", .kw_abi },
+    // NOTE: `create`, `create2`, `staticcall`, `delegatecall` are intentionally
+    // NOT reserved keywords — they are contextual builtins recognised by the
+    // parser only in expression position, so contracts may freely use them as
+    // action/variable names.
+    .{ "wei", .kw_wei },
+    .{ "gwei", .kw_gwei },
+    .{ "ether", .kw_ether },
     .{ "ok", .kw_ok },
     .{ "fail", .kw_fail },
     .{ "deployer", .kw_deployer },
@@ -586,7 +654,6 @@ const keyword_map = std.StaticStringMap(TokenKind).initComptime(.{
     .{ "adversary", .kw_adversary },
     .{ "tries", .kw_tries },
     .{ "attack", .kw_attack },
-    .{ "call", .kw_call },
     .{ "expects", .kw_expects },
     .{ "conservation_violated", .kw_conservation_violated },
     .{ "action_blocked", .kw_action_blocked },
@@ -912,6 +979,25 @@ pub const Lexer = struct {
             self.pos += 1;
         }
         const word = self.source[start..self.pos];
+        // Special case: `hex"..."` — a raw byte string literal.
+        // The `hex` ident is followed (no whitespace) by an opening `"`.
+        if (std.mem.eql(u8, word, "hex") and
+            self.pos < self.source.len and self.source[self.pos] == '"')
+        {
+            // Consume the entire `hex"…"` token, treating it as opaque.
+            self.advance(); // consume opening quote
+            while (self.pos < self.source.len and self.source[self.pos] != '"') {
+                if (self.source[self.pos] == '\n') {
+                    self.line += 1;
+                    self.col = 1;
+                    self.pos += 1;
+                } else {
+                    self.advance();
+                }
+            }
+            if (self.pos < self.source.len) self.advance(); // consume closing `"`
+            return self.makeTokenAt(.hex_bytes_literal, start, start_line, start_col);
+        }
         const kind = tokenKindOf(word) orelse .identifier;
         return self.makeTokenAt(kind, start, start_line, start_col);
     }

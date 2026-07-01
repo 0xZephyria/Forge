@@ -656,6 +656,13 @@ fn mapEVMType(ty: types.ResolvedType) []const u8 {
         .capability => "bytes",
         .proof => "bytes",
         .void_ => "void",
+        // Generics / first-class function values / payable wrapper are
+        // erased at the ABI boundary: free type parameters become bytes,
+        // function pointers serialise as opaque bytes, and `payable T`
+        // collapses to the EVM rendering of the inner type.
+        .type_param => "bytes",
+        .function => "bytes",
+        .payable_addr => "address",
     };
 }
 
@@ -715,6 +722,9 @@ fn mapZephType(ty: types.ResolvedType) []const u8 {
         .capability => |name| name,
         .proof => "proof",
         .void_ => "void",
+        .type_param => "type_param",
+        .function => "function",
+        .payable_addr => "payable_account",
     };
 }
 
@@ -766,6 +776,10 @@ fn visibilityStr(v: ast.Visibility) []const u8 {
         .hidden => "hidden",
         .outside => "outside",
         .system => "system",
+        .public => "public",
+        .internal => "internal",
+        .private => "private",
+        .external => "external",
     };
 }
 

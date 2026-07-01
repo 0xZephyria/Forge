@@ -138,6 +138,10 @@ fn parseArgs(args: []const [:0]const u8) ArgResult {
                 return .exit_err;
             }
             opts.target = args[i];
+            // `--target evm` implies the EVM codegen pipeline + ABI.
+            if (std.mem.eql(u8, opts.target, "evm")) {
+                opts.evm_abi = true;
+            }
         } else if (arg.len > 0 and arg[0] == '-') {
             std.debug.print("error: unknown option '{s}'\n", .{arg});
             return .exit_err;
@@ -444,6 +448,10 @@ fn errorCodeFromDiag(d: errors.Diagnostic) u16 {
         error.ComplexityViolated => 37,
         error.AttackSucceeded => 38,
         error.AttackBlocked => 39,
+        // Backend
+        error.ConstructNotEmittedOnTarget => 42,
+        error.NonExhaustiveMatch => 43,
+        error.TooManyIndexedFields => 44,
         // General
         error.OutOfMemory => 40,
         error.InternalError => 41,
@@ -487,6 +495,11 @@ fn printAstSummary(top_levels: []const TopLevel) void {
             .type_alias => |t| std.debug.print("alias {s}\n", .{t.name}),
             .capability_def => |cap| std.debug.print("capability {s}\n", .{cap.name}),
             .global_invariant => |gi| std.debug.print("global invariant {s}\n", .{gi.name}),
+            .free_pure => |p| std.debug.print("free pure {s}\n", .{p.name}),
+            .free_view => |v| std.debug.print("free view {s}\n", .{v.name}),
+            .free_action => |a| std.debug.print("free action {s}\n", .{a.name}),
+            .free_helper => |h| std.debug.print("free helper {s}\n", .{h.name}),
+            .free_error => |e| std.debug.print("free error {s}\n", .{e.name}),
         }
     }
 }

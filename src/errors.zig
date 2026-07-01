@@ -150,6 +150,17 @@ pub const CompileError = error{
     /// SPEC: Novel Idea 3 — Adversary Blocks.
     AttackBlocked,
 
+    // ── Backend / codegen errors ───────────────────────────────────────────
+    /// A MIR construct is not yet wired into the active backend.
+    /// Emitted by codegen when an opcode has no native lowering yet.
+    ConstructNotEmittedOnTarget,
+    /// A `match` over an enum value missed at least one variant and lacked
+    /// a wildcard `_` arm.
+    NonExhaustiveMatch,
+    /// An event has more than three `indexed` fields, exceeding the
+    /// EVM non-anonymous-event ceiling.
+    TooManyIndexedFields,
+
     // ── General ───────────────────────────────────────────────────────────
     /// The allocator returned `error.OutOfMemory` during compilation.
     OutOfMemory,
@@ -316,6 +327,10 @@ fn errorCode(kind: CompileError) u16 {
         error.ComplexityViolated => 37,
         error.AttackSucceeded => 38,
         error.AttackBlocked => 39,
+        // Backend
+        error.ConstructNotEmittedOnTarget => 42,
+        error.NonExhaustiveMatch => 43,
+        error.TooManyIndexedFields => 44,
         // General
         error.OutOfMemory => 40,
         error.InternalError => 41,
@@ -366,6 +381,10 @@ fn errorLabel(kind: CompileError) []const u8 {
         error.ComplexityViolated => "gas complexity class exceeded",
         error.AttackSucceeded => "adversary attack succeeded (potential vulnerability)",
         error.AttackBlocked => "adversary attack was blocked",
+        // Backend
+        error.ConstructNotEmittedOnTarget => "construct not emitted on selected target",
+        error.NonExhaustiveMatch => "non-exhaustive match: missing variants",
+        error.TooManyIndexedFields => "too many indexed event fields (max 3)",
         // General
         error.OutOfMemory => "out of memory",
         error.InternalError => "internal compiler error",

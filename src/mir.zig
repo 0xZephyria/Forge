@@ -83,6 +83,13 @@ pub const MirType = enum {
             .enum_ => .i32,
             .proof => .ptr,
             .void_ => .void_,
+            // Generic type parameters lower as opaque 256-bit handles until
+            // monomorphisation is implemented. Function values are also
+            // 256-bit handles for now. `payable Account` lowers as its
+            // underlying address type.
+            .type_param => .i256,
+            .function => .i256,
+            .payable_addr => .i256,
         };
     }
 };
@@ -109,6 +116,9 @@ pub const Selector = u32;
 // ============================================================================
 // Section 2 — MIR Instructions
 // ============================================================================
+
+/// SPEC: Part 10.1 — Low-level external call variants.
+pub const MirLowCallKind = enum { call, static, delegate };
 
 /// SPEC: All Parts — Every operation the MIR can represent.
 /// Each instruction is a flat, self-contained operation. No nested expressions.
@@ -159,6 +169,22 @@ pub const MirOp = union(enum) {
     /// SPEC: Part 2.2 — dst = -operand (arithmetic negation).
     negate: struct { dst: Reg, operand: Reg },
 
+    // ── Bitwise ───────────────────────────────────────────────────────────
+    /// SPEC: Part 2.2 — dst = lhs & rhs (bitwise AND).
+    bit_and: struct { dst: Reg, lhs: Reg, rhs: Reg },
+    /// SPEC: Part 2.2 — dst = lhs | rhs (bitwise OR).
+    bit_or: struct { dst: Reg, lhs: Reg, rhs: Reg },
+    /// SPEC: Part 2.2 — dst = lhs ^ rhs (bitwise XOR).
+    bit_xor: struct { dst: Reg, lhs: Reg, rhs: Reg },
+    /// SPEC: Part 2.2 — dst = lhs << rhs (logical left shift).
+    shl: struct { dst: Reg, lhs: Reg, rhs: Reg },
+    /// SPEC: Part 2.2 — dst = lhs >> rhs (logical right shift).
+    shr: struct { dst: Reg, lhs: Reg, rhs: Reg },
+    /// SPEC: Part 2.2 — dst = ~operand (bitwise complement).
+    bit_not: struct { dst: Reg, operand: Reg },
+    /// SPEC: Part 2.2 — dst = lhs ** rhs (exponentiation).
+    exp: struct { dst: Reg, lhs: Reg, rhs: Reg },
+
     // ── Register movement ─────────────────────────────────────────────────
     /// Copy src register value to dst.
     mov: struct { dst: Reg, src: Reg },
@@ -192,6 +218,18 @@ pub const MirOp = union(enum) {
     state_write: struct { field_id: FieldId, key: ?Reg, value: Reg },
     /// SPEC: Part 5.2 — Delete a map entry: `remove mine.map[key]`.
     state_delete: struct { field_id: FieldId, key: Reg },
+
+    // ── General storage slot computation (nested maps, computed slots) ─────
+    /// dst = the base storage slot for a state field (its field_id as a slot).
+    slot_field: struct { dst: Reg, field_id: FieldId },
+    /// dst = keccak256(pad32(key) ++ pad32(base_slot)) — one mapping level.
+    slot_map: struct { dst: Reg, base_slot: Reg, key: Reg },
+    /// dst = base_slot + offset — struct field / array element offset.
+    slot_offset: struct { dst: Reg, base_slot: Reg, offset: u32 },
+    /// dst = SLOAD(slot).
+    storage_load: struct { dst: Reg, slot: Reg },
+    /// SSTORE(slot, value).
+    storage_store: struct { slot: Reg, value: Reg },
 
     // ── Linear asset operations ───────────────────────────────────────────
     /// SPEC: Part 8.4 — Transfer a linear asset to a recipient.
@@ -295,6 +333,68 @@ pub const MirOp = union(enum) {
     /// Call an internal action/view/pure/helper by selector.
     call_internal: struct { dst: Reg, selector: Selector, args: []const Reg },
 
+    // ── Tuple destructuring (multi-return) ────────────────────────────────
+    /// SPEC: Part 6.4 — Split a tuple register into N destination registers.
+    /// Backends materialise the per-slot reads from the source aggregate.
+    tuple_destructure: struct { src: Reg, dsts: []const Reg },
+
+    // ── First-class function values ───────────────────────────────────────
+    /// SPEC: Part 5.5 — `fn_ref Name` — materialise a function pointer value.
+    fn_ref: struct { dst: Reg, name_offset: u32, name_len: u32 },
+    /// SPEC: Part 5.5 — Invoke a function pointer value with arguments.
+    fn_call: struct { dst: Reg, fn_reg: Reg, args: []const Reg },
+
+    // ── Generic monomorphisation ──────────────────────────────────────────
+    /// SPEC: Part 5.5 — Record a generic instantiation. Backends use this
+    /// to specialise the referenced function/struct for the given type args.
+    type_inst: struct { name_offset: u32, name_len: u32, arg_count: u32 },
+
+    // ── Collection literals ───────────────────────────────────────────────
+    /// SPEC: Part 2.6 — Construct an empty list with `len` reserved slots.
+    list_new: struct { dst: Reg, len: u32 },
+    /// SPEC: Part 2.6 — Write `value` at `index` in a list.
+    list_set: struct { list: Reg, index: u32, value: Reg },
+    /// SPEC: Part 2.6 — Construct an empty map.
+    map_new: struct { dst: Reg },
+    /// SPEC: Part 2.6 — Insert `value` under `key` in a map.
+    map_set: struct { map: Reg, key: Reg, value: Reg },
+    /// SPEC: Part 2.6 — Construct an empty set.
+    set_new: struct { dst: Reg },
+    /// SPEC: Part 2.6 — Insert `element` into a set.
+    set_insert: struct { set: Reg, element: Reg },
+
+    // ── ABI helper opcodes ────────────────────────────────────────────────
+    /// SPEC: Part 10.1 — `abi.encode(a, b, ...)` — head/tail Solidity encoding.
+    abi_encode: struct { dst: Reg, args: []const Reg },
+    /// SPEC: Part 10.1 — `abi.encode_packed(...)` — no padding.
+    abi_encode_packed: struct { dst: Reg, args: []const Reg },
+    /// SPEC: Part 10.1 — `abi.decode(bytes, T)` — decode into a target type id.
+    abi_decode: struct { dst: Reg, data: Reg, type_id: u32 },
+    /// SPEC: Part 10.1 — `abi.encode_with_selector(sel, args...)`.
+    abi_encode_selector: struct { dst: Reg, selector: Reg, args: []const Reg },
+
+    // ── Low-level external calls ──────────────────────────────────────────
+    /// SPEC: Part 10.1 — `target.call(value, data)` / `staticcall` / `delegatecall`.
+    /// Returns success flag and returned bytes pointer in two destination regs.
+    low_call: struct {
+        dst_success: Reg,
+        dst_data: Reg,
+        target: Reg,
+        value_or_zero: Reg,
+        data: Reg,
+        kind: MirLowCallKind,
+    },
+
+    // ── Contract creation ─────────────────────────────────────────────────
+    /// SPEC: Part 10.3 — `create(value, init_code)` / `create2(value, salt, init_code)`.
+    create_contract: struct {
+        dst: Reg,
+        value: Reg,
+        init_code: Reg,
+        salt: ?Reg,
+        is_create2: bool,
+    },
+
     // ── No-op placeholder for match arm bookkeeping ───────────────────────
     nop,
 };
@@ -384,6 +484,16 @@ pub const MirFunction = struct {
     return_type: ?MirType,
     body: []const MirInstr,
     max_regs: Reg,
+};
+
+/// SPEC: Part 5.5 — A lambda discovered during expression lowering, queued so
+/// its body is lifted into a synthesised top-level pure once the enclosing
+/// function's lowering completes.
+pub const PendingLambda = struct {
+    name: []const u8,
+    params: []ast.Param,
+    return_type: ?ast.TypeExpr,
+    body: []ast.Stmt,
 };
 
 /// SPEC: Part 5 — The complete lowered contract, ready for any backend.
@@ -510,6 +620,23 @@ pub const MirLowerer = struct {
     error_ids: std.StringHashMapUnmanaged(ErrorId),
     next_error_id: ErrorId,
 
+    /// Monotonic counter for synthesised lambda names.
+    lambda_counter: u32,
+
+    /// SPEC: Part 5.5 — Lambdas encountered while lowering an expression are
+    /// recorded here; the enclosing function drains the queue after its own
+    /// body completes so each lambda becomes a callable top-level pure.
+    pending_lambdas: std.ArrayListUnmanaged(PendingLambda),
+
+    /// SPEC: Part 7.4 — Guard declarations of the contract being lowered,
+    /// used to inline guard bodies at `guard name(args)` call sites.
+    guards: []const ast.GuardDecl = &.{},
+
+    /// SPEC: Part 5.2 — Resolved type of each state field by name, used to
+    /// infer struct field offsets and mapping value types during slot-path
+    /// lowering.
+    field_types: std.StringHashMapUnmanaged(ResolvedType) = .{},
+
     /// SPEC: All Parts — Create a new lowerer.
     pub fn init(
         allocator: std.mem.Allocator,
@@ -533,6 +660,8 @@ pub const MirLowerer = struct {
             .next_event_id = 0,
             .error_ids = .{},
             .next_error_id = 0,
+            .lambda_counter = 0,
+            .pending_lambdas = .{},
         };
     }
 
@@ -543,9 +672,9 @@ pub const MirLowerer = struct {
         self.functions.deinit(self.allocator);
         self.loop_stack.deinit(self.allocator);
         self.local_regs.deinit(self.allocator);
-        self.field_ids.deinit(self.allocator);
-        self.event_ids.deinit(self.allocator);
+        self.field_ids.deinit(self.allocator);        self.event_ids.deinit(self.allocator);
         self.error_ids.deinit(self.allocator);
+        self.field_types.deinit(self.allocator);
     }
 
     // ── Register and label allocation ─────────────────────────────────────
@@ -727,6 +856,23 @@ pub const MirLowerer = struct {
                         return dst;
                     }
                 }
+                // Struct field read from storage (`m[k].field`,
+                // `mine.s.field`). Route through the slot-path model when the
+                // object resolves to a struct storage path.
+                if (fa.object.kind == .index_access or fa.object.kind == .field_access) {
+                    if (self.storagePathType(fa.object)) |obj_ty| {
+                        switch (obj_ty) {
+                            .struct_ => {
+                                if (try self.lowerStorageSlot(expr)) |slot_reg| {
+                                    const dst = self.freshReg();
+                                    try self.emit(.{ .storage_load = .{ .dst = dst, .slot = slot_reg } }, span);
+                                    return dst;
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                }
                 // General field access: evaluate object, return as-is.
                 // Full struct field offset resolution happens in backends.
                 return try self.lowerExpr(fa.object);
@@ -734,6 +880,16 @@ pub const MirLowerer = struct {
 
             // ── Index access ──────────────────────────────────────────────
             .index_access => |ia| {
+                // Nested mapping read (`m[a][b]`) — route through the general
+                // slot-path model since the single-key state_read cannot
+                // encode more than one level.
+                if (ia.object.kind == .index_access) {
+                    if (try self.lowerStorageSlot(expr)) |slot_reg| {
+                        const dst = self.freshReg();
+                        try self.emit(.{ .storage_load = .{ .dst = dst, .slot = slot_reg } }, span);
+                        return dst;
+                    }
+                }
                 // `mine.map[key]` → state_read with key register
                 const key_reg = try self.lowerExpr(ia.index);
                 var field_name: ?[]const u8 = null;
@@ -778,6 +934,7 @@ pub const MirLowerer = struct {
                 switch (op.op) {
                     .not_ => try self.emit(.{ .bool_not = .{ .dst = dst, .operand = operand } }, span),
                     .negate => try self.emit(.{ .negate = .{ .dst = dst, .operand = operand } }, span),
+                    .bit_not => try self.emit(.{ .bit_not = .{ .dst = dst, .operand = operand } }, span),
                 }
                 return dst;
             },
@@ -917,7 +1074,229 @@ pub const MirLowerer = struct {
                 } }, span);
                 return dst;
             },
+
+            // ── Hex bytes literal ─────────────────────────────────────────
+            .hex_bytes_lit => |raw| {
+                const dst = self.freshReg();
+                // Strip leading `hex"` and trailing `"`.
+                var inner: []const u8 = raw;
+                if (std.mem.startsWith(u8, raw, "hex\"")) inner = raw[4..];
+                if (inner.len > 0 and inner[inner.len - 1] == '"') inner = inner[0 .. inner.len - 1];
+                const decoded = decodeHexLitToOwned(self.allocator, inner) catch &[_]u8{};
+                defer self.allocator.free(decoded);
+                const interned = try self.data.intern(decoded);
+                try self.emit(.{ .const_data = .{
+                    .dst = dst,
+                    .offset = interned.offset,
+                    .len = interned.len,
+                } }, span);
+                return dst;
+            },
+
+            // ── Numeric literal with unit denomination ────────────────────
+            .unit_lit => |ul| {
+                const dst = self.freshReg();
+                const bytes = scaleUnitLitTo256(ul.value, ul.unit);
+                try self.emit(.{ .const_i256 = .{ .dst = dst, .bytes = bytes } }, span);
+                return dst;
+            },
+
+            // ── List literal ──────────────────────────────────────────────
+            .list_lit => |elems| {
+                const dst = self.freshReg();
+                try self.emit(.{ .list_new = .{
+                    .dst = dst,
+                    .len = @intCast(elems.len),
+                } }, span);
+                for (elems, 0..) |elem, i| {
+                    const val = try self.lowerExpr(elem);
+                    try self.emit(.{ .list_set = .{
+                        .list = dst,
+                        .index = @intCast(i),
+                        .value = val,
+                    } }, span);
+                }
+                return dst;
+            },
+
+            // ── Map literal ───────────────────────────────────────────────
+            .map_lit => |entries| {
+                const dst = self.freshReg();
+                try self.emit(.{ .map_new = .{ .dst = dst } }, span);
+                for (entries) |entry| {
+                    const k = try self.lowerExpr(entry.key);
+                    const v = try self.lowerExpr(entry.value);
+                    try self.emit(.{ .map_set = .{
+                        .map = dst,
+                        .key = k,
+                        .value = v,
+                    } }, span);
+                }
+                return dst;
+            },
+
+            // ── Set literal ───────────────────────────────────────────────
+            .set_lit => |elems| {
+                const dst = self.freshReg();
+                try self.emit(.{ .set_new = .{ .dst = dst } }, span);
+                for (elems) |elem| {
+                    const val = try self.lowerExpr(elem);
+                    try self.emit(.{ .set_insert = .{
+                        .set = dst,
+                        .element = val,
+                    } }, span);
+                }
+                return dst;
+            },
+
+            // ── Struct spread / partial update ────────────────────────────
+            .struct_update => |su| {
+                // Lower the base, then evaluate each override (its register
+                // becomes the new field value). For now, MIR records this as
+                // a sequence of evaluations whose composition is the result.
+                var last = try self.lowerExpr(su.base);
+                for (su.fields) |fi| {
+                    last = try self.lowerExpr(fi.value);
+                }
+                return last;
+            },
+
+            // ── Lambda expression ─────────────────────────────────────────
+            .lambda => |le| {
+                // SPEC: Part 5.5 — Lambdas are lifted to anonymous top-level
+                // pures. We synthesise a name, intern it, emit a fn_ref so
+                // the surrounding expression yields a function value, and
+                // enqueue the body so the enclosing function's lowering pass
+                // drains it and emits a real callable function.
+                const dst = self.freshReg();
+                const name_buf = try std.fmt.allocPrint(
+                    self.allocator,
+                    "__forge_lambda_{d}",
+                    .{self.lambda_counter},
+                );
+                self.lambda_counter += 1;
+                const interned = try self.data.intern(name_buf);
+                try self.emit(.{ .fn_ref = .{
+                    .dst = dst,
+                    .name_offset = interned.offset,
+                    .name_len = interned.len,
+                } }, span);
+                try self.pending_lambdas.append(self.allocator, .{
+                    .name = name_buf,
+                    .params = le.params,
+                    .return_type = le.return_type,
+                    .body = le.body,
+                });
+                return dst;
+            },
+
+            // ── fn_ref expression ─────────────────────────────────────────
+            .fn_ref => |name| {
+                const dst = self.freshReg();
+                const interned = try self.data.intern(name);
+                try self.emit(.{ .fn_ref = .{
+                    .dst = dst,
+                    .name_offset = interned.offset,
+                    .name_len = interned.len,
+                } }, span);
+                return dst;
+            },
+
+            // ── payable(addr) cast ────────────────────────────────────────
+            .payable_cast => |inner| {
+                // payable() is a type-system marker — no runtime work.
+                return try self.lowerExpr(inner);
+            },
+
+            // ── Low-level external call ───────────────────────────────────
+            .low_call => |lc| {
+                const target = try self.lowerExpr(lc.target);
+                const dst_success = self.freshReg();
+                const dst_data = self.freshReg();
+                const value_reg = blk: {
+                    if (lc.value) |v| break :blk try self.lowerExpr(v);
+                    const zero = self.freshReg();
+                    try self.emit(.{ .const_i256 = .{
+                        .dst = zero,
+                        .bytes = [_]u8{0} ** 32,
+                    } }, span);
+                    break :blk zero;
+                };
+                const data_reg = try self.lowerExpr(lc.data);
+                const kind: MirLowCallKind = switch (lc.kind) {
+                    .call => .call,
+                    .staticcall => .static,
+                    .delegatecall => .delegate,
+                };
+                try self.emit(.{ .low_call = .{
+                    .dst_success = dst_success,
+                    .dst_data = dst_data,
+                    .target = target,
+                    .value_or_zero = value_reg,
+                    .data = data_reg,
+                    .kind = kind,
+                } }, span);
+                return dst_data;
+            },
+
+            // ── ABI helper ────────────────────────────────────────────────
+            .abi_op => |op| {
+                return try self.lowerAbiOp(op, span);
+            },
+
+            // ── Contract creation ─────────────────────────────────────────
+            .create_expr => |ce| {
+                const value_reg = try self.lowerExpr(ce.value);
+                const init_reg = try self.lowerExpr(ce.init_code);
+                const salt_reg: ?Reg = if (ce.salt) |s| try self.lowerExpr(s) else null;
+                const dst = self.freshReg();
+                try self.emit(.{ .create_contract = .{
+                    .dst = dst,
+                    .value = value_reg,
+                    .init_code = init_reg,
+                    .salt = salt_reg,
+                    .is_create2 = ce.is_create2,
+                } }, span);
+                return dst;
+            },
         }
+    }
+
+    /// SPEC: Part 10.1 — Lower one of the `abi.*` helpers to MIR.
+    fn lowerAbiOp(self: *MirLowerer, op: ast.AbiOp, span: Span) anyerror!Reg {
+        const dst = self.freshReg();
+        switch (op) {
+            .encode => |args| {
+                const regs = try self.allocator.alloc(Reg, args.len);
+                for (args, 0..) |a, i| regs[i] = try self.lowerExpr(a.value);
+                try self.emit(.{ .abi_encode = .{ .dst = dst, .args = regs } }, span);
+            },
+            .encode_packed => |args| {
+                const regs = try self.allocator.alloc(Reg, args.len);
+                for (args, 0..) |a, i| regs[i] = try self.lowerExpr(a.value);
+                try self.emit(.{ .abi_encode_packed = .{ .dst = dst, .args = regs } }, span);
+            },
+            .encode_with_selector => |ews| {
+                const sel = try self.lowerExpr(ews.selector);
+                const regs = try self.allocator.alloc(Reg, ews.args.len);
+                for (ews.args, 0..) |a, i| regs[i] = try self.lowerExpr(a.value);
+                try self.emit(.{ .abi_encode_selector = .{
+                    .dst = dst,
+                    .selector = sel,
+                    .args = regs,
+                } }, span);
+            },
+            .decode => |d| {
+                const data_reg = try self.lowerExpr(d.data);
+                const type_id = fnvHash32(@tagName(d.target_type.*));
+                try self.emit(.{ .abi_decode = .{
+                    .dst = dst,
+                    .data = data_reg,
+                    .type_id = type_id,
+                } }, span);
+            },
+        }
+        return dst;
     }
 
     // ── Binary operation lowering ──────────────────────────────────────────
@@ -954,6 +1333,12 @@ pub const MirLowerer = struct {
             .less_eq => try self.emit(.{ .le = .{ .dst = dst, .lhs = lhs, .rhs = rhs } }, span),
             .greater_eq => try self.emit(.{ .ge = .{ .dst = dst, .lhs = lhs, .rhs = rhs } }, span),
             .has => try self.emit(.{ .has_check = .{ .dst = dst, .collection = lhs, .element = rhs } }, span),
+            .bit_and => try self.emit(.{ .bit_and = .{ .dst = dst, .lhs = lhs, .rhs = rhs } }, span),
+            .bit_or => try self.emit(.{ .bit_or = .{ .dst = dst, .lhs = lhs, .rhs = rhs } }, span),
+            .bit_xor => try self.emit(.{ .bit_xor = .{ .dst = dst, .lhs = lhs, .rhs = rhs } }, span),
+            .shl => try self.emit(.{ .shl = .{ .dst = dst, .lhs = lhs, .rhs = rhs } }, span),
+            .shr => try self.emit(.{ .shr = .{ .dst = dst, .lhs = lhs, .rhs = rhs } }, span),
+            .power => try self.emit(.{ .exp = .{ .dst = dst, .lhs = lhs, .rhs = rhs } }, span),
             .and_, .or_ => unreachable, // Handled above
         }
         return dst;
@@ -1064,10 +1449,38 @@ pub const MirLowerer = struct {
                 } }, span);
                 return dst;
             }
+            // SPEC: Part 5.5 — If the identifier is bound to a local register,
+            // it is a function-value-bearing variable (lambda result, fn_ref
+            // value, or `Fn[…]` parameter). Dispatch through fn_call rather
+            // than treating the name as a static selector.
+            if (self.lookupLocal(name)) |fn_reg| {
+                try self.emit(.{ .fn_call = .{
+                    .dst = dst,
+                    .fn_reg = fn_reg,
+                    .args = owned_args,
+                } }, span);
+                return dst;
+            }
             const sel = fnvHash32(name);
             try self.emit(.{ .call_internal = .{
                 .dst = dst,
                 .selector = sel,
+                .args = owned_args,
+            } }, span);
+            return dst;
+        }
+
+        // SPEC: Part 5.5 — Callee is itself an expression producing a
+        // function value (`(fn_ref Foo)(x)`, `(fn (x) gives u256: …)(x)`,
+        // `make_fn()(x)`). Lower it into a register and dispatch via
+        // fn_call.
+        if (callee.kind == .fn_ref or callee.kind == .lambda or
+            callee.kind == .call or callee.kind == .index_access)
+        {
+            const fn_reg = try self.lowerExpr(callee);
+            try self.emit(.{ .fn_call = .{
+                .dst = dst,
+                .fn_reg = fn_reg,
                 .args = owned_args,
             } }, span);
             return dst;
@@ -1167,8 +1580,45 @@ pub const MirLowerer = struct {
                 try self.bindLocal(lb.name, dst);
             },
 
+            // ── let tuple destructuring (`let (a, b) = expr`) ─────────────
+            // SPEC: Part 2.13 — until structured tuple lowering is in place,
+            // we evaluate the init for its side effects and bind each name
+            // SPEC: Part 6.4 — Lower `let (a, b, ...) = expr` by allocating
+            // one destination register per binding and emitting a single
+            // `tuple_destructure` op. The backend is responsible for
+            // unpacking the source aggregate.
+            .let_tuple => |lt| {
+                const src = try self.lowerExpr(lt.init);
+                var dsts: std.ArrayListUnmanaged(Reg) = .{};
+                defer dsts.deinit(self.allocator);
+                for (lt.names) |name| {
+                    const r = self.freshReg();
+                    try self.bindLocal(name, r);
+                    try dsts.append(self.allocator, r);
+                }
+                const owned = try self.allocator.dupe(Reg, dsts.items);
+                try self.emit(.{ .tuple_destructure = .{
+                    .src = src,
+                    .dsts = owned,
+                } }, span);
+            },
+
+            // ── modifier-body placeholder ─────────────────────────────────
+            // SPEC: Part 7.4 — `_` inside a `guard` is replaced with the
+            // wrapped action body during inlining. By the time the lowerer
+            // runs, any reachable placeholder has been spliced out; emit a
+            // nop so any stragglers are harmless.
+            .placeholder => {
+                try self.emit(.{ .nop = {} }, span);
+            },
+
             // ── assignment ────────────────────────────────────────────────
             .assign => |asg| {
+                // Whole-struct assignment into storage: write each field to
+                // its offset slot so struct state persists correctly.
+                if (asg.value.kind == .struct_lit) {
+                    if (try self.lowerStructAssign(asg.target, asg.value, span)) return;
+                }
                 const val = try self.lowerExpr(asg.value);
                 try self.lowerAssignTarget(asg.target, val, span);
             },
@@ -1585,12 +2035,38 @@ pub const MirLowerer = struct {
             },
 
             // ── guard_apply ───────────────────────────────────────────────
-            .guard_apply => |name| {
-                const interned = try self.data.intern(name);
-                try self.emit(.{ .auth_check = .{
-                    .name_offset = interned.offset,
-                    .name_len = interned.len,
-                } }, span);
+            // SPEC: Part 7.4 — Inline the named guard's precondition body at
+            // this call site, binding the guard's parameters to the supplied
+            // argument registers. Guards are precondition blocks (needs,
+            // ensures, only-gates); inlining runs them before the rest of the
+            // enclosing action body executes — exactly the modifier pattern.
+            .guard_apply => |ga| {
+                var found = false;
+                for (self.guards) |gd| {
+                    if (std.mem.eql(u8, gd.name, ga.name)) {
+                        found = true;
+                        // Bind each guard parameter to the argument register.
+                        const n = @min(gd.params.len, ga.args.len);
+                        var i: usize = 0;
+                        while (i < n) : (i += 1) {
+                            const arg_reg = try self.lowerExpr(ga.args[i].value);
+                            try self.bindLocal(gd.params[i].name, arg_reg);
+                        }
+                        // Inline the guard body statements.
+                        for (gd.body) |gs| {
+                            try self.lowerStmt(&gs);
+                        }
+                        break;
+                    }
+                }
+                if (!found) {
+                    // Fall back to an authority check by that name.
+                    const interned = try self.data.intern(ga.name);
+                    try self.emit(.{ .auth_check = .{
+                        .name_offset = interned.offset,
+                        .name_len = interned.len,
+                    } }, span);
+                }
             },
 
             // ── only ──────────────────────────────────────────────────────
@@ -1626,6 +2102,140 @@ pub const MirLowerer = struct {
 
     // ── Assignment target lowering ────────────────────────────────────────
 
+    /// SPEC: Part 5.2 — Assign a struct literal into a storage path by writing
+    /// each field to `base_slot + field_index`. Returns true if handled.
+    fn lowerStructAssign(
+        self: *MirLowerer,
+        target: *const Expr,
+        value: *const Expr,
+        span: Span,
+    ) anyerror!bool {
+        const target_ty = self.storagePathType(target) orelse return false;
+        const info = switch (target_ty) {
+            .struct_ => |i| i,
+            else => return false,
+        };
+        const base_slot = (try self.lowerStorageSlot(target)) orelse return false;
+        const sl = value.kind.struct_lit;
+        // Write each declared field of the literal at its struct index.
+        for (sl.fields) |fi| {
+            const idx = structFieldIndex(info, fi.name) orelse continue;
+            const field_val = try self.lowerExpr(fi.value);
+            const slot = self.freshReg();
+            try self.emit(.{ .slot_offset = .{
+                .dst = slot,
+                .base_slot = base_slot,
+                .offset = idx,
+            } }, span);
+            try self.emit(.{ .storage_store = .{ .slot = slot, .value = field_val } }, span);
+        }
+        return true;
+    }
+
+    /// SPEC: Part 5.2 — Infer the resolved value type of a storage-path
+    /// expression, so slot lowering can compute struct field offsets and
+    /// mapping value types. Returns null when the type cannot be inferred.
+    fn storagePathType(self: *MirLowerer, expr: *const Expr) ?ResolvedType {
+        switch (expr.kind) {
+            .field_access => |fa| {
+                if (fa.object.kind == .identifier and
+                    std.mem.eql(u8, fa.object.kind.identifier, "mine"))
+                {
+                    return self.field_types.get(fa.field);
+                }
+                // Struct field access: type of the field within the struct.
+                const obj_ty = self.storagePathType(fa.object) orelse return null;
+                switch (obj_ty) {
+                    .struct_ => |info| {
+                        for (info.fields) |f| {
+                            if (std.mem.eql(u8, f.name, fa.field)) return f.type_;
+                        }
+                        return null;
+                    },
+                    else => return null,
+                }
+            },
+            .identifier => |name| return self.field_types.get(name),
+            .index_access => |ia| {
+                const obj_ty = self.storagePathType(ia.object) orelse return null;
+                return switch (obj_ty) {
+                    .map => |m| m.value.*,
+                    .enum_map => |m| m.value.*,
+                    .list => |elem| elem.*,
+                    .set => |elem| elem.*,
+                    .array => |a| a.elem.*,
+                    else => null,
+                };
+            },
+            else => return null,
+        }
+    }
+
+    /// Find the 0-based field index of `field_name` within a struct type.
+    fn structFieldIndex(info: *const types.StructInfo, field_name: []const u8) ?u32 {
+        for (info.fields, 0..) |f, i| {
+            if (std.mem.eql(u8, f.name, field_name)) return @intCast(i);
+        }
+        return null;
+    }
+
+    /// SPEC: Part 5.2 — Compute the storage slot register for a state lvalue
+    /// expression, supporting arbitrarily nested mapping access
+    /// (`mine.m[a][b][c]`) and struct-field offsets (`mine.m[k].field`).
+    /// Returns null if `expr` is not a storage path.
+    ///
+    /// The returned register holds the final derived slot; callers pair it
+    /// with `storage_load` / `storage_store`.
+    fn lowerStorageSlot(self: *MirLowerer, expr: *const Expr) anyerror!?Reg {
+        switch (expr.kind) {
+            // Base field: `mine.field` or a bare state-field identifier.
+            .field_access => |fa| {
+                if (fa.object.kind == .identifier and
+                    std.mem.eql(u8, fa.object.kind.identifier, "mine"))
+                {
+                    const fid = try self.getOrAssignFieldId(fa.field);
+                    const dst = self.freshReg();
+                    try self.emit(.{ .slot_field = .{ .dst = dst, .field_id = fid } }, expr.span);
+                    return dst;
+                }
+                // Struct field offset: `<storage-path>.field` where the path
+                // resolves to a struct type. slot = base_slot + field_index.
+                const obj_ty = self.storagePathType(fa.object) orelse return null;
+                switch (obj_ty) {
+                    .struct_ => |info| {
+                        const idx = structFieldIndex(info, fa.field) orelse return null;
+                        const base_slot = (try self.lowerStorageSlot(fa.object)) orelse return null;
+                        const dst = self.freshReg();
+                        try self.emit(.{ .slot_offset = .{
+                            .dst = dst,
+                            .base_slot = base_slot,
+                            .offset = idx,
+                        } }, expr.span);
+                        return dst;
+                    },
+                    else => return null,
+                }
+            },
+            .identifier => |name| {
+                if (self.field_ids.get(name)) |fid| {
+                    const dst = self.freshReg();
+                    try self.emit(.{ .slot_field = .{ .dst = dst, .field_id = fid } }, expr.span);
+                    return dst;
+                }
+                return null;
+            },
+            // Mapping access: derive slot from the base slot and the key.
+            .index_access => |ia| {
+                const base_slot = (try self.lowerStorageSlot(ia.object)) orelse return null;
+                const key = try self.lowerExpr(ia.index);
+                const dst = self.freshReg();
+                try self.emit(.{ .slot_map = .{ .dst = dst, .base_slot = base_slot, .key = key } }, expr.span);
+                return dst;
+            },
+            else => return null,
+        }
+    }
+
     /// SPEC: Part 5.2 — Lower the target of an assignment or aug_assign.
     fn lowerAssignTarget(
         self: *MirLowerer,
@@ -1659,9 +2269,24 @@ pub const MirLowerer = struct {
                         .key = null,
                         .value = value,
                     } }, span);
+                    return;
+                }
+                // Struct field write into storage (`m[k].field = v`,
+                // `mine.s.field = v`). Route through the slot-path model.
+                if (try self.lowerStorageSlot(target)) |slot_reg| {
+                    try self.emit(.{ .storage_store = .{ .slot = slot_reg, .value = value } }, span);
                 }
             },
             .index_access => |ia| {
+                // Nested mapping access (`m[a][b] = v`) — the object is itself
+                // an index_access, so the single-key state_write cannot encode
+                // it. Route through the general slot-path model.
+                if (ia.object.kind == .index_access) {
+                    if (try self.lowerStorageSlot(target)) |slot_reg| {
+                        try self.emit(.{ .storage_store = .{ .slot = slot_reg, .value = value } }, span);
+                        return;
+                    }
+                }
                 const key = try self.lowerExpr(ia.index);
                 var fname: ?[]const u8 = null;
                 if (ia.object.kind == .field_access) {
@@ -1772,6 +2397,17 @@ pub const MirLowerer = struct {
         assets: []const ast.AssetDef,
         invariants: []const ast.GlobalInvariantDef,
     ) anyerror!MirModule {
+        // SPEC: Part 7.4 — Record guard declarations so `guard name(args)`
+        // statements can inline the guard body at their call sites.
+        self.guards = contract.guards;
+
+        // SPEC: Part 5.2 — Record resolved state field types for slot-path
+        // struct-offset / mapping-value inference.
+        for (contract.state) |sf| {
+            const rt = self.resolver.resolve(sf.type_) catch continue;
+            try self.field_types.put(self.allocator, sf.name, rt);
+        }
+
         // ── Lower Global Assets ───────────────────────────────────────────
         for (assets) |asset| {
             if (asset.before_transfer) |bt| {
@@ -2131,6 +2767,25 @@ pub const MirLowerer = struct {
 
         const selector = fnvHash32(name);
         try self.finishFunction(name, selector, kind, mir_params, return_type);
+
+        // SPEC: Part 5.5 — Drain any lambdas captured during this function's
+        // body and lower each as a fresh top-level pure. Nested lambdas
+        // (lambdas inside lambdas) are appended to the queue while their
+        // parent is lowering, so the while-loop naturally handles them.
+        while (self.pending_lambdas.items.len > 0) {
+            const pending = self.pending_lambdas.orderedRemove(0);
+            const ret_ty: ?MirType = if (pending.return_type) |rt| blk: {
+                const resolved = self.resolver.resolve(rt) catch break :blk null;
+                break :blk MirType.fromResolved(resolved);
+            } else null;
+            try self.lowerFuncBody(
+                pending.name,
+                .pure,
+                pending.params,
+                ret_ty,
+                pending.body,
+            );
+        }
     }
 };
 
@@ -2268,6 +2923,67 @@ fn fnvHash32(name: []const u8) u32 {
         h *%= 0x01000193;
     }
     return h;
+}
+
+/// SPEC: Part 2.3 — Decode a `hex"..."` literal's inner content into raw bytes.
+/// Ignores `_` separators; silently truncates an odd trailing nibble.
+fn decodeHexLitToOwned(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
+    var clean: [256]u8 = undefined;
+    var n: usize = 0;
+    for (hex) |c| {
+        if (c == '_') continue;
+        if (n >= clean.len) break;
+        clean[n] = c;
+        n += 1;
+    }
+    const usable = n & ~@as(usize, 1);
+    const out = try allocator.alloc(u8, usable / 2);
+    var i: usize = 0;
+    while (i < usable) : (i += 2) {
+        const hi = hexNibble(clean[i]) orelse 0;
+        const lo = hexNibble(clean[i + 1]) orelse 0;
+        out[i / 2] = (hi << 4) | lo;
+    }
+    return out;
+}
+
+fn hexNibble(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => null,
+    };
+}
+
+/// SPEC: Part 2.1 — Scale a numeric literal by the denomination unit.
+/// `1 ether` → 10^18 ; `1 gwei` → 10^9 ; `1 wei` → 1.
+fn scaleUnitLitTo256(value: []const u8, unit: ast.UnitDenom) [32]u8 {
+    const base = parseIntLitTo256(value);
+    const decimals: u8 = switch (unit) {
+        .wei => 0,
+        .gwei => 9,
+        .ether => 18,
+    };
+    if (decimals == 0) return base;
+    return mul256ByPow10(base, decimals);
+}
+
+/// Multiply a 256-bit big-endian integer by 10^n.
+fn mul256ByPow10(a: [32]u8, n: u8) [32]u8 {
+    var out = a;
+    var i: u8 = 0;
+    while (i < n) : (i += 1) {
+        var carry: u32 = 0;
+        var j: usize = 32;
+        while (j > 0) {
+            j -= 1;
+            const prod: u32 = @as(u32, out[j]) * 10 + carry;
+            out[j] = @intCast(prod & 0xff);
+            carry = prod >> 8;
+        }
+    }
+    return out;
 }
 
 // ============================================================================

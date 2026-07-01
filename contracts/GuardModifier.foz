@@ -1,0 +1,37 @@
+version 1
+
+// Smoke test for guard invocation (Solidity `modifier` equivalent).
+// A `guard name(args)` statement inside an action inlines the guard's
+// precondition body before the rest of the action runs.
+
+contract GuardModifier:
+    has:
+        owner is Account
+        is_locked is bool
+        balances is Map[Account -> u256]
+
+    setup(o is Account):
+        owner = o
+        is_locked = no
+
+    guard only_owner():
+        need caller equals owner else "not owner"
+
+    guard not_locked():
+        need is_locked equals no else "contract locked"
+
+    guard has_balance(acc is Account, amount is u256):
+        need balances[acc] >= amount else "insufficient balance"
+
+    action lock():
+        guard only_owner()
+        is_locked = yes
+
+    action deposit(amount is u256):
+        guard not_locked()
+        balances[caller] = balances[caller] plus amount
+
+    action withdraw(amount is u256):
+        guard not_locked()
+        guard has_balance(caller, amount)
+        balances[caller] = balances[caller] minus amount

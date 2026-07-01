@@ -1,0 +1,43 @@
+version 1
+
+// Smoke test for first-class function values in FORGE.
+// Exercises:
+//   - `fn_ref Name`                — take a pointer to a top-level pure
+//   - `fn (x is u256) gives u256: …` — anonymous function value (lambda)
+//   - calling a function value held in a local variable
+//
+// What Solidity expresses with `function (uint256) external pure returns (uint256)`,
+// FORGE expresses with `Fn[u256 -> u256]` + `fn_ref` + lambda.
+
+contract FunctionValues:
+    has:
+        total is u256
+        admin is Account
+
+    setup(a is Account):
+        admin = a
+        total = 0
+
+    // Named pure that we can take a reference to.
+    pure double(x is u256) gives u256:
+        give back x times 2
+
+    // Apply the named pure through fn_ref.
+    action add_double(x is u256):
+        need caller equals admin else "only admin"
+        let f = fn_ref double
+        total = total plus f(x)
+        tell Applied(x, total)
+
+    // Apply an inline lambda — the body is lifted into a synthesised
+    // top-level pure at MIR lowering time.
+    action add_inline(x is u256):
+        need caller equals admin else "only admin"
+        let triple = fn (y is u256) gives u256: y times 3
+        total = total plus triple(x)
+        tell Applied(x, total)
+
+    view get_total() gives u256:
+        give back total
+
+    event Applied(input is u256, new_total is u256)
