@@ -25,7 +25,7 @@ Forge is a high-performance, safety-first smart contract language and virtual ma
 
 ### Prerequisites
 
-- [Zig](https://ziglang.org/download/) (latest stable version recommended)
+- [Zig](https://ziglang.org/download/) (Zig v0.15)
 
 ### Building the Compiler
 
@@ -40,7 +40,8 @@ The binary will be available in `zig-out/bin/`.
 ### Documentation
 
 For more detailed information on the language and how to use it, please refer to the:
-👉 [**FORGE_DOCUMENTATION.md**](FORGE_DOCUMENTATION.md)
+
+[**FORGE_DOCUMENTATION.md**](FORGE_DOCUMENTATION.md)
 
 You can also check the full [FORGE_LANGUAGE_SPEC.md](FORGE_LANGUAGE_SPEC.md) for a technical reference.
 
